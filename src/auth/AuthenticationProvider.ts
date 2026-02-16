@@ -132,6 +132,9 @@ export class FrontierAuthProvider implements vscode.AuthenticationProvider, vsco
                 let shouldClearSession = false;
                 let hadNetworkError = false;
 
+                // Preserve previously cached userInfo so we don't wipe it on network errors
+                const existingCachedUserInfo = this.stateManager.getUserInfo();
+
                 try {
                     const validity = await this.checkTokenValidity(sessionData.accessToken);
                     if (validity.isValid && validity.userInfo) {
@@ -149,11 +152,21 @@ export class FrontierAuthProvider implements vscode.AuthenticationProvider, vsco
                     } else if (validity.isNetworkError) {
                         // Network error - mark for revalidation when connectivity is restored
                         hadNetworkError = true;
+                        // Preserve cached user info from previous session
+                        userInfo = existingCachedUserInfo;
+                        if (existingCachedUserInfo) {
+                            userLabel = existingCachedUserInfo.username || userLabel;
+                        }
                     }
                 } catch (error) {
                     // Network or other transient error - keep the session for offline access
                     console.warn("Could not validate token during initialization (keeping session):", error);
                     hadNetworkError = true;
+                    // Preserve cached user info from previous session
+                    userInfo = existingCachedUserInfo;
+                    if (existingCachedUserInfo) {
+                        userLabel = existingCachedUserInfo.username || userLabel;
+                    }
                 }
 
                 if (shouldClearSession) {
@@ -264,16 +277,25 @@ export class FrontierAuthProvider implements vscode.AuthenticationProvider, vsco
         return "Frontier User";
     }
 
+    private static readonly TOKEN_VALIDATION_TIMEOUT_MS = 5000;
+
     private async checkTokenValidity(
         token: string
     ): Promise<TokenValidityResult & { userInfo?: any }> {
         try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(
+                () => controller.abort(),
+                FrontierAuthProvider.TOKEN_VALIDATION_TIMEOUT_MS
+            );
             const response = await fetch(`${this.apiEndpoint}/auth/me`, {
                 headers: {
                     Authorization: `Bearer ${token}`,
                     Accept: "application/json",
                 },
+                signal: controller.signal,
             });
+            clearTimeout(timeoutId);
 
             if (response.ok) {
                 const userInfo = await response.json();

@@ -213,11 +213,20 @@ export function registerCommands(
                 const stateManager = StateManager.getInstance();
                 let userInfo = stateManager.getUserInfo();
 
-                // If no cached user info exists, try to fetch and cache it
+                // If no cached user info exists, try to fetch and cache it (with timeout to avoid blocking callers)
                 if (!userInfo) {
                     console.log("No cached user info found, attempting to fetch and cache...");
                     try {
-                        await authProvider.fetchAndCacheUserInfo();
+                        const FETCH_TIMEOUT_MS = 5000;
+                        await Promise.race([
+                            authProvider.fetchAndCacheUserInfo(),
+                            new Promise<void>((_, reject) =>
+                                setTimeout(
+                                    () => reject(new Error("getUserInfo fetch timed out")),
+                                    FETCH_TIMEOUT_MS
+                                )
+                            ),
+                        ]);
                         userInfo = stateManager.getUserInfo(); // Try again after caching
                     } catch (error) {
                         console.warn("Could not fetch user info for caching:", error);
