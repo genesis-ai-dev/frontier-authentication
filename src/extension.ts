@@ -43,6 +43,7 @@ export interface FrontierAPI {
             name: string;
             description: string | null;
             visibility: string;
+            isArchived?: boolean;
             url: string;
             webUrl: string;
             lastActivity: string;
@@ -264,6 +265,7 @@ export async function activate(context: vscode.ExtensionContext) {
                     name: string;
                     description: string | null;
                     visibility: string;
+                    isArchived?: boolean;
                     url: string;
                     webUrl: string;
                     lastActivity: string;
