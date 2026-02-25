@@ -2,14 +2,19 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import * as git from "isomorphic-git";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { StateManager } from "../../../state";
 
 suite("Unit: reconcile respects stream-only strategy", () => {
+    suiteSetup(() => {
+        // Point dugite at system git for tests
+        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+    });
+
     test("reconcilePointersFilesystem returns early for stream-only", async () => {
         // Arrange a minimal workspace with a pointer
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "frontier-reconcile-so-"));
-        await git.init({ fs, dir, defaultBranch: "main" });
+        await dugiteGit.init(dir);
 
         const pointerRel = ".project/attachments/pointers/audio/stream.wav";
         const pointerAbs = path.join(dir, pointerRel);
@@ -25,16 +30,11 @@ suite("Unit: reconcile respects stream-only strategy", () => {
         );
 
         // Stage and commit
-        await git.add({ fs, dir, filepath: pointerRel });
-        await git.commit({
-            fs,
-            dir,
-            message: "add pointer",
-            author: { name: "Tester", email: "tester@example.com" },
-        });
+        await dugiteGit.add(dir, pointerRel);
+        await dugiteGit.commit(dir, "add pointer", { name: "Tester", email: "tester@example.com" });
 
         // Fake remote config so getRemoteUrl is non-empty
-        await git.addRemote({ fs, dir, remote: "origin", url: "https://example.com/repo.git" });
+        await dugiteGit.addRemote(dir, "origin", "https://example.com/repo.git");
 
         // Initialize StateManager and set strategy via API
         const ctx: any = {

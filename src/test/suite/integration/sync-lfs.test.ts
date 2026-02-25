@@ -3,11 +3,17 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import * as git from "isomorphic-git";
+import { execSync } from "child_process";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { registerMockAuthProvider } from "../../helpers/mockAuthProvider";
 import { GitLabService } from "../../../gitlab/GitLabService";
 import { SCMManager } from "../../../scm/SCMManager";
 import { StateManager } from "../../../state";
+
+/** Helper: update a git ref. */
+const gitWriteRef = (dir: string, ref: string, value: string): void => {
+    execSync(`git update-ref ${ref} ${value}`, { cwd: dir });
+};
 
 suite("Integration: sync uses Git LFS for pointer downloads", () => {
     let mockProvider: vscode.Disposable | undefined;
@@ -16,6 +22,9 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
     let originalGetExtension: any;
 
     suiteSetup(async () => {
+        // Point dugite at system git for tests
+        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+
         // Register mock VS Code auth provider and activate extension
         mockProvider = await registerMockAuthProvider();
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
@@ -56,27 +65,17 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
         // Prepare a temporary workspace
         workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "frontier-sync-lfs-"));
 
-        // Initialize a real git repo with isomorphic-git
-        await git.init({ fs, dir: workspaceDir, defaultBranch: "main" });
+        // Initialize a real git repo
+        await dugiteGit.init(workspaceDir);
+        await dugiteGit.disableLfsFilters(workspaceDir);
         // Write initial file and commit, so HEAD exists
         await fs.promises.writeFile(path.join(workspaceDir, "README.md"), "hello", "utf8");
-        await git.add({ fs, dir: workspaceDir, filepath: "README.md" });
-        const headOid = await git.commit({
-            fs,
-            dir: workspaceDir,
-            message: "initial",
-            author: { name: "Tester", email: "tester@example.com" },
-        });
+        await dugiteGit.add(workspaceDir, "README.md");
+        const headOid = await dugiteGit.commit(workspaceDir, "initial", { name: "Tester", email: "tester@example.com" });
         // Add remote and create matching remote ref
         const remoteUrl = "https://example.com/repo.git";
-        await git.addRemote({ fs, dir: workspaceDir, remote: "origin", url: remoteUrl });
-        await git.writeRef({
-            fs,
-            dir: workspaceDir,
-            ref: "refs/remotes/origin/main",
-            value: headOid,
-            force: true,
-        });
+        await dugiteGit.addRemote(workspaceDir, "origin", remoteUrl);
+        gitWriteRef(workspaceDir, "refs/remotes/origin/main", headOid);
 
         // Mark pointers as LFS-tracked
         await fs.promises.writeFile(
@@ -98,21 +97,10 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
         await fs.promises.writeFile(pointerAbs, pointerText, "utf8");
 
         // Stage and commit the pointer so local HEAD includes it
-        await git.add({ fs, dir: workspaceDir, filepath: pointerRel });
-        const newHead = await git.commit({
-            fs,
-            dir: workspaceDir,
-            message: "add pointer",
-            author: { name: "Tester", email: "tester@example.com" },
-        });
+        await dugiteGit.add(workspaceDir, pointerRel);
+        const newHead = await dugiteGit.commit(workspaceDir, "add pointer", { name: "Tester", email: "tester@example.com" });
         // Make remote ref match local HEAD to avoid fast-forward path
-        await git.writeRef({
-            fs,
-            dir: workspaceDir,
-            ref: "refs/remotes/origin/main",
-            value: newHead,
-            force: true,
-        });
+        gitWriteRef(workspaceDir, "refs/remotes/origin/main", newHead);
 
         // Ensure files dir path exists but target file absent
         const filesAbs = path.join(workspaceDir, ".project/attachments/files/audio/sync.wav");
@@ -139,10 +127,10 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
         // Prevent duplicate command registration inside tests
         (SCMManager as any).prototype.registerCommands = function () {};
 
-        // Stub isomorphic-git fetch/fastForward/push to no-op to avoid network
-        (git as any).fetch = async () => {};
-        (git as any).fastForward = async () => {};
-        (git as any).push = async () => {};
+        // Stub dugiteGit fetch/fastForward/push to no-op to avoid network
+        (dugiteGit as any).fetchOrigin = async () => {};
+        (dugiteGit as any).fastForward = async () => {};
+        (dugiteGit as any).push = async () => {};
 
         // Stub fetch to simulate LFS batch + download
         originalFetch = (globalThis as any).fetch;

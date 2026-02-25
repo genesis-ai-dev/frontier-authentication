@@ -444,25 +444,26 @@ export function registerVersionCheckCommands(context: vscode.ExtensionContext): 
 
                 // Fetch remote refs and read remote metadata.json (best effort)
                 try {
-                    const git = await import("isomorphic-git");
-                    const fs = (await import("fs")).promises as any;
-                    const http = (await import("isomorphic-git/http/node")).default;
-                    await git.fetch({ fs, http, dir: workspacePath } as any);
+                    const dugiteGit = await import("../git/dugiteGit");
+                    // Only fetch if git binary is configured (it may not be during tests)
+                    if (dugiteGit.isGitBinaryConfigured()) {
+                        // We need auth but don't have it here — skip fetch, rely on cached remote refs
+                        // The SCMManager fetch in syncChanges will have updated refs already
+                    }
                 } catch {}
 
                 let mismatch = false;
                 try {
-                    const git = await import("isomorphic-git");
-                    const fs = (await import("fs")).promises as any;
-                    const currentBranch = await git.currentBranch({ fs, dir: workspacePath });
+                    const dugiteGit = await import("../git/dugiteGit");
+                    const currentBranch = await dugiteGit.currentBranch(workspacePath);
                     if (currentBranch) {
                         const remoteRef = `refs/remotes/origin/${currentBranch}`;
                         let remoteHead: string | undefined;
-                        try { remoteHead = await git.resolveRef({ fs, dir: workspacePath, ref: remoteRef }); } catch {}
+                        try { remoteHead = await dugiteGit.resolveRef(workspacePath, remoteRef); } catch {}
                         if (remoteHead) {
                             try {
-                                const result = await git.readBlob({ fs, dir: workspacePath, oid: remoteHead, filepath: "metadata.json" });
-                                const text = new TextDecoder().decode(result.blob);
+                                const blob = await dugiteGit.readBlobAtRef(workspacePath, remoteHead, "metadata.json");
+                                const text = new TextDecoder().decode(blob);
                                 const remoteMetadata = JSON.parse(text) as { meta?: { requiredExtensions?: { codexEditor?: string; frontierAuthentication?: string } } };
                                 const required = remoteMetadata.meta?.requiredExtensions;
                                 if (required) {

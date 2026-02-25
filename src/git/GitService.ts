@@ -1,6 +1,5 @@
-import * as git from "isomorphic-git";
-import http from "isomorphic-git/http/node";
-import lfs from "@fetsorn/isogit-lfs";
+import * as dugiteGit from "./dugiteGit";
+import { formatPointerInfo, buildPointerInfo } from "./lfsPointerUtils";
 import * as fs from "fs";
 import * as vscode from "vscode";
 import * as path from "path";
@@ -388,13 +387,7 @@ async function uploadBlobsToLFSBucket(
         contents = recovered;
     }
 
-    // Use the original library's buildPointerInfo function
-    const buildPointerInfo = (lfs as any).buildPointerInfo;
-    const getAuthHeader = (lfs as any).getAuthHeader || (() => ({}));
-
-    if (!buildPointerInfo) {
-        throw new Error("Unable to access buildPointerInfo from LFS library");
-    }
+    const getAuthHeader = (_auth?: unknown): Record<string, string> => ({});
 
     // Filter out skipped indices before building pointer infos
     const effectiveContents: Uint8Array[] = contents.filter((_, i) => !skipIndices.has(i));
@@ -914,8 +907,8 @@ export class GitService {
                     }
                 } catch { }
 
-                const status = await git.statusMatrix({ fs, dir });
-                const headOid = await git.resolveRef({ fs, dir, ref: "HEAD" });
+                const status = await dugiteGit.statusMatrix(dir);
+                const headOid = await dugiteGit.resolveRef(dir, "HEAD");
                 this.debugLog("[GitService] Repository status", {
                     statusEntries: status.length,
                     headOid: headOid.substring(0, 8),
@@ -980,12 +973,12 @@ export class GitService {
                                 oid: infos[0].oid,
                             });
 
-                            const pointerBlob = lfs.formatPointerInfo(infos[0]);
+                            const pointerBlob = formatPointerInfo(infos[0]);
                             await fs.promises.writeFile(
                                 absolutePathToFill,
                                 Buffer.from(pointerBlob)
                             );
-                            await git.add({ fs, dir, filepath });
+                            await dugiteGit.add(dir, filepath);
                             this.debugLog("[GitService] Wrote pointer and staged", { filepath });
 
                             const filesAbs = this.getFilesPathForPointer(dir, filepath);
@@ -1442,9 +1435,9 @@ export class GitService {
 
         // Get some context before pushing
         try {
-            const currentBranch = await git.currentBranch({ fs, dir });
+            const currentBranch = await dugiteGit.currentBranch(dir);
             const remoteUrl = await this.getRemoteUrl(dir);
-            const status = await git.statusMatrix({ fs, dir });
+            const status = await dugiteGit.statusMatrix(dir);
             const changedFiles = status.filter(
                 (entry) => entry[1] !== entry[2] || entry[2] !== entry[3]
             ).length;
@@ -1464,21 +1457,13 @@ export class GitService {
             this.progressCallback("pushing", 0, 0, "Uploading changes");
         }
 
-        const pushOperation = git.push({
-            fs,
-            http,
-            dir,
-            remote: "origin",
+        const pushOperation = dugiteGit.push(dir, auth, {
             ...(ref && { ref }),
-            onProgress: (event) => {
+            onProgress: (phase, loaded, total) => {
                 console.log(
-                    `[GitService] ⬆️  Push progress: ${event.phase || "uploading"} ${event.loaded || 0}/${event.total || 0}`
+                    `[GitService] ⬆️  Push progress: ${phase || "uploading"} ${loaded || 0}/${total || 0}`
                 );
-                this.updateSyncProgress("pushing", event);
-            },
-            onAuth: () => {
-                this.debugLog(`[GitService] Authentication requested for push operation`);
-                return auth;
+                this.updateSyncProgress("pushing", { phase, loaded, total });
             },
         });
 
@@ -1514,7 +1499,7 @@ export class GitService {
                 errorMessage.includes("One or more branches were not updated") ||
                 errorMessage.includes("failed to update ref")
             ) {
-                // Typical isomorphic-git GitPushError when the remote ref changed
+                // Typical git push error when the remote ref changed
                 // between our last fetch and push (non-fast-forward update).
                 userFriendlyMessage =
                     "push failed: Remote branch changed since last sync. Please sync again to merge the latest remote changes.";
@@ -1602,7 +1587,7 @@ export class GitService {
         let uploadedLfsFiles: string[] = [];
 
         try {
-            const currentBranch = await git.currentBranch({ fs, dir });
+            const currentBranch = await dugiteGit.currentBranch(dir);
             if (!currentBranch) {
                 throw new Error("Not on any branch");
             }
@@ -1666,22 +1651,11 @@ export class GitService {
             }
             try {
                 await this.withTimeout(
-                    git.fetch({
-                        fs,
-                        http,
-                        dir,
-                        onProgress: (event) => {
-                            console.log(
-                                `[GitService] ⬇️  Fetch progress: ${event.phase || "downloading"} ${event.loaded || 0}/${event.total || 0}`
-                            );
-                            this.updateSyncProgress("fetching", event);
-                        },
-                        onAuth: () => {
-                            this.debugLog(
-                                "[GitService] Authentication requested for fetch operation"
-                            );
-                            return auth;
-                        },
+                    dugiteGit.fetchOrigin(dir, auth, (phase, loaded, total) => {
+                        console.log(
+                            `[GitService] ⬇️  Fetch progress: ${phase || "downloading"} ${loaded || 0}/${total || 0}`
+                        );
+                        this.updateSyncProgress("fetching", { phase, loaded, total });
                     }),
                     2 * 60 * 1000,
                     "Fetch operation"
@@ -1729,13 +1703,13 @@ export class GitService {
             }
 
             // 4. Get references to current state
-            let localHead = await git.resolveRef({ fs, dir, ref: "HEAD" });
+            let localHead = await dugiteGit.resolveRef(dir, "HEAD");
             let remoteHead;
             const remoteRef = `refs/remotes/origin/${currentBranch}`;
 
             // 5. Check if remote branch exists
             try {
-                remoteHead = await git.resolveRef({ fs, dir, ref: remoteRef });
+                remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
             } catch (err) {
                 // Remote branch doesn't exist, just push our changes
                 this.debugLog("Remote branch doesn't exist, pushing our changes");
@@ -1744,7 +1718,7 @@ export class GitService {
             }
 
             // Get files changed in local HEAD (this doesn't need updating after refetch)
-            const localStatusMatrix = await git.statusMatrix({ fs, dir });
+            const localStatusMatrix = await dugiteGit.statusMatrix(dir);
 
             this.debugLog("workingCopyStatusBeforeCommit:", workingCopyStatusBeforeCommit);
             this.debugLog("localStatusMatrix:", localStatusMatrix);
@@ -1784,16 +1758,7 @@ export class GitService {
                 }
 
                 await this.withTimeout(
-                    git.fastForward({
-                        fs,
-                        http,
-                        dir,
-                        ref: currentBranch,
-                        onAuth: () => {
-                            this.debugLog("[GitService] Authentication requested for fast-forward");
-                            return auth;
-                        },
-                    }),
+                    dugiteGit.fastForward(dir, currentBranch, auth),
                     2 * 60 * 1000,
                     "Fast-forward operation"
                 );
@@ -1837,7 +1802,7 @@ export class GitService {
             // Re-read local HEAD in case fast-forward succeeded but push failed.
             // Without this, the merge base calculation would use the stale pre-fast-forward
             // localHead, causing incorrect conflict detection and potentially losing data.
-            const currentLocalHead = await git.resolveRef({ fs, dir, ref: "HEAD" });
+            const currentLocalHead = await dugiteGit.resolveRef(dir, "HEAD");
             if (currentLocalHead !== localHead) {
                 this.debugLog("[GitService] Local HEAD moved (fast-forward succeeded, push failed):", {
                     before: localHead.substring(0, 8),
@@ -1851,17 +1816,7 @@ export class GitService {
             this.debugLog("[GitService] Refetching remote changes before conflict analysis");
             try {
                 await this.withTimeout(
-                    git.fetch({
-                        fs,
-                        http,
-                        dir,
-                        onAuth: () => {
-                            this.debugLog(
-                                "[GitService] Authentication requested for pre-conflict-analysis fetch"
-                            );
-                            return auth;
-                        },
-                    }),
+                    dugiteGit.fetchOrigin(dir, auth),
                     2 * 60 * 1000,
                     "Pre-conflict-analysis fetch"
                 );
@@ -1875,7 +1830,7 @@ export class GitService {
                 }
 
                 // Update remoteHead reference after the new fetch
-                remoteHead = await git.resolveRef({ fs, dir, ref: remoteRef });
+                remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
                 this.debugLog(
                     "[GitService] Updated remote HEAD after refetch:",
                     remoteHead.substring(0, 8)
@@ -1894,27 +1849,15 @@ export class GitService {
             }
 
             // Recalculate merge base after potential refetch
-            const updatedMergeBaseCommits = await git.findMergeBase({
-                fs,
-                dir,
-                oids: [localHead, remoteHead],
-            });
+            const updatedMergeBaseCommits = await dugiteGit.findMergeBase(dir, localHead, remoteHead);
 
             this.debugLog("Updated merge base commits after refetch:", updatedMergeBaseCommits);
 
             // Update status matrices with potentially new remote state
-            const updatedRemoteStatusMatrix = await git.statusMatrix({
-                fs,
-                dir,
-                ref: remoteRef,
-            });
+            const updatedRemoteStatusMatrix = await dugiteGit.statusMatrixAtRef(dir, remoteRef);
             const updatedMergeBaseStatusMatrix =
                 updatedMergeBaseCommits.length > 0
-                    ? await git.statusMatrix({
-                        fs,
-                        dir,
-                        ref: updatedMergeBaseCommits[0],
-                    })
+                    ? await dugiteGit.statusMatrixAtRef(dir, updatedMergeBaseCommits[0])
                     : [];
 
             this.debugLog("updatedRemoteStatusMatrix:", updatedRemoteStatusMatrix);
@@ -1922,7 +1865,7 @@ export class GitService {
 
             // Re-read local status matrix now. The original was captured before the fast-forward
             // attempt (step 7) and may be stale if fast-forward succeeded but push was rejected.
-            const updatedLocalStatusMatrix = await git.statusMatrix({ fs, dir }).catch(() => localStatusMatrix);
+            const updatedLocalStatusMatrix = await dugiteGit.statusMatrix(dir).catch(() => localStatusMatrix);
 
             // Convert status matrices to maps for easier lookup
             const localStatusMap = new Map(
@@ -2096,12 +2039,7 @@ export class GitService {
                     // Try to read local content if it exists in local HEAD
                     try {
                         if (!isDeletedLocally && !isAddedLocally) {
-                            const { blob: lBlob } = await git.readBlob({
-                                fs,
-                                dir,
-                                oid: localHead,
-                                filepath,
-                            });
+                            const lBlob = await dugiteGit.readBlobAtRef(dir, localHead, filepath);
                             localContent = new TextDecoder().decode(lBlob);
                         } else if (isAddedLocally) {
                             // For locally added files, read from working directory
@@ -2122,21 +2060,11 @@ export class GitService {
                     // Try to read remote content if it exists in remote HEAD
                     try {
                         if (!isDeletedRemotely && !isAddedRemotely) {
-                            const { blob: rBlob } = await git.readBlob({
-                                fs,
-                                dir,
-                                oid: remoteHead,
-                                filepath,
-                            });
+                            const rBlob = await dugiteGit.readBlobAtRef(dir, remoteHead, filepath);
                             remoteContent = new TextDecoder().decode(rBlob);
                         } else if (isAddedRemotely) {
                             try {
-                                const { blob: rBlob } = await git.readBlob({
-                                    fs,
-                                    dir,
-                                    oid: remoteHead,
-                                    filepath,
-                                });
+                                const rBlob = await dugiteGit.readBlobAtRef(dir, remoteHead, filepath);
                                 remoteContent = new TextDecoder().decode(rBlob);
                             } catch (e) {
                                 this.debugLog(`Error reading remotely added file ${filepath}:`, e);
@@ -2149,12 +2077,7 @@ export class GitService {
                     // Try to read base content if available
                     try {
                         if (updatedMergeBaseCommits.length > 0) {
-                            const { blob: bBlob } = await git.readBlob({
-                                fs,
-                                dir,
-                                oid: updatedMergeBaseCommits[0],
-                                filepath,
-                            });
+                            const bBlob = await dugiteGit.readBlobAtRef(dir, updatedMergeBaseCommits[0], filepath);
                             baseContent = new TextDecoder().decode(bBlob);
                         }
                     } catch (err) {
@@ -2243,9 +2166,9 @@ export class GitService {
 
             // Log additional context that might help with debugging
             try {
-                const currentBranch = await git.currentBranch({ fs, dir });
+                const currentBranch = await dugiteGit.currentBranch(dir);
                 const remoteUrl = await this.getRemoteUrl(dir);
-                const status = await git.statusMatrix({ fs, dir });
+                const status = await dugiteGit.statusMatrix(dir);
 
                 console.error(`[GitService] Sync failure context:`, {
                     currentBranch,
@@ -2310,12 +2233,12 @@ export class GitService {
      * Check if the working copy has any changes
      */
     async getWorkingCopyState(dir: string): Promise<{ isDirty: boolean; status: any[]; }> {
-        const status = await git.statusMatrix({ fs, dir });
+        const status = await dugiteGit.statusMatrix(dir);
         this.debugLog(
             "Status before committing local changes:",
             JSON.stringify(
                 status.filter(
-                    (entry) => entry.includes(0) || entry.includes(2) || entry.includes(3)
+                    (entry) => (entry as (string | number)[]).includes(0) || (entry as (string | number)[]).includes(2) || (entry as (string | number)[]).includes(3)
                 )
             )
         );
@@ -2354,7 +2277,7 @@ export class GitService {
             );
             this.debugLog(`Resolved files: ${resolvedFiles.map((f) => f.filepath).join(", ")}`);
 
-            const currentBranch = await git.currentBranch({ fs, dir });
+            const currentBranch = await dugiteGit.currentBranch(dir);
             if (!currentBranch) {
                 throw new Error("Not on any branch");
             }
@@ -2368,7 +2291,7 @@ export class GitService {
                 try {
                     if (resolution === "deleted") {
                         this.debugLog(`Removing file from git: ${filepath}`);
-                        await git.remove({ fs, dir, filepath });
+                        await dugiteGit.remove(dir, filepath);
                     } else {
                         this.debugLog(`Adding file to git (LFS-aware): ${filepath}`);
                         await this.stageResolvedFileWithLFS(dir, filepath, auth);
@@ -2387,15 +2310,7 @@ export class GitService {
             // the subsequent push to be rejected as a non-fast-forward update.
             this.debugLog("[GitService] Fetching latest changes before merge completion");
             await this.withTimeout(
-                git.fetch({
-                    fs,
-                    http,
-                    dir,
-                    onAuth: () => {
-                        this.debugLog("[GitService] Authentication requested for pre-merge fetch");
-                        return auth;
-                    },
-                }),
+                dugiteGit.fetchOrigin(dir, auth),
                 2 * 60 * 1000,
                 "Pre-merge fetch operation"
             );
@@ -2404,42 +2319,21 @@ export class GitService {
             // remote tip. This guarantees that the resulting merge commit will be a
             // fast-forward of the remote (barring a race where someone pushes again
             // between this fetch and our push).
-            const localHead = await git.resolveRef({ fs, dir, ref: currentBranch });
+            const localHead = await dugiteGit.resolveRef(dir, currentBranch);
             const remoteRef = this.getRemoteRef(currentBranch);
-            const remoteHead = await git.resolveRef({ fs, dir, ref: remoteRef });
+            const remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
             const commitMessage = `Merge branch 'origin/${currentBranch}'`;
             this.debugLog(`Creating merge commit with message: ${commitMessage}`);
 
             try {
                 // Create a merge commit with the two parents
-                await git.commit({
-                    fs,
-                    dir,
-                    message: commitMessage,
-                    author: {
-                        name: author.name,
-                        email: author.email,
-                        timestamp: Math.floor(Date.now() / 1000),
-                        timezoneOffset: new Date().getTimezoneOffset(),
-                    },
-                    parent: [localHead, remoteHead],
-                });
+                await dugiteGit.mergeCommit(dir, commitMessage, { name: author.name, email: author.email }, [localHead, remoteHead]);
             } catch (commitError) {
                 console.error("Error creating merge commit:", commitError);
 
                 // Create a regular commit instead
                 this.debugLog("Attempting to create a regular commit with the resolved changes");
-                await git.commit({
-                    fs,
-                    dir,
-                    message: `Resolved conflicts with ${this.getShortRemoteRef(currentBranch)}`,
-                    author: {
-                        name: author.name,
-                        email: author.email,
-                        timestamp: Math.floor(Date.now() / 1000),
-                        timezoneOffset: new Date().getTimezoneOffset(),
-                    },
-                });
+                await dugiteGit.commit(dir, `Resolved conflicts with ${this.getShortRemoteRef(currentBranch)}`, { name: author.name, email: author.email });
             }
 
             // Push the merge commit with a more robust approach
@@ -2475,16 +2369,14 @@ export class GitService {
      * Stage all changes in the working directory
      */
     async addAll(dir: string): Promise<void> {
-        const status = await git.statusMatrix({ fs, dir });
+        const status = await dugiteGit.statusMatrix(dir);
 
         // Handle deletions
         const deletedFiles = status
             .filter((entry) => this.fileStatus.isDeleted(entry))
             .map(([filepath]) => filepath);
 
-        for (const filepath of deletedFiles) {
-            await git.remove({ fs, dir, filepath });
-        }
+        await dugiteGit.removeMany(dir, deletedFiles);
 
         // Handle modifications and additions
         const modifiedFiles = status
@@ -2495,9 +2387,7 @@ export class GitService {
             )
             .map(([filepath]) => filepath);
 
-        for (const filepath of modifiedFiles) {
-            await git.add({ fs, dir, filepath });
-        }
+        await dugiteGit.addMany(dir, modifiedFiles);
     }
 
     /**
@@ -2508,7 +2398,7 @@ export class GitService {
         dir: string,
         auth: { username: string; password: string; }
     ): Promise<string[]> {
-        const status = await git.statusMatrix({ fs, dir });
+        const status = await dugiteGit.statusMatrix(dir);
         const uploadedLfsFiles: string[] = [];
 
         // Handle deletions
@@ -2516,9 +2406,7 @@ export class GitService {
             .filter((entry) => this.fileStatus.isDeleted(entry))
             .map(([filepath]) => filepath);
 
-        for (const filepath of deletedFiles) {
-            await git.remove({ fs, dir, filepath });
-        }
+        await dugiteGit.removeMany(dir, deletedFiles);
 
         // Handle modifications and additions
         const modifiedFiles = status
@@ -2544,11 +2432,13 @@ export class GitService {
         const rawBytesFiles: { filepath: string; bytes: Buffer }[] = [];
         // Existing pointers whose backing bytes need uploading to the new repo
         const existingPointerUploads: { filepath: string; bytes: Buffer }[] = [];
+        // Non-LFS files collected for batch staging
+        const nonLfsFilesToAdd: string[] = [];
 
         for (const filepath of modifiedFiles) {
-            // Non-LFS → regular add
+            // Non-LFS → collect for batch add
             if (!(await this.isLfsTracked(dir, filepath))) {
-                await git.add({ fs, dir, filepath });
+                nonLfsFilesToAdd.push(filepath);
                 continue;
             }
 
@@ -2560,7 +2450,7 @@ export class GitService {
             // No remote / auth → fall back to regular add
             if (!remoteUrl || !lfsBaseUrl || !effectiveAuth) {
                 console.warn(`[GitService] No remote URL/auth; adding ${filepath} without LFS`);
-                await git.add({ fs, dir, filepath });
+                nonLfsFilesToAdd.push(filepath);
                 continue;
             }
 
@@ -2581,12 +2471,12 @@ export class GitService {
                         `[GitService] ${filepath} is already an LFS pointer; staging without upload`
                     );
                     // Normalize and stage the pointer
-                    const canonicalPointer = lfs.formatPointerInfo({
+                    const canonicalPointer = formatPointerInfo({
                         oid: existingPointer.oid,
                         size: existingPointer.size,
                     } as any);
                     await fs.promises.writeFile(absolutePath, Buffer.from(canonicalPointer));
-                    await git.add({ fs, dir, filepath });
+                    await dugiteGit.add(dir, filepath);
 
                     if (this.isPointerPath(filepath)) {
                         // Check if files/ dir has real bytes we should upload to the new repo
@@ -2601,7 +2491,7 @@ export class GitService {
                         if (blobBytes && blobBytes.length > 0) {
                             const maybePointer = this.parseLfsPointer(blobBytes.toString("utf8"));
                             if (!maybePointer) {
-                                const buildPointerInfo = (lfs as any).buildPointerInfo;
+                                // buildPointerInfo is now imported from lfsPointerUtils
                                 const info = buildPointerInfo
                                     ? await buildPointerInfo(blobBytes)
                                     : null;
@@ -2674,6 +2564,14 @@ export class GitService {
             rawBytesFiles.push({ filepath, bytes: uploadBytes });
         }
 
+        // ── Phase 1b: Batch-stage all non-LFS files in one call ──────────
+        if (nonLfsFilesToAdd.length > 0) {
+            this.debugLog(
+                `[GitService] Batch-staging ${nonLfsFilesToAdd.length} non-LFS file(s)`
+            );
+            await dugiteGit.addMany(dir, nonLfsFilesToAdd);
+        }
+
         // ── Phase 2: Batch-upload raw-bytes files ────────────────────────
         if (rawBytesFiles.length > 0 && lfsBaseUrl && effectiveAuth) {
             const totalBatches = Math.ceil(rawBytesFiles.length / LFS_UPLOAD_BATCH_SIZE);
@@ -2681,7 +2579,7 @@ export class GitService {
                 `[GitService] Batch-uploading ${rawBytesFiles.length} raw LFS files in ${totalBatches} batch(es) of up to ${LFS_UPLOAD_BATCH_SIZE}`
             );
 
-            const buildPointerInfo = (lfs as any).buildPointerInfo;
+            // buildPointerInfo is now imported from lfsPointerUtils
 
             for (let i = 0; i < rawBytesFiles.length; i += LFS_UPLOAD_BATCH_SIZE) {
                 const batch = rawBytesFiles.slice(i, i + LFS_UPLOAD_BATCH_SIZE);
@@ -2729,10 +2627,10 @@ export class GitService {
                     }
 
                     // Write pointer file and stage
-                    const pointerBlob = lfs.formatPointerInfo(matchedInfo);
+                    const pointerBlob = formatPointerInfo(matchedInfo);
                     const absolutePath = path.join(dir, filepath);
                     await fs.promises.writeFile(absolutePath, Buffer.from(pointerBlob));
-                    await git.add({ fs, dir, filepath });
+                    await dugiteGit.add(dir, filepath);
 
                     // Ensure files/ dir has the raw bytes
                     if (this.isPointerPath(filepath)) {
@@ -2906,17 +2804,7 @@ export class GitService {
         message: string,
         author: { name: string; email: string; }
     ): Promise<string> {
-        return git.commit({
-            fs,
-            dir,
-            message,
-            author: {
-                name: author.name,
-                email: author.email,
-                timestamp: Math.floor(Date.now() / 1000),
-                timezoneOffset: new Date().getTimezoneOffset(),
-            },
-        });
+        return dugiteGit.commit(dir, message, { name: author.name, email: author.email });
     }
 
     // ========== UTILITY METHODS ==========
@@ -2939,22 +2827,13 @@ export class GitService {
                     const dirUri = vscode.Uri.file(dir);
                     await vscode.workspace.fs.createDirectory(dirUri);
 
-                    await git.clone({
-                        fs,
-                        http,
-                        dir,
-                        url,
-                        onProgress: (event) => {
-                            if (event.phase === "Receiving objects") {
-                                progress.report({
-                                    message: `${event.phase}: ${event.loaded}/${event.total} objects`,
-                                    increment: (event.loaded / event.total) * 100,
-                                });
-                            }
-                        },
-                        ...(auth && {
-                            onAuth: () => auth,
-                        }),
+                    await dugiteGit.clone(url, dir, auth ?? undefined, (phase, loaded, total) => {
+                        if (phase === "receiving objects") {
+                            progress.report({
+                                message: `${phase}: ${loaded}/${total} objects`,
+                                increment: ((loaded ?? 0) / (total || 1)) * 100,
+                            });
+                        }
                     });
                 } catch (error) {
                     console.error("Clone error:", error);
@@ -3103,13 +2982,12 @@ export class GitService {
     }
 
     async add(dir: string, filepath: string): Promise<void> {
-        await git.add({ fs, dir, filepath });
+        await dugiteGit.add(dir, filepath);
     }
 
     async init(dir: string): Promise<void> {
         try {
-            await git.init({ fs, dir, defaultBranch: "main" });
-            await git.branch({ fs, dir, ref: "main", checkout: true });
+            await dugiteGit.init(dir);
         } catch (error) {
             console.error("Init error:", error);
             throw new Error(
@@ -3120,7 +2998,7 @@ export class GitService {
 
     async getRemoteUrl(dir: string): Promise<string | undefined> {
         try {
-            const remotes = await git.listRemotes({ fs, dir });
+            const remotes = await dugiteGit.listRemotes(dir);
             const origin = remotes.find((remote) => remote.remote === "origin");
             return origin?.url;
             // const sanitizedUrl = this.stripCredentialsFromUrl(origin?.url || "");
@@ -3132,17 +3010,17 @@ export class GitService {
     }
 
     async getRemotes(dir: string): Promise<Array<{ remote: string; url: string; }>> {
-        return git.listRemotes({ fs, dir });
+        return dugiteGit.listRemotes(dir);
     }
 
     async addRemote(dir: string, name: string, url: string): Promise<void> {
         try {
-            await git.addRemote({ fs, dir, remote: name, url });
+            await dugiteGit.addRemote(dir, name, url);
         } catch (error) {
             // If remote already exists, update it
             if (error instanceof Error && error.message.includes("already exists")) {
-                await git.deleteRemote({ fs, dir, remote: name });
-                await git.addRemote({ fs, dir, remote: name, url });
+                await dugiteGit.deleteRemote(dir, name);
+                await dugiteGit.addRemote(dir, name, url);
             } else {
                 throw error;
             }
@@ -3151,7 +3029,7 @@ export class GitService {
 
     async hasGitRepository(dir: string): Promise<boolean> {
         try {
-            await git.resolveRef({ fs, dir, ref: "HEAD" });
+            await dugiteGit.resolveRef(dir, "HEAD");
             return true;
         } catch (error) {
             return false;
@@ -3164,7 +3042,7 @@ export class GitService {
     }
 
     async setConfig(dir: string, path: string, value: string): Promise<void> {
-        await git.setConfig({ fs, dir, path, value });
+        await dugiteGit.setConfig(dir, path, value);
     }
 
     async push(
@@ -3337,7 +3215,7 @@ export class GitService {
         }
 
         // Fallback: regular add
-        await git.add({ fs, dir, filepath });
+        await dugiteGit.add(dir, filepath);
     }
 
     async isOnline(): Promise<boolean> {
@@ -3525,7 +3403,7 @@ export class GitService {
         try {
             const absPath = path.join(dir, filepath);
             const bytes = await fs.promises.readFile(absPath);
-            const buildPointerInfo = (lfs as any).buildPointerInfo;
+            // buildPointerInfo is now imported from lfsPointerUtils
             if (!buildPointerInfo) {
                 return null;
             }
@@ -3547,8 +3425,8 @@ export class GitService {
         filepath: string
     ): Promise<{ oid: string; size: number; } | null> {
         try {
-            const headOid = await git.resolveRef({ fs, dir, ref: "HEAD" });
-            const { blob } = await git.readBlob({ fs, dir, oid: headOid, filepath });
+            const headOid = await dugiteGit.resolveRef(dir, "HEAD");
+            const blob = await dugiteGit.readBlobAtRef(dir, headOid, filepath);
             const text = new TextDecoder().decode(blob);
             return this.parseLfsPointer(text);
         } catch {
@@ -3636,7 +3514,7 @@ export class GitService {
         // If not LFS-tracked, do normal add
         if (!(await this.isLfsTracked(dir, filepath))) {
             this.debugLog(`[GitService] ${filepath} is not LFS-tracked; adding as normal`);
-            await git.add({ fs, dir, filepath });
+            await dugiteGit.add(dir, filepath);
             return false;
         }
         this.debugLog(`[GitService] ${filepath} is LFS-tracked; adding as LFS`);
@@ -3649,7 +3527,7 @@ export class GitService {
         if (!remoteUrl) {
             // Fall back: just add as normal if we have no remote yet
             console.warn(`[GitService] No remote URL; adding ${filepath} without LFS`);
-            await git.add({ fs, dir, filepath });
+            await dugiteGit.add(dir, filepath);
             return false;
         }
         const { cleanUrl, auth } = GitService.parseGitUrl(remoteUrl);
@@ -3666,7 +3544,7 @@ export class GitService {
 
         if (!effectiveAuth) {
             console.warn(`[GitService] No auth; adding ${filepath} without LFS`);
-            await git.add({ fs, dir, filepath });
+            await dugiteGit.add(dir, filepath);
             return false;
         }
 
@@ -3685,7 +3563,7 @@ export class GitService {
                     `[GitService] ${filepath} is already an LFS pointer; staging without upload`
                 );
                 // Normalize pointer content and stage
-                const canonicalPointer = lfs.formatPointerInfo({
+                const canonicalPointer = formatPointerInfo({
                     oid: existingPointer.oid,
                     size: existingPointer.size,
                 } as any);
@@ -3693,7 +3571,7 @@ export class GitService {
                     absolutePathToPointerFill,
                     Buffer.from(canonicalPointer)
                 );
-                await git.add({ fs, dir, filepath });
+                await dugiteGit.add(dir, filepath);
 
                 if (this.isPointerPath(filepath)) {
                     // If files dir has real bytes, attempt to upload so the new repo has LFS objects
@@ -3711,7 +3589,7 @@ export class GitService {
                         if (!maybePointer) {
                             try {
                                 // Verify bytes match the pointer OID/size before uploading
-                                const buildPointerInfo = (lfs as any).buildPointerInfo;
+                                // buildPointerInfo is now imported from lfsPointerUtils
                                 const info = buildPointerInfo ? await buildPointerInfo(blobBytes) : null;
                                 const oid = String((info as any)?.oid ?? "");
                                 const size = Number((info as any)?.size ?? 0);
@@ -3795,11 +3673,11 @@ export class GitService {
             );
             return false;
         }
-        const pointerBlob = lfs.formatPointerInfo(pointerInfos[0]);
+        const pointerBlob = formatPointerInfo(pointerInfos[0]);
 
         // Write pointer and stage it
         await fs.promises.writeFile(absolutePathToPointerFill, Buffer.from(pointerBlob));
-        await git.add({ fs, dir, filepath });
+        await dugiteGit.add(dir, filepath);
         // If the pointer lives under pointers directory, ensure materialized bytes exist in files directory
         if (this.isPointerPath(filepath)) {
             const filesAbs = this.getFilesPathForPointer(dir, filepath);

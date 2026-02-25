@@ -3,6 +3,7 @@
 "use strict";
 
 const path = require("path");
+const CopyWebpackPlugin = require("copy-webpack-plugin");
 
 //@ts-check
 /** @typedef {import('webpack').Configuration} WebpackConfig **/
@@ -23,14 +24,11 @@ const config = {
         // Don't bundle these Node.js native modules
         "utf-8-validate": "commonjs utf-8-validate",
         bufferutil: "commonjs bufferutil",
+        // Note: dugite and tar are bundled by webpack (their JS source is small).
+        // dugite's binary is NOT bundled — it downloads at runtime via gitBinaryManager.
     },
     resolve: {
         extensions: [".ts", ".js"],
-        fallback: {
-            fs: require.resolve("memfs"),
-            path: require.resolve("path-browserify"),
-            crypto: require.resolve("crypto-browserify"),
-        },
     },
     module: {
         rules: [
@@ -48,6 +46,16 @@ const config = {
     experiments: {
         asyncWebAssembly: true,
     },
+    plugins: [
+        new CopyWebpackPlugin({
+            patterns: [
+                {
+                    from: "src/git/askpass.js",
+                    to: "askpass.js",
+                },
+            ],
+        }),
+    ],
     ignoreWarnings: [/Critical dependency/],
     devtool: "nosources-source-map",
     infrastructureLogging: {

@@ -3,10 +3,16 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import * as git from "isomorphic-git";
+import { execSync } from "child_process";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { GitLabService } from "../../../gitlab/GitLabService";
 import { SCMManager } from "../../../scm/SCMManager";
 import { StateManager } from "../../../state";
+
+/** Helper: update a git ref. */
+const gitWriteRef = (dir: string, ref: string, value: string): void => {
+    execSync(`git update-ref ${ref} ${value}`, { cwd: dir });
+};
 
 suite("Integration: clone with stream-and-save does not bulk download", () => {
     let workspaceDir: string;
@@ -14,6 +20,9 @@ suite("Integration: clone with stream-and-save does not bulk download", () => {
     let originalClone: any;
 
     suiteSetup(async () => {
+        // Point dugite at system git for tests
+        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
         assert.ok(ext, "Extension not found");
         await ext!.activate();
@@ -30,7 +39,7 @@ suite("Integration: clone with stream-and-save does not bulk download", () => {
 
     setup(async () => {
         workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "frontier-clone-sas-"));
-        await git.init({ fs, dir: workspaceDir, defaultBranch: "main" });
+        await dugiteGit.init(workspaceDir);
 
         const pointerRel = ".project/attachments/pointers/audio/on-demand.wav";
         const pointerAbs = path.join(workspaceDir, pointerRel);
@@ -44,13 +53,13 @@ suite("Integration: clone with stream-and-save does not bulk download", () => {
             ].join("\n"),
             "utf8"
         );
-        await git.add({ fs, dir: workspaceDir, filepath: pointerRel });
-        const head = await git.commit({ fs, dir: workspaceDir, message: "add ptr", author: { name: "T", email: "t@e" } });
-        await git.addRemote({ fs, dir: workspaceDir, remote: "origin", url: "https://example.com/repo.git" });
-        await git.writeRef({ fs, dir: workspaceDir, ref: "refs/remotes/origin/main", value: head, force: true });
+        await dugiteGit.add(workspaceDir, pointerRel);
+        const head = await dugiteGit.commit(workspaceDir, "add ptr", { name: "T", email: "t@e" });
+        await dugiteGit.addRemote(workspaceDir, "origin", "https://example.com/repo.git");
+        gitWriteRef(workspaceDir, "refs/remotes/origin/main", head);
 
-        originalClone = (git as any).clone;
-        (git as any).clone = async () => {};
+        originalClone = (dugiteGit as any).clone;
+        (dugiteGit as any).clone = async () => {};
 
         originalFetch = (globalThis as any).fetch;
         (globalThis as any).fetch = async (input: any, init?: any) => {
@@ -86,7 +95,7 @@ suite("Integration: clone with stream-and-save does not bulk download", () => {
 
     teardown(async () => {
         (globalThis as any).fetch = originalFetch;
-        if (originalClone) (git as any).clone = originalClone;
+        if (originalClone) (dugiteGit as any).clone = originalClone;
         try { fs.rmSync(workspaceDir, { recursive: true, force: true }); } catch {}
         if ((global as any).__restoreGetRemoteUrl) { (global as any).__restoreGetRemoteUrl(); delete (global as any).__restoreGetRemoteUrl; }
     });

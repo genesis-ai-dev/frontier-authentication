@@ -3,10 +3,16 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import * as git from "isomorphic-git";
+import { execSync } from "child_process";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { GitLabService } from "../../../gitlab/GitLabService";
 import { SCMManager } from "../../../scm/SCMManager";
 import { StateManager } from "../../../state";
+
+/** Helper: update a git ref. */
+const gitWriteRef = (dir: string, ref: string, value: string): void => {
+    execSync(`git update-ref ${ref} ${value}`, { cwd: dir });
+};
 
 suite("Integration: clone respects mediaStrategy", () => {
     let workspaceDir: string;
@@ -15,6 +21,9 @@ suite("Integration: clone respects mediaStrategy", () => {
     let originalGetRemoteUrl: any;
 
     suiteSetup(async () => {
+        // Point dugite at system git for tests
+        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
         assert.ok(ext, "Extension not found");
         await ext!.activate();
@@ -36,15 +45,10 @@ suite("Integration: clone respects mediaStrategy", () => {
     setup(async () => {
         workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "frontier-clone-ms-"));
 
-        await git.init({ fs, dir: workspaceDir, defaultBranch: "main" });
+        await dugiteGit.init(workspaceDir);
         await fs.promises.writeFile(path.join(workspaceDir, "README.md"), "hello", "utf8");
-        await git.add({ fs, dir: workspaceDir, filepath: "README.md" });
-        const headOid = await git.commit({
-            fs,
-            dir: workspaceDir,
-            message: "initial",
-            author: { name: "Tester", email: "tester@example.com" },
-        });
+        await dugiteGit.add(workspaceDir, "README.md");
+        const headOid = await dugiteGit.commit(workspaceDir, "initial", { name: "Tester", email: "tester@example.com" });
 
         // Add a pointer under pointers dir
         const fakeOid = "c".repeat(64);
@@ -57,22 +61,17 @@ suite("Integration: clone respects mediaStrategy", () => {
             "size 11",
         ].join("\n");
         await fs.promises.writeFile(pointerAbs, pointerText, "utf8");
-        await git.add({ fs, dir: workspaceDir, filepath: pointerRel });
-        const newHead = await git.commit({
-            fs,
-            dir: workspaceDir,
-            message: "add pointer",
-            author: { name: "Tester", email: "tester@example.com" },
-        });
+        await dugiteGit.add(workspaceDir, pointerRel);
+        const newHead = await dugiteGit.commit(workspaceDir, "add pointer", { name: "Tester", email: "tester@example.com" });
 
         // Simulate remote by setting origin and remote ref to HEAD
         const remoteUrl = "https://example.com/repo.git";
-        await git.addRemote({ fs, dir: workspaceDir, remote: "origin", url: remoteUrl });
-        await git.writeRef({ fs, dir: workspaceDir, ref: "refs/remotes/origin/main", value: newHead, force: true });
+        await dugiteGit.addRemote(workspaceDir, "origin", remoteUrl);
+        gitWriteRef(workspaceDir, "refs/remotes/origin/main", newHead);
 
-        // Stub git.clone to avoid network and skip actual clone since repo already present
-        originalClone = (git as any).clone;
-        (git as any).clone = async () => {};
+        // Stub dugiteGit.clone to avoid network and skip actual clone since repo already present
+        originalClone = (dugiteGit as any).clone;
+        (dugiteGit as any).clone = async () => {};
 
         // Stub fetch to satisfy LFS batch/download for auto-download case
         originalFetch = (globalThis as any).fetch;
@@ -130,7 +129,7 @@ suite("Integration: clone respects mediaStrategy", () => {
 
     teardown(async () => {
         (globalThis as any).fetch = originalFetch;
-        if (originalClone) (git as any).clone = originalClone;
+        if (originalClone) (dugiteGit as any).clone = originalClone;
         try { fs.rmSync(workspaceDir, { recursive: true, force: true }); } catch {}
         if (originalGetRemoteUrl) {
             const { GitService } = require("../../../git/GitService");

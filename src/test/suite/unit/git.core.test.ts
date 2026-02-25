@@ -2,7 +2,7 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import * as git from "isomorphic-git";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { GitService } from "../../../git/GitService";
 
 suite("Git core actions", () => {
@@ -16,6 +16,11 @@ suite("Git core actions", () => {
     };
 
     const service = new GitService(stateStub);
+
+    suiteSetup(() => {
+        // Point dugite at system git for tests
+        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+    });
 
     setup(async () => {
         repoDir = fs.mkdtempSync(path.join(tmpRoot, "repo-"));
@@ -34,13 +39,8 @@ suite("Git core actions", () => {
         // Make initial commit
         const fp = path.join(repoDir, "init.txt");
         await fs.promises.writeFile(fp, "hello", "utf8");
-        await git.add({ fs, dir: repoDir, filepath: "init.txt" });
-        await git.commit({
-            fs,
-            dir: repoDir,
-            message: "init",
-            author: { name: "T", email: "t@example.com" },
-        });
+        await dugiteGit.add(repoDir, "init.txt");
+        await dugiteGit.commit(repoDir, "init", { name: "T", email: "t@example.com" });
         assert.strictEqual(await service.hasGitRepository(repoDir), true);
     });
 
@@ -62,19 +62,14 @@ suite("Git core actions", () => {
         // Stage both
         await service.addAll(repoDir);
         // Commit
-        await git.commit({
-            fs,
-            dir: repoDir,
-            message: "add a,b",
-            author: { name: "T", email: "t@example.com" },
-        });
+        await dugiteGit.commit(repoDir, "add a,b", { name: "T", email: "t@example.com" });
         // Modify a and delete b
         await fs.promises.writeFile(a, "2", "utf8");
         await fs.promises.unlink(b);
         // addAll should stage modified and schedule deletion
         await service.addAll(repoDir);
         // Inspect index vs workdir using statusMatrix
-        const status = await git.statusMatrix({ fs, dir: repoDir });
+        const status = await dugiteGit.statusMatrix(repoDir);
         // a.txt should have staged changes; b.txt should be removed
         const aEntry = status.find(([f]) => f === "a.txt");
         const bEntry = status.find(([f]) => f === "b.txt");
@@ -91,34 +86,25 @@ suite("Git core actions", () => {
         await service.addRemote(repoDir, "origin", remote);
         // Prepare a commit so push is callable
         await fs.promises.writeFile(path.join(repoDir, "c.txt"), "x", "utf8");
-        await git.add({ fs, dir: repoDir, filepath: "c.txt" });
-        await git.commit({
-            fs,
-            dir: repoDir,
-            message: "c",
-            author: { name: "T", email: "t@example.com" },
-        });
+        await dugiteGit.add(repoDir, "c.txt");
+        await dugiteGit.commit(repoDir, "c", { name: "T", email: "t@example.com" });
 
-        // Stub isomorphic-git push to capture onAuth
-        let onAuthCalled = false;
-        const origPush = (git as any).push;
-        (git as any).push = async (opts: any) => {
-            if (typeof opts.onAuth === "function") {
-                const creds = opts.onAuth();
-                onAuthCalled = creds?.username === "oauth2" && !!creds?.password;
-            }
-            return {};
+        // Stub dugiteGit push to capture auth
+        let authReceived = false;
+        const origPush = (dugiteGit as any).push;
+        (dugiteGit as any).push = async (_dir: string, auth: any) => {
+            authReceived = auth?.username === "oauth2" && !!auth?.password;
         };
 
         try {
             await service.push(repoDir, { username: "oauth2", password: "token" });
             assert.strictEqual(
-                onAuthCalled,
+                authReceived,
                 true,
-                "onAuth should be called with provided credentials"
+                "Auth should be passed with provided credentials"
             );
         } finally {
-            (git as any).push = origPush;
+            (dugiteGit as any).push = origPush;
         }
     });
 });

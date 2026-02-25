@@ -3,10 +3,16 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import * as git from "isomorphic-git";
+import { execSync } from "child_process";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { GitLabService } from "../../../gitlab/GitLabService";
 import { SCMManager } from "../../../scm/SCMManager";
 import { StateManager } from "../../../state";
+
+/** Helper: update a git ref. */
+const gitWriteRef = (dir: string, ref: string, value: string): void => {
+    execSync(`git update-ref ${ref} ${value}`, { cwd: dir });
+};
 
 suite("Integration: unsynced local media preserved across strategies", () => {
     let workspaceDir: string;
@@ -14,6 +20,9 @@ suite("Integration: unsynced local media preserved across strategies", () => {
     let originalClone: any;
 
     suiteSetup(async () => {
+        // Point dugite at system git for tests
+        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
         assert.ok(ext, "Extension not found");
         await ext!.activate();
@@ -33,7 +42,7 @@ suite("Integration: unsynced local media preserved across strategies", () => {
 
     setup(async () => {
         workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "frontier-unsynced-"));
-        await git.init({ fs, dir: workspaceDir, defaultBranch: "main" });
+        await dugiteGit.init(workspaceDir);
 
         // Commit a pointer tracked by git
         const ptrRel = ".project/attachments/pointers/audio/remote.wav";
@@ -48,8 +57,8 @@ suite("Integration: unsynced local media preserved across strategies", () => {
             ].join("\n"),
             "utf8"
         );
-        await git.add({ fs, dir: workspaceDir, filepath: ptrRel });
-        const head = await git.commit({ fs, dir: workspaceDir, message: "add ptr", author: { name: "T", email: "t@e" } });
+        await dugiteGit.add(workspaceDir, ptrRel);
+        const head = await dugiteGit.commit(workspaceDir, "add ptr", { name: "T", email: "t@e" });
 
         // Add a local-only unsynced recording (not tracked in git)
         const localOnlyAbs = path.join(workspaceDir, ".project/attachments/files/audio/local-only.wav");
@@ -57,12 +66,12 @@ suite("Integration: unsynced local media preserved across strategies", () => {
         await fs.promises.writeFile(localOnlyAbs, Buffer.from("local-bytes"));
 
         // Set remote and ref
-        await git.addRemote({ fs, dir: workspaceDir, remote: "origin", url: "https://example.com/repo.git" });
-        await git.writeRef({ fs, dir: workspaceDir, ref: "refs/remotes/origin/main", value: head, force: true });
+        await dugiteGit.addRemote(workspaceDir, "origin", "https://example.com/repo.git");
+        gitWriteRef(workspaceDir, "refs/remotes/origin/main", head);
 
         // Stub clone to avoid network
-        originalClone = (git as any).clone;
-        (git as any).clone = async () => {};
+        originalClone = (dugiteGit as any).clone;
+        (dugiteGit as any).clone = async () => {};
 
         // Stub fetch for LFS
         originalFetch = (globalThis as any).fetch;
@@ -117,7 +126,7 @@ suite("Integration: unsynced local media preserved across strategies", () => {
 
     teardown(async () => {
         (globalThis as any).fetch = originalFetch;
-        if (originalClone) (git as any).clone = originalClone;
+        if (originalClone) (dugiteGit as any).clone = originalClone;
         try { fs.rmSync(workspaceDir, { recursive: true, force: true }); } catch {}
         if ((global as any).__restoreGetRemoteUrl2) { (global as any).__restoreGetRemoteUrl2(); delete (global as any).__restoreGetRemoteUrl2; }
     });

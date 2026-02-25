@@ -3,8 +3,7 @@ import * as path from "path";
 import * as fs from "fs";
 import { ConflictedFile, GitService } from "../git/GitService";
 import { GitLabService } from "../gitlab/GitLabService";
-import * as git from "isomorphic-git";
-import http from "isomorphic-git/http/node";
+import * as dugiteGit from "../git/dugiteGit";
 import { PublishWorkspaceOptions } from "../commands/scmCommands";
 import { StateManager } from "../state";
 import { ResolvedFile } from "../extension";
@@ -490,36 +489,26 @@ export class SCMManager {
             // Fetch and check remote metadata.json requirements without merging
             try {
                 // Fetch latest remote refs
-                await git.fetch({
-                    fs,
-                    http,
-                    dir: workspacePath,
-                    onAuth: () => auth,
-                });
+                await dugiteGit.fetchOrigin(workspacePath, auth);
 
-                const currentBranch = await git.currentBranch({ fs, dir: workspacePath });
+                const currentBranch = await dugiteGit.currentBranch(workspacePath);
                 if (currentBranch) {
                     const remoteRef = `refs/remotes/origin/${currentBranch}`;
                     let remoteHead: string | undefined;
                     try {
-                        remoteHead = await git.resolveRef({
-                            fs,
-                            dir: workspacePath,
-                            ref: remoteRef,
-                        });
+                        remoteHead = await dugiteGit.resolveRef(workspacePath, remoteRef);
                     } catch (e) {
                         // No remote branch yet; skip remote metadata check
                     }
 
                     if (remoteHead) {
                         try {
-                            const result = await git.readBlob({
-                                fs,
-                                dir: workspacePath,
-                                oid: remoteHead,
-                                filepath: "metadata.json",
-                            });
-                            const text = new TextDecoder().decode(result.blob);
+                            const blob = await dugiteGit.readBlobAtRef(
+                                workspacePath,
+                                remoteHead,
+                                "metadata.json",
+                            );
+                            const text = new TextDecoder().decode(blob);
                             const remoteMetadata = JSON.parse(text) as {
                                 meta?: {
                                     requiredExtensions?: {

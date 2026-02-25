@@ -12,6 +12,9 @@ import {
 import { initialState, StateManager } from "./state";
 import { AuthState } from "./types/state";
 import { ConflictedFile, GitService as GitServiceClass } from "./git/GitService";
+import * as gitBinaryManager from "./git/gitBinaryManager";
+import * as dugiteGit from "./git/dugiteGit";
+import * as path from "path";
 
 // Module-level gitService instance
 let gitServiceInstance: GitServiceClass | undefined;
@@ -135,6 +138,12 @@ export interface FrontierAPI {
         path?: string,
         ref?: string
     ) => Promise<Array<{ name: string; path: string; type: "blob" | "tree" }>>;
+
+    /**
+     * Get the path to the dugite-native git binary (downloaded at runtime).
+     * Used by codex-editor to share the same binary without downloading again.
+     */
+    getGitBinaryPath: () => { localGitDir: string; execPath: string } | undefined;
 }
 
 export interface ResolvedFile {
@@ -171,6 +180,28 @@ export async function activate(context: vscode.ExtensionContext) {
         console.error("Error initializing authentication provider:", error);
         // Continue anyway, as initialization errors will be handled gracefully
         // and retried with exponential backoff as needed
+    }
+
+    // Initialize git binary (downloads dugite-native if needed)
+    try {
+        const gitPaths = await gitBinaryManager.ensureGitBinary(context);
+        dugiteGit.setGitBinaryPath(gitPaths.localGitDir, gitPaths.execPath);
+
+        // Set the askpass script path for credential injection and ensure it's executable
+        const askpassPath = path.join(context.extensionPath, "dist", "askpass.js");
+        try {
+            await import("fs").then((fs) => fs.promises.chmod(askpassPath, 0o755));
+        } catch {
+            // May fail on read-only filesystems; git will fall back gracefully
+        }
+        dugiteGit.setAskpassPath(askpassPath);
+
+        console.log("[Frontier] Git binary initialized:", gitPaths.localGitDir);
+    } catch (error) {
+        console.error("[Frontier] Failed to initialize git binary:", error);
+        vscode.window.showWarningMessage(
+            "Failed to download Git runtime. Some features may not work. Please check your internet connection and restart.",
+        );
     }
 
     // Create GitService for debug logging control
@@ -502,6 +533,8 @@ export async function activate(context: vscode.ExtensionContext) {
                 throw e;
             }
         },
+
+        getGitBinaryPath: () => gitBinaryManager.getResolvedPath(),
     };
 
     return frontierAPI;

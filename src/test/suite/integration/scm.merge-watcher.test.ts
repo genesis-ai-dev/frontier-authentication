@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { registerMockAuthProvider } from "../../helpers/mockAuthProvider";
 import { SCMManager } from "../../../scm/SCMManager";
 import { GitLabService } from "../../../gitlab/GitLabService";
@@ -14,6 +15,9 @@ suite("Integration: SCMManager Merge & File Watcher", () => {
     let mockContext: vscode.ExtensionContext;
 
     suiteSetup(async () => {
+        // Point dugite at system git for tests
+        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+
         mockProvider = await registerMockAuthProvider();
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
         assert.ok(ext, "Extension not found");
@@ -66,15 +70,15 @@ suite("Integration: SCMManager Merge & File Watcher", () => {
         ];
 
         // Mock operations
-        const originalFetch = require("isomorphic-git").fetch;
-        const originalResolveRef = require("isomorphic-git").resolveRef;
-        const originalCommit = require("isomorphic-git").commit;
-        const originalPush = require("isomorphic-git").push;
+        const originalFetchOrigin = dugiteGit.fetchOrigin;
+        const originalResolveRef = dugiteGit.resolveRef;
+        const originalCommit = dugiteGit.commit;
+        const originalPush = dugiteGit.push;
 
-        (require("isomorphic-git") as any).fetch = async () => ({});
-        (require("isomorphic-git") as any).resolveRef = async () => "hash";
-        (require("isomorphic-git") as any).commit = async () => "merge-hash";
-        (require("isomorphic-git") as any).push = async () => ({});
+        (dugiteGit as any).fetchOrigin = async () => {};
+        (dugiteGit as any).resolveRef = async () => "hash";
+        (dugiteGit as any).commit = async () => "merge-hash";
+        (dugiteGit as any).push = async () => {};
 
         try {
             await scmManager.completeMerge(resolvedFiles, workspaceDir);
@@ -83,11 +87,10 @@ suite("Integration: SCMManager Merge & File Watcher", () => {
             // May fail if files don't exist, but should handle multiple files
             assert.ok(error instanceof Error);
         } finally {
-            (require("isomorphic-git") as any).fetch = originalFetch;
-            (require("isomorphic-git") as any).resolveRef = originalResolveRef;
-            (require("isomorphic-git") as any).commit = originalCommit;
-            (require("isomorphic-git") as any).push = originalPush;
+            (dugiteGit as any).fetchOrigin = originalFetchOrigin;
+            (dugiteGit as any).resolveRef = originalResolveRef;
+            (dugiteGit as any).commit = originalCommit;
+            (dugiteGit as any).push = originalPush;
         }
     });
 });
-
