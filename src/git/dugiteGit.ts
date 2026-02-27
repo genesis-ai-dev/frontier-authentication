@@ -73,14 +73,29 @@ export function getGitBinaryPaths(): { localGitDir: string; execPath: string } |
 // ---------------------------------------------------------------------------
 
 /**
- * Low-level exec wrapper that injects the binary path env vars into every call.
+ * Config flags prepended to every git invocation to prevent native git from
+ * invoking git-lfs filter processes.  We handle all LFS operations manually
+ * (upload, download, pointer creation), so the built-in filter must stay out
+ * of the way — especially because dugite's bundled git binary does not ship
+ * with git-lfs.
+ */
+const LFS_OVERRIDE_FLAGS = [
+    "-c", "filter.lfs.process=",
+    "-c", "filter.lfs.clean=cat",
+    "-c", "filter.lfs.smudge=cat",
+    "-c", "filter.lfs.required=false",
+];
+
+/**
+ * Low-level exec wrapper that injects the binary path env vars into every call
+ * and disables git-lfs filters via one-shot `-c` flags.
  */
 async function gitExec(
     args: string[],
     dir: string,
     options?: IGitExecutionOptions,
 ): Promise<IGitResult> {
-    return exec(args, dir, {
+    return exec([...LFS_OVERRIDE_FLAGS, ...args], dir, {
         ...options,
         env: { ...gitEnvOverrides, ...options?.env },
     });
@@ -180,9 +195,11 @@ export async function setConfig(dir: string, key: string, value: string): Promis
 }
 
 /**
- * Disable LFS filter rules so that native git does not invoke git-lfs
- * during add/checkout.  Useful in test environments where git-lfs is not
- * installed alongside the system git binary.
+ * Persist LFS filter overrides into the repo's .git/config so that any
+ * git invocation (even outside dugiteGit) skips git-lfs filters.
+ *
+ * Note: gitExec() already passes ephemeral `-c` overrides on every call,
+ * so this is only needed when external tools may touch the repo.
  */
 export async function disableLfsFilters(dir: string): Promise<void> {
     await setConfig(dir, "filter.lfs.process", "");
