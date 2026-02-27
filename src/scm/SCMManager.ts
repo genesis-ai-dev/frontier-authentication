@@ -420,6 +420,8 @@ export class SCMManager {
     ): Promise<{
         hasConflicts: boolean;
         conflicts?: ConflictedFile[];
+        /** True when sync was blocked by a pre-condition (e.g., outdated extensions). */
+        blocked?: boolean;
         /**
          * Optional diagnostics to help clients validate remote changes vs merged conflicts.
          */
@@ -429,7 +431,7 @@ export class SCMManager {
         // Check extension version compatibility with project metadata before syncing
         const canSync = await checkMetadataVersionsForSync(this.context, isManualSync);
         if (!canSync) {
-            return { hasConflicts: false };
+            return { hasConflicts: false, blocked: true };
         }
 
         // Check if another sync is already in progress before firing 'started' event
@@ -564,7 +566,7 @@ export class SCMManager {
                                         isManualSync
                                     );
                                     if (!allow) {
-                                        return { hasConflicts: false };
+                                        return { hasConflicts: false, blocked: true };
                                     }
                                 }
                             }

@@ -360,6 +360,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 hasConflicts: boolean;
                 conflicts?: Array<ConflictedFile>;
                 offline?: boolean;
+                blocked?: boolean;
             }>,
         completeMerge: async (resolvedFiles: ResolvedFile[], workspacePath: string | undefined) =>
             vscode.commands.executeCommand(
