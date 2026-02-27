@@ -217,6 +217,12 @@ function isValidLFSInfoResponseData(val: unknown): val is LFSBatchResponse {
 /**
  * replace @fetsorn/isogit-lfs uploadBlobs function with corrected validation
  */
+type LfsFileStatus = {
+    index: number;
+    size: number;
+    alreadyOnServer: boolean;
+};
+
 async function uploadBlobsToLFSBucket(
     {
         headers = {},
@@ -224,7 +230,8 @@ async function uploadBlobsToLFSBucket(
         auth,
         recovery,
     }: UploadBlobsOptions & { recovery?: { dir: string; filepaths: string[]; }; },
-    contents: Uint8Array[]
+    contents: Uint8Array[],
+    onFileStatus?: (status: LfsFileStatus) => void,
 ): Promise<LfsPointerInfo[]> {
     debugLog("[LFS Patch] Using patched uploadBlobs function");
     debugLog("[LFS Patch] URL:", url);
@@ -492,9 +499,12 @@ async function uploadBlobsToLFSBucket(
     // Upload each object (with per-file retry, concurrency-limited)
     const responseData = lfsInfoResponseData as LFSBatchResponse;
     const uploadTasks = responseData.objects.map((object, index: number) => async () => {
+            const fileSize = effectiveContents[index]?.length ?? 0;
+
             // Server already has file
             if (!object.actions) {
                 debugLog(`[LFS Patch] Server already has ${fileLabel(index)}`);
+                onFileStatus?.({ index, size: fileSize, alreadyOnServer: true });
                 return;
             }
 
@@ -502,6 +512,7 @@ async function uploadBlobsToLFSBucket(
             const upload = actions.upload;
             if (!upload?.href) {
                 debugLog(`[LFS Patch] No upload action provided for ${fileLabel(index)}`);
+                onFileStatus?.({ index, size: fileSize, alreadyOnServer: true });
                 return;
             }
 
@@ -552,6 +563,7 @@ async function uploadBlobsToLFSBucket(
                     }
 
                     debugLog(`[LFS Patch] ${fileLabel(index)} uploaded successfully`);
+                    onFileStatus?.({ index, size: fileSize, alreadyOnServer: false });
                 } catch (fetchError: any) {
                     clearTimeout(timeoutId);
                     console.error(`[LFS Patch] Network error uploading ${fileLabel(index)}:`, fetchError);
@@ -793,31 +805,56 @@ export class GitService {
     /**
      * Update sync progress for heartbeat and UI
      */
+    private static readonly USER_FRIENDLY_PHASE: Record<string, string> = {
+        pushing: "Uploading changes",
+        fetching: "Downloading changes",
+    };
+
+    private static formatBytes(bytes: number): string {
+        if (bytes < 1024) {
+            return `${bytes} B`;
+        }
+        if (bytes < 1024 * 1024) {
+            return `${(bytes / 1024).toFixed(1)} KB`;
+        }
+        if (bytes < 1024 * 1024 * 1024) {
+            return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+        }
+        return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+    }
+
     private updateSyncProgress(
         phase: string,
-        event: { loaded?: number; total?: number; phase?: string; }
+        event: {
+            loaded?: number;
+            total?: number;
+            phase?: string;
+            transferInfo?: string;
+        },
     ): void {
         const now = Date.now();
         const current = event.loaded || 0;
         const total = event.total || 0;
 
-        // Build description: use event.phase if provided, otherwise use our phase with counts
-        // If event.phase exists (e.g., from git), append the counts to it
+        // When event.phase comes from raw git stderr (e.g. "writing objects",
+        // "receiving objects") replace it with a user-friendly label derived
+        // from the high-level phase so end-users never see git internals.
+        const friendly = GitService.USER_FRIENDLY_PHASE[phase];
         let description: string;
-        if (event.phase) {
-            // Git provides descriptive phase like "Receiving objects" - add counts if available
-            if (total > 0) {
-                description = `${event.phase}: ${current}/${total}`;
-            } else {
-                description = event.phase;
-            }
+        if (event.phase && friendly) {
+            const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+            const sizePart = this.extractTransferSize(event.transferInfo);
+            const details = [
+                total > 0 ? `${pct}%` : undefined,
+                sizePart,
+            ].filter(Boolean).join(" — ");
+            description = details ? `${friendly} (${details})` : friendly;
+        } else if (event.phase) {
+            description = total > 0 ? `${event.phase}: ${current}/${total}` : event.phase;
+        } else if (total > 0) {
+            description = `${phase}: ${current}/${total}`;
         } else {
-            // Use our custom phase with counts if available
-            if (total > 0) {
-                description = `${phase}: ${current}/${total}`;
-            } else {
-                description = phase;
-            }
+            description = phase;
         }
 
         // Track real progress
@@ -851,6 +888,43 @@ export class GitService {
                 this.debugLog(`[GitService] Failed to call progress callback: ${error}`);
             }
         }
+    }
+
+    /**
+     * Pull the cumulative transfer size from git's progress suffix and
+     * normalise it to a human-readable string.
+     *
+     * Input examples: "1.20 MiB | 500.00 KiB/s", "1003 bytes", "256 bytes"
+     * Output examples: "1.20 MiB", "1.0 KB", "256 B"
+     */
+    private extractTransferSize(transferInfo?: string): string | undefined {
+        if (!transferInfo) {
+            return undefined;
+        }
+        const sizePart = transferInfo.split("|")[0].trim();
+        if (!sizePart) {
+            return undefined;
+        }
+
+        const match = sizePart.match(/^([\d.]+)\s*(bytes?|[KMGT]i?B)$/i);
+        if (!match) {
+            return sizePart;
+        }
+
+        const value = parseFloat(match[1]);
+        const unit = match[2].toLowerCase();
+
+        if (unit === "byte" || unit === "bytes") {
+            if (value < 1024) {
+                return `${Math.round(value)} B`;
+            }
+            if (value < 1024 * 1024) {
+                return `${(value / 1024).toFixed(1)} KB`;
+            }
+            return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+        }
+
+        return sizePart;
     }
 
     /**
@@ -1463,6 +1537,8 @@ export class GitService {
                 console.log(
                     `[GitService] ⬆️  Push progress: ${phase || "uploading"} ${loaded || 0}/${total || 0}`
                 );
+                // Don't forward git's transfer size — it only reflects pointer
+                // files, not the real LFS payload already uploaded earlier.
                 this.updateSyncProgress("pushing", { phase, loaded, total });
             },
         });
@@ -1651,11 +1727,11 @@ export class GitService {
             }
             try {
                 await this.withTimeout(
-                    dugiteGit.fetchOrigin(dir, auth, (phase, loaded, total) => {
+                    dugiteGit.fetchOrigin(dir, auth, (phase, loaded, total, transferInfo) => {
                         console.log(
                             `[GitService] ⬇️  Fetch progress: ${phase || "downloading"} ${loaded || 0}/${total || 0}`
                         );
-                        this.updateSyncProgress("fetching", { phase, loaded, total });
+                        this.updateSyncProgress("fetching", { phase, loaded, total, transferInfo });
                     }),
                     2 * 60 * 1000,
                     "Fetch operation"
@@ -2575,11 +2651,23 @@ export class GitService {
         // ── Phase 2: Batch-upload raw-bytes files ────────────────────────
         if (rawBytesFiles.length > 0 && lfsBaseUrl && effectiveAuth) {
             const totalBatches = Math.ceil(rawBytesFiles.length / LFS_UPLOAD_BATCH_SIZE);
+            const totalLfsBytes = rawBytesFiles.reduce((sum, f) => sum + f.bytes.length, 0);
             this.debugLog(
                 `[GitService] Batch-uploading ${rawBytesFiles.length} raw LFS files in ${totalBatches} batch(es) of up to ${LFS_UPLOAD_BATCH_SIZE}`
             );
 
-            // buildPointerInfo is now imported from lfsPointerUtils
+            if (this.progressCallback) {
+                this.progressCallback(
+                    "uploading_lfs",
+                    0,
+                    totalLfsBytes,
+                    `Uploading media (${GitService.formatBytes(totalLfsBytes)})`,
+                );
+            }
+
+            let processedBytes = 0;
+            let skippedBytes = 0;
+            let skippedCount = 0;
 
             for (let i = 0; i < rawBytesFiles.length; i += LFS_UPLOAD_BATCH_SIZE) {
                 const batch = rawBytesFiles.slice(i, i + LFS_UPLOAD_BATCH_SIZE);
@@ -2595,7 +2683,28 @@ export class GitService {
                         auth: effectiveAuth,
                         recovery: { dir, filepaths: batch.map((f) => f.filepath) },
                     },
-                    batch.map((f) => f.bytes)
+                    batch.map((f) => f.bytes),
+                    (status) => {
+                        processedBytes += status.size;
+                        if (status.alreadyOnServer) {
+                            skippedBytes += status.size;
+                            skippedCount++;
+                        }
+                        if (this.progressCallback) {
+                            const pct = totalLfsBytes > 0
+                                ? Math.round((processedBytes / totalLfsBytes) * 100)
+                                : 100;
+                            const skippedPart = skippedBytes > 0
+                                ? ` — ${GitService.formatBytes(skippedBytes)} already synced`
+                                : "";
+                            this.progressCallback(
+                                "uploading_lfs",
+                                processedBytes,
+                                totalLfsBytes,
+                                `Uploading media (${pct}% — ${GitService.formatBytes(processedBytes)} of ${GitService.formatBytes(totalLfsBytes)}${skippedPart})`,
+                            );
+                        }
+                    },
                 );
 
                 // uploadBlobsToLFSBucket may skip corrupted/empty files, so the
@@ -2648,6 +2757,12 @@ export class GitService {
 
                     uploadedLfsFiles.push(filepath);
                 }
+            }
+
+            if (skippedCount > 0) {
+                this.debugLog(
+                    `[GitService] ${skippedCount} LFS file(s) already on server (${GitService.formatBytes(skippedBytes)} skipped)`
+                );
             }
         }
 

@@ -170,10 +170,17 @@ export function parseGitProgress(data: string, onProgress?: ProgressCallback): v
     }
     const lines = data.split(/\r?\n|\r/);
     for (const line of lines) {
-        const match = line.match(/([\w\s]+?):\s+(\d+)%\s+\((\d+)\/(\d+)\)/);
+        const match = line.match(
+            /([\w\s]+?):\s+(\d+)%\s+\((\d+)\/(\d+)\)(?:,\s*(.+))?/,
+        );
         if (match) {
-            const [, phase, , current, total] = match;
-            onProgress(phase.trim().toLowerCase(), parseInt(current, 10), parseInt(total, 10));
+            const [, phase, , current, total, transferInfo] = match;
+            onProgress(
+                phase.trim().toLowerCase(),
+                parseInt(current, 10),
+                parseInt(total, 10),
+                transferInfo?.trim(),
+            );
         }
     }
 }
