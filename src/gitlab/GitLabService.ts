@@ -30,6 +30,7 @@ interface GitLabProject {
     name: string;
     description: string | null;
     visibility: "private" | "internal" | "public";
+    archived?: boolean;
     http_url_to_repo: string;
     web_url: string;
     created_at: string;

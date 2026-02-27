@@ -44,6 +44,7 @@ export function registerSCMCommands(
                     name: project.name,
                     description: project.description,
                     visibility: project.visibility,
+                    isArchived: project.archived ?? false,
                     url: project.http_url_to_repo,
                     webUrl: project.web_url,
                     lastActivity: project.last_activity_at,
