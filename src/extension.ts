@@ -144,6 +144,8 @@ export interface FrontierAPI {
      * Used by codex-editor to share the same binary without downloading again.
      */
     getGitBinaryPath: () => { localGitDir: string; execPath: string } | undefined;
+    isGitBinaryAvailable: () => boolean;
+    retryGitBinaryDownload: () => Promise<boolean>;
 }
 
 export interface ResolvedFile {
@@ -203,12 +205,12 @@ export async function activate(context: vscode.ExtensionContext) {
         } catch (error) {
             console.error("[Frontier] Failed to initialize git binary:", error);
             const choice = await vscode.window.showErrorMessage(
-                "Failed to download the Git runtime. The app cannot function without it. " +
-                "Please check your internet connection and try again.",
-                "Retry",
-                "Continue without Git",
+                "Failed to download the sync runtime. You can still work offline, but syncing " +
+                "will be unavailable until the runtime is installed. You can retry from Sync Settings.",
+                "Retry Now",
+                "Continue Offline",
             );
-            if (choice !== "Retry") {
+            if (choice !== "Retry Now") {
                 break;
             }
             // Reset resolved paths so ensureGitBinary retries from scratch
@@ -548,6 +550,21 @@ export async function activate(context: vscode.ExtensionContext) {
         },
 
         getGitBinaryPath: () => gitBinaryManager.getResolvedPath(),
+
+        isGitBinaryAvailable: () => gitBinaryManager.getResolvedPath() !== undefined,
+
+        retryGitBinaryDownload: async (): Promise<boolean> => {
+            try {
+                gitBinaryManager.resetResolvedPaths();
+                const gitPaths = await gitBinaryManager.ensureGitBinary(context);
+                dugiteGit.setGitBinaryPath(gitPaths.localGitDir, gitPaths.execPath);
+                console.log("[Frontier] Git binary downloaded via retry:", gitPaths.localGitDir);
+                return true;
+            } catch (error) {
+                console.error("[Frontier] Git binary retry failed:", error);
+                return false;
+            }
+        },
     };
 
     return frontierAPI;
