@@ -182,26 +182,38 @@ export async function activate(context: vscode.ExtensionContext) {
         // and retried with exponential backoff as needed
     }
 
-    // Initialize git binary (downloads dugite-native if needed)
-    try {
-        const gitPaths = await gitBinaryManager.ensureGitBinary(context);
-        dugiteGit.setGitBinaryPath(gitPaths.localGitDir, gitPaths.execPath);
-
-        // Set the askpass script path for credential injection and ensure it's executable
-        const askpassPath = path.join(context.extensionPath, "dist", "askpass.js");
+    // Initialize git binary (downloads dugite-native if needed).
+    // Offers the user a manual retry when all automatic attempts are exhausted.
+    let gitInitialized = false;
+    while (!gitInitialized) {
         try {
-            await import("fs").then((fs) => fs.promises.chmod(askpassPath, 0o755));
-        } catch {
-            // May fail on read-only filesystems; git will fall back gracefully
-        }
-        dugiteGit.setAskpassPath(askpassPath);
+            const gitPaths = await gitBinaryManager.ensureGitBinary(context);
+            dugiteGit.setGitBinaryPath(gitPaths.localGitDir, gitPaths.execPath);
 
-        console.log("[Frontier] Git binary initialized:", gitPaths.localGitDir);
-    } catch (error) {
-        console.error("[Frontier] Failed to initialize git binary:", error);
-        vscode.window.showWarningMessage(
-            "Failed to download Git runtime. Some features may not work. Please check your internet connection and restart.",
-        );
+            const askpassPath = path.join(context.extensionPath, "dist", "askpass.js");
+            try {
+                await import("fs").then((fsModule) => fsModule.promises.chmod(askpassPath, 0o755));
+            } catch {
+                // May fail on read-only filesystems; git will fall back gracefully
+            }
+            dugiteGit.setAskpassPath(askpassPath);
+
+            console.log("[Frontier] Git binary initialized:", gitPaths.localGitDir);
+            gitInitialized = true;
+        } catch (error) {
+            console.error("[Frontier] Failed to initialize git binary:", error);
+            const choice = await vscode.window.showErrorMessage(
+                "Failed to download the Git runtime. The app cannot function without it. " +
+                "Please check your internet connection and try again.",
+                "Retry",
+                "Continue without Git",
+            );
+            if (choice !== "Retry") {
+                break;
+            }
+            // Reset resolved paths so ensureGitBinary retries from scratch
+            gitBinaryManager.resetResolvedPaths();
+        }
     }
 
     // Create GitService for debug logging control

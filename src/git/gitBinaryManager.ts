@@ -68,6 +68,11 @@ export function getResolvedPath(): GitBinaryPaths | undefined {
     return resolvedPaths;
 }
 
+/** Reset cached paths so the next ensureGitBinary call retries from scratch. */
+export function resetResolvedPaths(): void {
+    resolvedPaths = undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -98,7 +103,9 @@ export async function ensureGitBinary(
         return resolvedPaths;
     }
 
-    // Download with progress UI
+    // Download with progress UI, retrying the entire flow up to MAX_FULL_RETRIES times
+    const MAX_FULL_RETRIES = 3;
+
     await vscode.window.withProgress(
         {
             location: vscode.ProgressLocation.Notification,
@@ -106,53 +113,72 @@ export async function ensureGitBinary(
             cancellable: false,
         },
         async (progress) => {
-            try {
-                // Clean up any partial installation
-                await fs.promises.rm(gitRootDir, { recursive: true, force: true });
-                await fs.promises.mkdir(gitRootDir, { recursive: true });
+            let lastError: Error | undefined;
 
-                progress.report({ message: "Finding platform binary..." });
+            for (let attempt = 1; attempt <= MAX_FULL_RETRIES; attempt++) {
+                try {
+                    // Clean up any partial installation from a previous attempt
+                    await fs.promises.rm(gitRootDir, { recursive: true, force: true });
+                    await fs.promises.mkdir(gitRootDir, { recursive: true });
 
-                // 1. Find the right asset for this platform
-                const asset = await findPlatformAsset();
+                    if (attempt > 1) {
+                        progress.report({
+                            message: `Retry ${attempt}/${MAX_FULL_RETRIES} — Finding platform binary...`,
+                        });
+                    } else {
+                        progress.report({ message: "Finding platform binary..." });
+                    }
 
-                progress.report({ message: `Downloading ${formatBytes(asset.size)}...` });
+                    const asset = await findPlatformAsset();
 
-                // 2. Download the tarball
-                const tarballPath = path.join(storageDir, "git-download.tar.gz");
-                await downloadFile(asset.browser_download_url, tarballPath, (pct) => {
-                    progress.report({
-                        message: `Downloading... ${pct}%`,
-                        increment: pct > 0 ? 1 : 0,
+                    const prefix = attempt > 1 ? `Retry ${attempt}/${MAX_FULL_RETRIES} — ` : "";
+
+                    progress.report({ message: `${prefix}Downloading ${formatBytes(asset.size)}...` });
+
+                    const tarballPath = path.join(storageDir, "git-download.tar.gz");
+                    await downloadFile(asset.browser_download_url, tarballPath, (pct) => {
+                        progress.report({
+                            message: `${prefix}Downloading... ${pct}%`,
+                            increment: pct > 0 ? 1 : 0,
+                        });
                     });
-                });
 
-                progress.report({ message: "Extracting..." });
+                    progress.report({ message: `${prefix}Extracting...` });
+                    await extractTarball(tarballPath, gitRootDir);
 
-                // 3. Extract
-                await extractTarball(tarballPath, gitRootDir);
+                    await fs.promises.unlink(tarballPath).catch(() => { });
 
-                // 4. Clean up tarball
-                await fs.promises.unlink(tarballPath).catch(() => { });
+                    if (process.platform !== "win32") {
+                        await makeExecutable(gitRootDir);
+                    }
 
-                // 5. Ensure binaries are executable (unix)
-                if (process.platform !== "win32") {
-                    await makeExecutable(gitRootDir);
+                    progress.report({ message: `${prefix}Verifying...` });
+
+                    if (!(await isValidInstallation(gitRootDir))) {
+                        throw new Error("Git binary verification failed after extraction");
+                    }
+
+                    console.log("[GitBinaryManager] Git binary installed at:", gitRootDir);
+                    return; // Success
+                } catch (error) {
+                    lastError = error instanceof Error ? error : new Error(String(error));
+                    await fs.promises.rm(gitRootDir, { recursive: true, force: true }).catch(() => { });
+
+                    if (attempt < MAX_FULL_RETRIES) {
+                        const delay = 2000 * Math.pow(2, attempt - 1);
+                        console.warn(
+                            `[GitBinaryManager] Full attempt ${attempt}/${MAX_FULL_RETRIES} failed, retrying in ${delay}ms:`,
+                            lastError.message,
+                        );
+                        progress.report({
+                            message: `Attempt ${attempt} failed — retrying in ${(delay / 1000).toFixed(0)}s...`,
+                        });
+                        await new Promise((resolve) => setTimeout(resolve, delay));
+                    }
                 }
-
-                progress.report({ message: "Verifying..." });
-
-                // 6. Verify
-                if (!(await isValidInstallation(gitRootDir))) {
-                    throw new Error("Git binary verification failed after extraction");
-                }
-
-                console.log("[GitBinaryManager] Git binary installed at:", gitRootDir);
-            } catch (error) {
-                // Clean up failed installation
-                await fs.promises.rm(gitRootDir, { recursive: true, force: true }).catch(() => { });
-                throw error;
             }
+
+            throw lastError ?? new Error("Git binary download failed after all retries");
         },
     );
 
@@ -192,7 +218,7 @@ async function isValidInstallation(gitRootDir: string): Promise<boolean> {
     }
 }
 
-/** Find the tar.gz asset for the current platform from the GitHub release. */
+/** Find the tar.gz asset for the current platform from the GitHub release (with retries). */
 async function findPlatformAsset(): Promise<GitHubAsset> {
     const platformKey = `${os.platform()}-${os.arch()}`;
     const targetSuffix = PLATFORM_MAP[platformKey];
@@ -204,36 +230,53 @@ async function findPlatformAsset(): Promise<GitHubAsset> {
         );
     }
 
-    // Fetch release metadata from GitHub API
-    const response = await fetch(GITHUB_API_RELEASE_URL, {
-        headers: {
-            Accept: "application/vnd.github.v3+json",
-            "User-Agent": "frontier-authentication-vscode",
-        },
-    });
+    const maxRetries = 3;
+    let lastError: Error | undefined;
 
-    if (!response.ok) {
-        throw new Error(
-            `Failed to fetch release info: ${response.status} ${response.statusText}`,
-        );
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            const response = await fetch(GITHUB_API_RELEASE_URL, {
+                headers: {
+                    Accept: "application/vnd.github.v3+json",
+                    "User-Agent": "frontier-authentication-vscode",
+                },
+            });
+
+            if (!response.ok) {
+                throw new Error(
+                    `Failed to fetch release info: ${response.status} ${response.statusText}`,
+                );
+            }
+
+            const release = (await response.json()) as GitHubRelease;
+
+            const assetPattern = new RegExp(
+                `dugite-native-.*-${targetSuffix.replace("-", "\\-")}\\.tar\\.gz$`,
+            );
+            const asset = release.assets.find((a) => assetPattern.test(a.name));
+
+            if (!asset) {
+                throw new Error(
+                    `No tar.gz asset found for ${targetSuffix} in release ${release.tag_name}. ` +
+                    `Available: ${release.assets.map((a) => a.name).join(", ")}`,
+                );
+            }
+
+            return asset;
+        } catch (error) {
+            lastError = error instanceof Error ? error : new Error(String(error));
+            if (attempt < maxRetries) {
+                const delay = 1000 * Math.pow(2, attempt);
+                console.warn(
+                    `[GitBinaryManager] Asset lookup attempt ${attempt + 1} failed, retrying in ${delay}ms:`,
+                    lastError.message,
+                );
+                await new Promise((resolve) => setTimeout(resolve, delay));
+            }
+        }
     }
 
-    const release = (await response.json()) as GitHubRelease;
-
-    // Find the tar.gz asset matching our platform
-    const assetPattern = new RegExp(
-        `dugite-native-.*-${targetSuffix.replace("-", "\\-")}\\.tar\\.gz$`,
-    );
-    const asset = release.assets.find((a) => assetPattern.test(a.name));
-
-    if (!asset) {
-        throw new Error(
-            `No tar.gz asset found for ${targetSuffix} in release ${release.tag_name}. ` +
-            `Available: ${release.assets.map((a) => a.name).join(", ")}`,
-        );
-    }
-
-    return asset;
+    throw lastError ?? new Error("Failed to find platform asset after retries");
 }
 
 /** Download a file from a URL to a local path with progress reporting. */
