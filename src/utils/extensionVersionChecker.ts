@@ -78,18 +78,18 @@ async function getExtensionVersionsViaCommand(): Promise<{
     error?: string;
 }> {
     try {
-        // Check if codex-editor is available
         const codexExtension = vscode.extensions.getExtension("project-accelerate.codex-editor-extension");
         if (!codexExtension) {
             return { success: false, error: "Codex Editor extension not available" };
         }
 
-        // Ensure it's activated
+        // Never force-activate codex-editor here: this function is called from
+        // the version-check command that codex-editor itself may await during its
+        // own activation, which would create a circular-wait deadlock.
         if (!codexExtension.isActive) {
-            await codexExtension.activate();
+            return { success: false, error: "Codex Editor extension not yet active" };
         }
 
-        // Call the command
         const result = await vscode.commands.executeCommand<{
             success: boolean;
             versions?: { codexEditor?: string; frontierAuthentication?: string };
@@ -109,18 +109,15 @@ async function updateExtensionVersionsViaCommand(
     versions: { codexEditor?: string; frontierAuthentication?: string }
 ): Promise<{ success: boolean; error?: string }> {
     try {
-        // Check if codex-editor is available
         const codexExtension = vscode.extensions.getExtension("project-accelerate.codex-editor-extension");
         if (!codexExtension) {
             return { success: false, error: "Codex Editor extension not available" };
         }
 
-        // Ensure it's activated
         if (!codexExtension.isActive) {
-            await codexExtension.activate();
+            return { success: false, error: "Codex Editor extension not yet active" };
         }
 
-        // Call the command
         const result = await vscode.commands.executeCommand<{ success: boolean; error?: string }>(
             "codex-editor.updateMetadataExtensionVersions",
             versions
