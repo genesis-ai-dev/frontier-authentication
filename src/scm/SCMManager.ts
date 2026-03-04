@@ -40,6 +40,7 @@ export class SCMManager {
         };
     }> = new vscode.EventEmitter();
     public readonly onSyncStatusChange = this.syncEventEmitter.event;
+    private isSyncInProgress = false;
 
     constructor(gitLabService: GitLabService, context: vscode.ExtensionContext) {
         this.context = context;
@@ -425,6 +426,31 @@ export class SCMManager {
         /**
          * Optional diagnostics to help clients validate remote changes vs merged conflicts.
          */
+        allChangedFilePaths?: string[];
+        remoteChangedFilePaths?: string[];
+    }> {
+        // In-memory guard: prevents a second call from slipping through
+        // between the isSyncLocked() check and the actual filesystem lock acquisition
+        if (this.isSyncInProgress) {
+            this.syncEventEmitter.fire({ status: "skipped", message: "Sync already in progress" });
+            return { hasConflicts: false };
+        }
+        this.isSyncInProgress = true;
+
+        try {
+            return await this._syncChangesInner(options, isManualSync);
+        } finally {
+            this.isSyncInProgress = false;
+        }
+    }
+
+    private async _syncChangesInner(
+        options?: { commitMessage?: string },
+        isManualSync: boolean = false
+    ): Promise<{
+        hasConflicts: boolean;
+        conflicts?: ConflictedFile[];
+        blocked?: boolean;
         allChangedFilePaths?: string[];
         remoteChangedFilePaths?: string[];
     }> {
