@@ -870,11 +870,39 @@ export class SCMManager {
                 },
             });
 
+            if (syncResult.skippedDueToLock) {
+                this.syncEventEmitter.fire({ status: "error", message: "Publish failed: sync lock was held by another operation" });
+                throw new Error(
+                    "Publish failed: another sync operation was in progress. Please try again."
+                );
+            }
+
             if (syncResult.hadConflicts) {
                 this.syncEventEmitter.fire({ status: "error", message: "Publish encountered merge conflicts" });
                 throw new Error(
                     "Publish encountered merge conflicts with remote. Please resolve conflicts via sync before publishing."
                 );
+            }
+
+            // Verify the push actually reached the remote by checking the remote tracking ref
+            try {
+                const currentBranch = await dugiteGit.currentBranch(workspacePath);
+                if (currentBranch) {
+                    const localHead = await dugiteGit.resolveRef(workspacePath, "HEAD");
+                    await dugiteGit.fetchOrigin(workspacePath, auth);
+                    const remoteRef = `refs/remotes/origin/${currentBranch}`;
+                    const remoteHead = await dugiteGit.resolveRef(workspacePath, remoteRef);
+                    if (localHead !== remoteHead) {
+                        console.error("[PublishWorkspace] Post-push verification failed: local HEAD", localHead, "!= remote HEAD", remoteHead);
+                        throw new Error("Publish failed: files were not pushed to the remote. Please try again.");
+                    }
+                    console.log("[PublishWorkspace] Post-push verification passed: remote HEAD matches local HEAD");
+                }
+            } catch (verifyError) {
+                if (verifyError instanceof Error && verifyError.message.includes("Publish failed")) {
+                    throw verifyError;
+                }
+                console.warn("[PublishWorkspace] Could not verify push (non-fatal):", verifyError);
             }
 
             // Initialize SCM
