@@ -463,24 +463,30 @@ export class StateManager {
         phase?: string;
         progress?: { current: number; total: number; description?: string };
     }): Promise<void> {
-        if (!this.hasAcquiredLock || !this.lockFilePath) {
-            return; // Don't write if we don't own the lock
+        // Capture path locally so it can't become undefined between the guard
+        // and the async fs calls if releaseSyncLock() runs concurrently.
+        const filePath = this.lockFilePath;
+        if (!this.hasAcquiredLock || !filePath) {
+            return;
         }
         
         try {
-            // Read existing data (for merge)
             let existingData: any = { pid: process.pid };
             try {
-                const content = await fs.promises.readFile(this.lockFilePath, 'utf8');
+                const content = await fs.promises.readFile(filePath, 'utf8');
                 existingData = JSON.parse(content);
             } catch {
                 // File missing or corrupted - will create fresh
             }
+
+            // If lock was released while we were reading, bail out
+            if (!this.hasAcquiredLock) {
+                return;
+            }
             
-            // Merge new data
             const payload = JSON.stringify({
                 ...existingData,
-                pid: process.pid, // Always our PID
+                pid: process.pid,
                 timestamp: data?.timestamp || Date.now(),
                 lastProgress: data?.lastProgress || existingData.lastProgress || Date.now(),
                 phase: data?.phase || existingData.phase || 'syncing',
@@ -490,12 +496,11 @@ export class StateManager {
                 ...(data?.progress && { progress: data.progress })
             });
             
-            // Write atomically (not append mode, full replace)
-            await fs.promises.writeFile(this.lockFilePath, payload, { encoding: 'utf8' });
+            await fs.promises.writeFile(filePath, payload, { encoding: 'utf8' });
             
         } catch (error) {
             console.error("[StateManager] Failed to update lock heartbeat:", error);
-            throw error; // Propagate so caller can track failures
+            throw error;
         }
     }
 

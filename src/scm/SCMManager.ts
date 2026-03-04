@@ -849,11 +849,21 @@ export class SCMManager {
             };
 
             console.log("Running full sync as part of publish...");
+            this.syncEventEmitter.fire({ status: "started", message: "Publishing: syncing changes" });
+
             const syncResult = await this.gitService.syncChanges(workspacePath, auth, author, {
                 commitMessage: "Initial commit",
+                onProgress: (phase, loaded, total, description) => {
+                    this.syncEventEmitter.fire({
+                        status: "progress",
+                        message: description || `${phase}: ${loaded}/${total}`,
+                        progress: { phase, loaded, total, description },
+                    });
+                },
             });
 
             if (syncResult.hadConflicts) {
+                this.syncEventEmitter.fire({ status: "error", message: "Publish encountered merge conflicts" });
                 throw new Error(
                     "Publish encountered merge conflicts with remote. Please resolve conflicts via sync before publishing."
                 );
@@ -866,11 +876,17 @@ export class SCMManager {
             // Clear LFS source URL after successful publish
             await this.clearLocalLfsSourceUrl(workspacePath);
 
+            this.syncEventEmitter.fire({ status: "completed", message: "Publish sync complete" });
+
             vscode.window.showInformationMessage(
                 `Workspace published successfully to ${project.url}`
             );
         } catch (error) {
             console.error("Error in publishWorkspace:", error);
+            this.syncEventEmitter.fire({
+                status: "error",
+                message: error instanceof Error ? error.message : "Publish error",
+            });
             if (error instanceof Error) {
                 const errorMessage = error.message;
                 vscode.window.showErrorMessage(`Failed to publish workspace: ${errorMessage}`);
