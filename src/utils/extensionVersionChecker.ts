@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
 
 /**
  * Extension version checker for frontier-authentication.
@@ -6,6 +8,7 @@ import * as vscode from "vscode";
  * DESIGN: This extension delegates all metadata.json writes to codex-editor
  * via commands. This implements the "single writer" principle to prevent
  * conflicts and the issues that were causing metadata.json to be deleted.
+ * Reads, however, can safely go directly to disk.
  */
 
 // Lightweight version comparator to avoid external semver dependency
@@ -70,9 +73,29 @@ interface MetadataVersionCheckResult {
 }
 
 /**
- * Read extension versions from metadata.json via codex-editor command
+ * Read extension versions from metadata.json.
+ * Prefers the codex-editor command (which goes through the write-queue-aware
+ * MetadataManager), but falls back to a direct disk read when codex-editor
+ * isn't active yet (common during startup). Reads are always safe — the
+ * "single writer" principle only governs writes.
  */
 async function getExtensionVersionsViaCommand(): Promise<{
+    success: boolean;
+    versions?: { codexEditor?: string; frontierAuthentication?: string };
+    error?: string;
+}> {
+    // Try via codex-editor command first (write-queue-aware, most reliable)
+    const commandResult = await tryReadViaCommand();
+    if (commandResult.success) {
+        return commandResult;
+    }
+
+    // Fallback: read metadata.json directly from disk
+    debug(`[getExtensionVersions] Command unavailable (${commandResult.error}), reading metadata.json directly`);
+    return readVersionsFromDisk();
+}
+
+async function tryReadViaCommand(): Promise<{
     success: boolean;
     versions?: { codexEditor?: string; frontierAuthentication?: string };
     error?: string;
@@ -99,6 +122,37 @@ async function getExtensionVersionsViaCommand(): Promise<{
         return result || { success: false, error: "No response from command" };
     } catch (error) {
         return { success: false, error: `Command failed: ${(error as Error).message}` };
+    }
+}
+
+async function readVersionsFromDisk(): Promise<{
+    success: boolean;
+    versions?: { codexEditor?: string; frontierAuthentication?: string };
+    error?: string;
+}> {
+    try {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            return { success: false, error: "No workspace folder open" };
+        }
+
+        const metadataPath = path.join(workspaceFolder.uri.fsPath, "metadata.json");
+        const content = await fs.promises.readFile(metadataPath, "utf8");
+        const text = content.trim();
+
+        if (!text) {
+            return { success: false, error: "metadata.json is empty" };
+        }
+
+        const metadata = JSON.parse(text);
+        const versions = metadata?.meta?.requiredExtensions ?? {};
+        return { success: true, versions };
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+            return { success: true, versions: {} };
+        }
+        return { success: false, error: `Direct read failed: ${(error as Error).message}` };
     }
 }
 
