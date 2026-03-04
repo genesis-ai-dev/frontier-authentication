@@ -287,18 +287,18 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
             }
         }
 
-        // Update metadata via codex-editor command if needed
+        // Update metadata via codex-editor command if needed.
+        // A write failure is non-blocking: the compatibility check below is what
+        // matters — failing to *record* the current version shouldn't prevent sync.
+        let metadataUpdated = false;
         if (needsUpdate) {
             const updateResult = await updateExtensionVersionsViaCommand(versionsToUpdate);
             if (!updateResult.success) {
-                console.error("[MetadataVersionChecker] ❌ Failed to update metadata:", updateResult.error);
-                return {
-                    canSync: false,
-                    metadataUpdated: false,
-                    reason: `Failed to update metadata: ${updateResult.error}`,
-                };
+                console.warn("[MetadataVersionChecker] Could not update metadata (will retry next sync):", updateResult.error);
+            } else {
+                metadataUpdated = true;
+                debug("[MetadataVersionChecker] 💾 Metadata updated with latest extension versions");
             }
-            debug("[MetadataVersionChecker] 💾 Metadata updated with latest extension versions");
         }
 
         const canSync = outdatedExtensions.length === 0;
@@ -308,7 +308,7 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
             );
             return {
                 canSync: false,
-                metadataUpdated: needsUpdate,
+                metadataUpdated,
                 reason: `Extensions need updating: ${outdatedExtensions
                     .map((ext) => `${ext.displayName} (${ext.currentVersion} → ${ext.latestVersion})`)
                     .join(", ")}`,
@@ -318,7 +318,7 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
         }
 
         debug("[MetadataVersionChecker] ✅ All extension versions compatible with metadata");
-        return { canSync: true, metadataUpdated: needsUpdate };
+        return { canSync: true, metadataUpdated };
     } catch (error) {
         console.error("[MetadataVersionChecker] ❌ Error during metadata version check:", error);
         return {
