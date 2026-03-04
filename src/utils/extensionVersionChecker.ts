@@ -156,47 +156,20 @@ async function readVersionsFromDisk(): Promise<{
     }
 }
 
-/**
- * Update extension versions in metadata.json via codex-editor command
- */
-async function updateExtensionVersionsViaCommand(
-    versions: { codexEditor?: string; frontierAuthentication?: string }
-): Promise<{ success: boolean; error?: string }> {
-    try {
-        const codexExtension = vscode.extensions.getExtension("project-accelerate.codex-editor-extension");
-        if (!codexExtension) {
-            return { success: false, error: "Codex Editor extension not available" };
-        }
-
-        if (!codexExtension.isActive) {
-            return { success: false, error: "Codex Editor extension not yet active" };
-        }
-
-        const result = await vscode.commands.executeCommand<{ success: boolean; error?: string }>(
-            "codex-editor.updateMetadataExtensionVersions",
-            versions
-        );
-
-        return result || { success: false, error: "No response from command" };
-    } catch (error) {
-        return { success: false, error: `Command failed: ${(error as Error).message}` };
-    }
-}
-
 export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionCheckResult> {
     try {
         debug("[MetadataVersionChecker] ═══ METADATA VERSION CHECK ═══");
 
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
         if (!workspaceFolder) {
-            console.warn("[MetadataVersionChecker] ❌ No workspace folder found");
+            console.warn("[MetadataVersionChecker] No workspace folder found");
             return { canSync: false, metadataUpdated: false, reason: "No workspace folder" };
         }
 
         const codexEditorVersion = getCurrentExtensionVersion("project-accelerate.codex-editor-extension");
         const frontierAuthVersion = getCurrentExtensionVersion("frontier-rnd.frontier-authentication");
 
-        debug("[MetadataVersionChecker] 📦 Current versions:");
+        debug("[MetadataVersionChecker] Installed versions:");
         debug(`  - Codex Editor: ${codexEditorVersion || "not found"}`);
         debug(`  - Frontier Authentication: ${frontierAuthVersion || "not found"}`);
 
@@ -206,7 +179,7 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
             if (!frontierAuthVersion) missingExtensions.push("Frontier Authentication");
 
             console.error(
-                `[MetadataVersionChecker] ❌ Missing required extensions: ${missingExtensions.join(", ")}`
+                `[MetadataVersionChecker] Missing required extensions: ${missingExtensions.join(", ")}`
             );
             return {
                 canSync: false,
@@ -216,10 +189,10 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
             };
         }
 
-        // Read current versions via codex-editor command
+        // Read-only: read versions from metadata.json (codex-editor owns all writes)
         const currentVersionsResult = await getExtensionVersionsViaCommand();
         if (!currentVersionsResult.success) {
-            console.warn("[MetadataVersionChecker] ❌ Could not read metadata.json:", currentVersionsResult.error);
+            console.warn("[MetadataVersionChecker] Could not read metadata.json:", currentVersionsResult.error);
             return { canSync: false, metadataUpdated: false, reason: "Could not read metadata file" };
         }
 
@@ -227,88 +200,49 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
         const metadataCodexVersion = currentVersions.codexEditor;
         const metadataFrontierVersion = currentVersions.frontierAuthentication;
 
-        debug("[MetadataVersionChecker] 📋 Metadata requires:");
+        debug("[MetadataVersionChecker] Metadata requires:");
         debug(`  - Codex Editor: ${metadataCodexVersion || "not set"}`);
         debug(`  - Frontier Authentication: ${metadataFrontierVersion || "not set"}`);
 
-        let needsUpdate = false;
+        // Compare installed vs required — only block if installed is explicitly older.
+        // Missing versions in metadata are fine: codex-editor writes them on activation.
         const outdatedExtensions: ExtensionVersionInfo[] = [];
-        const versionsToUpdate: { codexEditor?: string; frontierAuthentication?: string } = {};
 
-        // Check if versions need updating
-        if (!metadataCodexVersion || !metadataFrontierVersion) {
-            debug("[MetadataVersionChecker] ➕ Adding missing extension version requirements to metadata");
-            needsUpdate = true;
-            if (!metadataCodexVersion) versionsToUpdate.codexEditor = codexEditorVersion;
-            if (!metadataFrontierVersion) versionsToUpdate.frontierAuthentication = frontierAuthVersion;
-        }
-
-        if (metadataCodexVersion) {
-            if (compareVersions(codexEditorVersion, metadataCodexVersion) < 0) {
-                console.warn(
-                    `[MetadataVersionChecker] ⚠️  Codex Editor outdated: ${codexEditorVersion} < ${metadataCodexVersion}`
-                );
-                outdatedExtensions.push({
-                    extensionId: "project-accelerate.codex-editor-extension",
-                    currentVersion: codexEditorVersion,
-                    latestVersion: metadataCodexVersion,
-                    isOutdated: true,
-                    downloadUrl: "",
-                    displayName: "Codex Editor",
-                });
-            } else if (compareVersions(codexEditorVersion, metadataCodexVersion) > 0) {
-                debug(
-                    `[MetadataVersionChecker] 🚀 Updating Codex Editor version: ${metadataCodexVersion} → ${codexEditorVersion}`
-                );
-                versionsToUpdate.codexEditor = codexEditorVersion;
-                needsUpdate = true;
-            }
-        }
-
-        if (metadataFrontierVersion) {
-            if (compareVersions(frontierAuthVersion, metadataFrontierVersion) < 0) {
-                console.warn(
-                    `[MetadataVersionChecker] ⚠️  Frontier Authentication outdated: ${frontierAuthVersion} < ${metadataFrontierVersion}`
-                );
-                outdatedExtensions.push({
-                    extensionId: "frontier-rnd.frontier-authentication",
-                    currentVersion: frontierAuthVersion,
-                    latestVersion: metadataFrontierVersion,
-                    isOutdated: true,
-                    downloadUrl: "",
-                    displayName: "Frontier Authentication",
-                });
-            } else if (compareVersions(frontierAuthVersion, metadataFrontierVersion) > 0) {
-                debug(
-                    `[MetadataVersionChecker] 🚀 Updating Frontier Authentication version: ${metadataFrontierVersion} → ${frontierAuthVersion}`
-                );
-                versionsToUpdate.frontierAuthentication = frontierAuthVersion;
-                needsUpdate = true;
-            }
-        }
-
-        // Update metadata via codex-editor command if needed.
-        // A write failure is non-blocking: the compatibility check below is what
-        // matters — failing to *record* the current version shouldn't prevent sync.
-        let metadataUpdated = false;
-        if (needsUpdate) {
-            const updateResult = await updateExtensionVersionsViaCommand(versionsToUpdate);
-            if (!updateResult.success) {
-                console.warn("[MetadataVersionChecker] Could not update metadata (will retry next sync):", updateResult.error);
-            } else {
-                metadataUpdated = true;
-                debug("[MetadataVersionChecker] 💾 Metadata updated with latest extension versions");
-            }
-        }
-
-        const canSync = outdatedExtensions.length === 0;
-        if (!canSync) {
+        if (metadataCodexVersion && compareVersions(codexEditorVersion, metadataCodexVersion) < 0) {
             console.warn(
-                `[MetadataVersionChecker] 🚫 Sync blocked due to ${outdatedExtensions.length} outdated extension(s)`
+                `[MetadataVersionChecker] Codex Editor outdated: ${codexEditorVersion} < ${metadataCodexVersion}`
+            );
+            outdatedExtensions.push({
+                extensionId: "project-accelerate.codex-editor-extension",
+                currentVersion: codexEditorVersion,
+                latestVersion: metadataCodexVersion,
+                isOutdated: true,
+                downloadUrl: "",
+                displayName: "Codex Editor",
+            });
+        }
+
+        if (metadataFrontierVersion && compareVersions(frontierAuthVersion, metadataFrontierVersion) < 0) {
+            console.warn(
+                `[MetadataVersionChecker] Frontier Authentication outdated: ${frontierAuthVersion} < ${metadataFrontierVersion}`
+            );
+            outdatedExtensions.push({
+                extensionId: "frontier-rnd.frontier-authentication",
+                currentVersion: frontierAuthVersion,
+                latestVersion: metadataFrontierVersion,
+                isOutdated: true,
+                downloadUrl: "",
+                displayName: "Frontier Authentication",
+            });
+        }
+
+        if (outdatedExtensions.length > 0) {
+            console.warn(
+                `[MetadataVersionChecker] Sync blocked due to ${outdatedExtensions.length} outdated extension(s)`
             );
             return {
                 canSync: false,
-                metadataUpdated,
+                metadataUpdated: false,
                 reason: `Extensions need updating: ${outdatedExtensions
                     .map((ext) => `${ext.displayName} (${ext.currentVersion} → ${ext.latestVersion})`)
                     .join(", ")}`,
@@ -317,10 +251,10 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
             };
         }
 
-        debug("[MetadataVersionChecker] ✅ All extension versions compatible with metadata");
-        return { canSync: true, metadataUpdated };
+        debug("[MetadataVersionChecker] All extension versions compatible with metadata");
+        return { canSync: true, metadataUpdated: false };
     } catch (error) {
-        console.error("[MetadataVersionChecker] ❌ Error during metadata version check:", error);
+        console.error("[MetadataVersionChecker] Error during metadata version check:", error);
         return {
             canSync: false,
             metadataUpdated: false,
