@@ -452,10 +452,13 @@ export class GitLabService {
 
             return await response.text();
         } catch (error) {
-            console.error("Error fetching repository file:", error);
-            throw new Error(
-                `Failed to fetch repository file: ${error instanceof Error ? error.message : "Unknown error"}`
-            );
+            const msg = error instanceof Error ? error.message : "Unknown error";
+            if (msg.includes("File not found")) {
+                console.debug("Repository file not found:", filePath, "ref:", ref);
+            } else {
+                console.error("Error fetching repository file:", error);
+            }
+            throw new Error(`Failed to fetch repository file: ${msg}`);
         }
     }
 
