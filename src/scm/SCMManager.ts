@@ -751,6 +751,14 @@ export class SCMManager {
         try {
             console.log("Starting workspace publish with options:", options);
 
+            // Block publish if installed extensions are older than what metadata.json requires
+            const canPublish = await checkMetadataVersionsForSync(this.context, true);
+            if (!canPublish) {
+                throw new Error(
+                    "Cannot publish: one or more extensions need updating. Please update your extensions and try again."
+                );
+            }
+
             // Initialize GitLab service
             await this.gitLabService.initializeWithRetry();
 
