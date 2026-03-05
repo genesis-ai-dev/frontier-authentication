@@ -388,6 +388,7 @@ async function uploadBlobsToLFSBucket(
                 }
             } catch (e) {
                 console.warn(`[LFS Patch] Error during empty-pointer recovery for ${filepath}:`, e);
+                skipIndices.add(i);
                 recovered.push(buf);
             }
         }
@@ -2648,11 +2649,14 @@ export class GitService {
                 continue;
             }
 
-            // No remote / auth → fall back to regular add
+            // No remote / auth → cannot upload LFS content; staging as a regular blob
+            // would permanently embed the binary in Git history, so we must abort.
             if (!remoteUrl || !lfsBaseUrl || !effectiveAuth) {
-                console.warn(`[GitService] No remote URL/auth; adding ${filepath} without LFS`);
-                nonLfsFilesToAdd.push(filepath);
-                continue;
+                throw new Error(
+                    `Cannot stage LFS-tracked file "${filepath}" — no remote URL or credentials available. ` +
+                    `Staging it as a regular Git blob would permanently bloat the repository. ` +
+                    `Ensure the project has a configured remote and valid authentication before committing LFS files.`
+                );
             }
 
             const absolutePath = path.join(dir, filepath);
@@ -2915,9 +2919,12 @@ export class GitService {
                         `[GitService] Uploaded batch of ${batch.length} existing pointer byte(s)`
                     );
                 } catch (e) {
-                    console.warn(
-                        `[GitService] Failed to upload existing pointer bytes batch:`,
-                        e
+                    const detail = e instanceof Error ? e.message : String(e);
+                    throw new Error(
+                        `Failed to upload existing LFS pointer bytes (batch starting at index ${i}, ` +
+                        `${batch.length} file(s): ${batch.map((f) => f.filepath).join(", ")}). ` +
+                        `These pointers would reference objects missing from the server. ` +
+                        `Error: ${detail}`
                     );
                 }
             }
