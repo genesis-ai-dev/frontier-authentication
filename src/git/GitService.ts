@@ -1042,6 +1042,13 @@ export class GitService {
                                 },
                                 [bytes]
                             );
+
+                            if (!infos || infos.length === 0) {
+                                throw new Error(
+                                    `LFS upload for ${filepath} returned no pointer info — the file may not have been uploaded`,
+                                );
+                            }
+
                             this.debugLog("[GitService] Uploaded blob to LFS", {
                                 filepath,
                                 oid: infos[0].oid,
@@ -1849,14 +1856,21 @@ export class GitService {
             let remoteHead;
             const remoteRef = `refs/remotes/origin/${currentBranch}`;
 
-            // 5. Check if remote branch exists
+            // 5. Check if remote branch exists.
+            // Only treat exit code 128 ("bad revision") as a missing ref.
+            // Other failures (repo corruption, permission errors) must propagate
+            // so they aren't silently hidden behind a blind push.
             try {
                 remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
             } catch (err) {
-                // Remote branch doesn't exist, just push our changes
-                this.debugLog("Remote branch doesn't exist, pushing our changes");
-                await this.safePush(dir, auth);
-                return { hadConflicts: false, uploadedLfsFiles };
+                const isRefNotFound =
+                    err instanceof dugiteGit.GitOperationError && err.exitCode === 128;
+                if (isRefNotFound) {
+                    this.debugLog("Remote branch doesn't exist, pushing our changes");
+                    await this.safePush(dir, auth);
+                    return { hadConflicts: false, uploadedLfsFiles };
+                }
+                throw err;
             }
 
             // Get files changed in local HEAD (this doesn't need updating after refetch)
@@ -1899,10 +1913,13 @@ export class GitService {
                     this.progressCallback("merging", 0, 1, "Merging remote changes");
                 }
 
+                const ffController = new AbortController();
                 await this.withTimeout(
-                    dugiteGit.fastForward(dir, currentBranch, auth),
+                    dugiteGit.fastForward(dir, currentBranch, auth, ffController.signal),
                     2 * 60 * 1000,
                     "Fast-forward operation",
+                    undefined,
+                    ffController,
                 );
 
                 console.log("[GitService] ✓ Fast-forward merge completed successfully");
@@ -2010,7 +2027,17 @@ export class GitService {
 
             // Re-read local status matrix now. The original was captured before the fast-forward
             // attempt (step 7) and may be stale if fast-forward succeeded but push was rejected.
-            const updatedLocalStatusMatrix = await dugiteGit.statusMatrix(dir).catch(() => localStatusMatrix);
+            let updatedLocalStatusMatrix: dugiteGit.StatusMatrixEntry[];
+            try {
+                updatedLocalStatusMatrix = await dugiteGit.statusMatrix(dir);
+            } catch (statusErr) {
+                console.warn(
+                    "[GitService] statusMatrix failed during conflict analysis — using pre-fast-forward snapshot. " +
+                    "Conflict detection may be slightly stale.",
+                    statusErr,
+                );
+                updatedLocalStatusMatrix = localStatusMatrix;
+            }
 
             // Convert status matrices to maps for easier lookup
             const localStatusMap = new Map(
@@ -2427,7 +2454,11 @@ export class GitService {
                 throw new Error("Not on any branch");
             }
 
-            // Stage the resolved files based on their resolution type (LFS-aware)
+            // Stage the resolved files based on their resolution type (LFS-aware).
+            // Every resolved file MUST be staged successfully — if any fail, the
+            // merge commit would be missing those resolutions, producing a commit
+            // that silently reverts the user's conflict choices.
+            const stagingFailures: Array<{ filepath: string; error: string }> = [];
             for (const { filepath, resolution } of resolvedFiles) {
                 this.debugLog(
                     `Processing resolved file: ${filepath} with resolution: ${resolution}`
@@ -2442,11 +2473,24 @@ export class GitService {
                         await this.stageResolvedFileWithLFS(dir, filepath, auth);
                     }
                 } catch (stageErr) {
-                    console.warn(
-                        `[GitService] Non-blocking staging error for ${filepath}; continuing merge:`,
-                        stageErr
+                    const detail = stageErr instanceof Error ? stageErr.message : String(stageErr);
+                    console.error(
+                        `[GitService] Failed to stage resolved file ${filepath}:`,
+                        stageErr,
                     );
+                    stagingFailures.push({ filepath, error: detail });
                 }
+            }
+
+            if (stagingFailures.length > 0) {
+                const fileList = stagingFailures
+                    .map(({ filepath, error }) => `  • ${filepath}: ${error}`)
+                    .join("\n");
+                throw new Error(
+                    `Merge aborted: ${stagingFailures.length} resolved file(s) could not be staged.\n` +
+                    `${fileList}\n` +
+                    `No merge commit was created — the conflict resolutions are still on disk and can be retried.`,
+                );
             }
 
             // Fetch latest changes to ensure we have the most recent remote state
@@ -2475,14 +2519,22 @@ export class GitService {
             this.debugLog(`Creating merge commit with message: ${commitMessage}`);
 
             try {
-                // Create a merge commit with the two parents
                 await dugiteGit.mergeCommit(dir, commitMessage, { name: author.name, email: author.email }, [localHead, remoteHead]);
             } catch (commitError) {
-                console.error("Error creating merge commit:", commitError);
-
-                // Create a regular commit instead
-                this.debugLog("Attempting to create a regular commit with the resolved changes");
-                await dugiteGit.commit(dir, `Resolved conflicts with ${this.getShortRemoteRef(currentBranch)}`, { name: author.name, email: author.email });
+                // A single-parent fallback would silently drop the remote parent
+                // from the merge history, making it look like those changes never
+                // existed. Instead, surface the real error so the sync layer can
+                // retry or the user can investigate.
+                const detail = commitError instanceof Error ? commitError.message : String(commitError);
+                console.error(
+                    `[GitService] mergeCommit failed (local=${localHead.substring(0, 8)}, remote=${remoteHead.substring(0, 8)}):`,
+                    commitError,
+                );
+                throw new Error(
+                    `Failed to create merge commit: ${detail}. ` +
+                    `Local HEAD: ${localHead.substring(0, 8)}, Remote HEAD: ${remoteHead.substring(0, 8)}. ` +
+                    `The merge was not completed — no changes have been pushed.`,
+                );
             }
 
             // Push the merge commit with a more robust approach

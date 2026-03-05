@@ -798,11 +798,15 @@ export async function fastForward(
     dir: string,
     branch: string,
     auth: { username: string; password: string },
+    signal?: AbortSignal,
 ): Promise<void> {
     const result = await gitExec(
         [...CREDENTIAL_OVERRIDE_FLAGS, "merge", "--ff-only", `origin/${branch}`],
         dir,
-        { env: authEnv(auth) },
+        {
+            env: authEnv(auth),
+            processCallback: buildProcessCallback(undefined, signal),
+        },
     );
     assertSuccess("merge --ff-only", result);
 }
