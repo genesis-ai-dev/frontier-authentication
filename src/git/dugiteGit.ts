@@ -49,8 +49,9 @@ export function setAskpassPath(scriptPath: string): void {
             const wrapperContent = `@echo off\r\nnode "${scriptPath}" %*\r\n`;
             fs.writeFileSync(wrapperPath, wrapperContent);
             askpassScriptPath = wrapperPath;
-        } catch {
-            // Fall back to the JS file directly
+            console.log(`[dugiteGit] Askpass wrapper created: ${wrapperPath} (win32)`);
+        } catch (err) {
+            console.warn(`[dugiteGit] Failed to create .cmd askpass wrapper, falling back to JS file:`, err);
         }
     } else {
         const wrapperPath = path.join(wrapperDir, "askpass-wrapper.sh");
@@ -58,8 +59,9 @@ export function setAskpassPath(scriptPath: string): void {
             const wrapperContent = `#!/bin/sh\nexec node "${scriptPath}" "$@"\n`;
             fs.writeFileSync(wrapperPath, wrapperContent, { mode: 0o755 });
             askpassScriptPath = wrapperPath;
-        } catch {
-            // Fall back to the JS file directly (will work if it has +x)
+            console.log(`[dugiteGit] Askpass wrapper created: ${wrapperPath} (${process.platform})`);
+        } catch (err) {
+            console.warn(`[dugiteGit] Failed to create .sh askpass wrapper, falling back to JS file:`, err);
         }
     }
 }
@@ -136,9 +138,6 @@ function authEnv(auth: { username: string; password: string }): Record<string, s
         FRONTIER_GIT_USERNAME: auth.username,
         FRONTIER_GIT_PASSWORD: auth.password,
         GIT_TERMINAL_PROMPT: "0",
-        // Prevent system-level git config from injecting credential helpers
-        // (e.g. Windows Credential Manager) that would show GUI prompts.
-        GIT_CONFIG_NOSYSTEM: "1",
     };
 }
 
