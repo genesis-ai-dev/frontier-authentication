@@ -20,6 +20,37 @@ const LFS_UPLOAD_BATCH_SIZE = 50;
 /** Max simultaneous PUT uploads within a single batch */
 const LFS_UPLOAD_CONCURRENCY = 10;
 
+/** Default timeout for LFS API requests (60 s) */
+const LFS_FETCH_TIMEOUT_MS = 60_000;
+/** Timeout for lightweight health-check requests (10 s) */
+const HEALTH_CHECK_TIMEOUT_MS = 10_000;
+
+/**
+ * Wrapper around `fetch` that aborts after `timeoutMs`.
+ * If a caller-provided `signal` is already aborted, throws immediately.
+ */
+function fetchWithTimeout(
+    input: string | URL | Request,
+    init?: RequestInit & { timeoutMs?: number },
+): Promise<Response> {
+    const { timeoutMs = LFS_FETCH_TIMEOUT_MS, ...rest } = init ?? {};
+    const controller = new AbortController();
+    const externalSignal = rest.signal;
+
+    if (externalSignal?.aborted) {
+        return Promise.reject(externalSignal.reason ?? new DOMException("Aborted", "AbortError"));
+    }
+
+    const onExternalAbort = () => controller.abort(externalSignal!.reason);
+    externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
+
+    const timer = setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
+    return fetch(input, { ...rest, signal: controller.signal }).finally(() => {
+        clearTimeout(timer);
+        externalSignal?.removeEventListener("abort", onExternalAbort);
+    });
+}
+
 /**
  * Determine whether an error is retryable (server-side / transient network errors).
  */
@@ -52,9 +83,13 @@ async function retryWithBackoff<T>(
     label: string,
     maxRetries: number = LFS_MAX_RETRIES,
     baseDelayMs: number = LFS_RETRY_BASE_DELAY_MS,
+    signal?: AbortSignal,
 ): Promise<T> {
     let hadFailure = false;
     for (let attempt = 0; ; attempt++) {
+        if (signal?.aborted) {
+            throw signal.reason ?? new DOMException("Aborted", "AbortError");
+        }
         try {
             const result = await fn();
             if (hadFailure) {
@@ -65,6 +100,9 @@ async function retryWithBackoff<T>(
             return result;
         } catch (error) {
             hadFailure = true;
+            if (signal?.aborted) {
+                throw signal.reason ?? new DOMException("Aborted", "AbortError");
+            }
             if (attempt >= maxRetries || !isRetryableError(error)) {
                 throw error;
             }
@@ -447,7 +485,7 @@ async function uploadBlobsToLFSBucket(
     debugLog("[LFS Patch] Auth headers:", Object.keys(authHeaders));
 
     const lfsInfoResponseData = await retryWithBackoff(async () => {
-        const lfsInfoRes = await fetch(`${url}/info/lfs/objects/batch`, {
+        const lfsInfoRes = await fetchWithTimeout(`${url}/info/lfs/objects/batch`, {
             method: "POST",
             headers: {
                 ...headers,
@@ -626,7 +664,7 @@ async function uploadBlobsToLFSBucket(
             if (actions.verify) {
                 debugLog(`[LFS Patch] Verifying ${fileLabel(index)}`);
                 await retryWithBackoff(async () => {
-                    const verificationResp = await fetch(actions.verify!.href, {
+                    const verificationResp = await fetchWithTimeout(actions.verify!.href, {
                         method: "POST",
                         headers: {
                             ...(actions.verify!.header ?? {}),
@@ -637,6 +675,7 @@ async function uploadBlobsToLFSBucket(
                             oid: String((infos[index] as any).oid ?? ""),
                             size: Number((infos[index] as any).size ?? 0),
                         }),
+                        timeoutMs: 30_000,
                     });
 
                     if (!verificationResp.ok) {
@@ -697,7 +736,7 @@ export async function downloadLFSObject(
         ],
     };
 
-    const batchResp = await fetch(`${url}/info/lfs/objects/batch`, {
+    const batchResp = await fetchWithTimeout(`${url}/info/lfs/objects/batch`, {
         method: "POST",
         headers: {
             ...headers,
@@ -989,7 +1028,9 @@ export class GitService {
                             "[GitService] Stream-and-save mode: will skip bulk downloads; will still convert local blobs to pointers"
                         );
                     }
-                } catch { }
+                } catch (strategyErr) {
+                    console.warn("[GitService] Failed to read repo strategy, defaulting to auto-download:", strategyErr);
+                }
 
                 const status = await dugiteGit.statusMatrix(dir);
                 const headOid = await dugiteGit.resolveRef(dir, "HEAD");
@@ -1173,7 +1214,7 @@ export class GitService {
                     })),
                 };
 
-                const batchResp = await fetch(`${lfsBaseUrl}/info/lfs/objects/batch`, {
+                const batchResp = await fetchWithTimeout(`${lfsBaseUrl}/info/lfs/objects/batch`, {
                     method: "POST",
                     headers: {
                         ...authHeaders,
@@ -1275,7 +1316,7 @@ export class GitService {
                                 size: oidToTargets.get(oid)?.[0]?.size ?? 0,
                             })),
                         };
-                        const retryResp = await fetch(`${lfsBaseUrl}/info/lfs/objects/batch`, {
+                        const retryResp = await fetchWithTimeout(`${lfsBaseUrl}/info/lfs/objects/batch`, {
                             method: "POST",
                             headers: {
                                 ...authHeaders,
@@ -2055,15 +2096,15 @@ export class GitService {
                     remoteHead.substring(0, 8)
                 );
             } catch (fetchError) {
+                const detail = fetchError instanceof Error ? fetchError.message : String(fetchError);
                 console.error("[GitService] Pre-conflict-analysis fetch failed:", {
-                    error: fetchError instanceof Error ? fetchError.message : String(fetchError),
+                    error: detail,
                     directory: dir,
                     hasAuth: !!auth.username,
                     timestamp: new Date().toISOString(),
                 });
-                // Continue with conflict analysis using the potentially stale remote state
-                console.warn(
-                    "[GitService] Continuing with conflict analysis using potentially stale remote state"
+                throw new Error(
+                    `Cannot proceed with conflict analysis — failed to fetch latest remote state: ${detail}`
                 );
             }
 
@@ -2234,7 +2275,7 @@ export class GitService {
             ];
 
             // 9. Get all files changed in either branch with enhanced conflict detection
-            const conflicts = await Promise.all(
+            const conflictResults = await Promise.allSettled(
                 allChangedFilePaths.map(async (filepath) => {
                     let localContent = "";
                     let remoteContent = "";
@@ -2360,20 +2401,38 @@ export class GitService {
                     }
                     return null;
                 })
-            ).then((results) =>
-                results.filter(
-                    (
-                        result
-                    ): result is {
+            );
+            const conflictSettledFailures = conflictResults.filter(
+                (r): r is PromiseRejectedResult => r.status === "rejected"
+            );
+            if (conflictSettledFailures.length > 0) {
+                console.warn(
+                    `[GitService] ${conflictSettledFailures.length} file(s) could not be analysed for conflicts:`,
+                    conflictSettledFailures.map((f) => f.reason instanceof Error ? f.reason.message : String(f.reason))
+                );
+            }
+            const conflicts = conflictResults
+                .filter(
+                    (r): r is PromiseFulfilledResult<{
                         filepath: string;
                         ours: string;
                         theirs: string;
                         base: string;
                         isNew: boolean;
                         isDeleted: boolean;
-                    } => result !== null
+                    } | null> => r.status === "fulfilled"
                 )
-            );
+                .map((r) => r.value)
+                .filter(
+                    (v): v is {
+                        filepath: string;
+                        ours: string;
+                        theirs: string;
+                        base: string;
+                        isNew: boolean;
+                        isDeleted: boolean;
+                    } => v !== null
+                );
 
             this.debugLog(`Found ${conflicts.length} conflicts that need resolution`);
             return {
@@ -3266,26 +3325,29 @@ export class GitService {
      * @param dir - Directory to search
      * @returns Array of file paths
      */
-    private async findAllFilesRecursively(dir: string): Promise<string[]> {
+    private async findAllFilesRecursively(dir: string, maxDepth: number = 50): Promise<string[]> {
         const files: string[] = [];
+        const stack: Array<{ dirPath: string; depth: number }> = [{ dirPath: dir, depth: 0 }];
 
-        try {
-            const entries = await fs.promises.readdir(dir, { withFileTypes: true });
-
-            for (const entry of entries) {
-                const fullPath = path.join(dir, entry.name);
-
-                if (entry.isDirectory()) {
-                    // Recurse into subdirectory
-                    const subFiles = await this.findAllFilesRecursively(fullPath);
-                    files.push(...subFiles);
-                } else if (entry.isFile()) {
-                    files.push(fullPath);
-                }
+        while (stack.length > 0) {
+            const { dirPath, depth } = stack.pop()!;
+            if (depth > maxDepth) {
+                this.debugLog(`[findAllFilesRecursively] Max depth exceeded at ${dirPath}`);
+                continue;
             }
-        } catch (error) {
-            // Directory doesn't exist or can't be read, return empty array
-            this.debugLog(`[findAllFilesRecursively] Error reading ${dir}:`, error);
+            try {
+                const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+                for (const entry of entries) {
+                    const fullPath = path.join(dirPath, entry.name);
+                    if (entry.isDirectory()) {
+                        stack.push({ dirPath: fullPath, depth: depth + 1 });
+                    } else if (entry.isFile()) {
+                        files.push(fullPath);
+                    }
+                }
+            } catch (error) {
+                this.debugLog(`[findAllFilesRecursively] Error reading ${dirPath}:`, error);
+            }
         }
 
         return files;
@@ -3489,7 +3551,10 @@ export class GitService {
                 // Non-pointer path: do nothing (no smudging)
             }
         } catch (err) {
-            console.warn(`[GitService] Failed to download LFS object for ${filepath}:`, err);
+            console.warn(`[GitService] Failed to ensure LFS content for ${filepath}:`, err);
+            vscode.window.showWarningMessage(
+                `LFS content for "${path.basename(filepath)}" could not be retrieved. The file may show as a pointer until next sync.`
+            );
         }
     }
 
@@ -3531,9 +3596,10 @@ export class GitService {
     async isOnline(): Promise<boolean> {
         try {
             // Check internet connectivity by making HEAD requests and checking response codes
-            const userIsOnline = await fetch("https://gitlab.com", {
+            const userIsOnline = await fetchWithTimeout("https://gitlab.com", {
                 method: "HEAD",
                 cache: "no-store",
+                timeoutMs: HEALTH_CHECK_TIMEOUT_MS,
             })
                 .then(async (res) => { await res.text().catch(() => {}); return res.status === 200; })
                 .catch(() => false);
@@ -3541,7 +3607,7 @@ export class GitService {
             const apiEndpoint = vscode.workspace.getConfiguration("frontier").get<string>("apiEndpoint") || "https://api.frontierrnd.com/api/v1";
             const baseUrl = apiEndpoint.replace(/\/api\/v1\/?$/, "");
 
-            const apiIsOnline = await fetch(baseUrl)
+            const apiIsOnline = await fetchWithTimeout(baseUrl, { timeoutMs: HEALTH_CHECK_TIMEOUT_MS })
                 .then(async (res) => { await res.text().catch(() => {}); return res.status === 200; })
                 .catch(() => false);
 
