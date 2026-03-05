@@ -1382,7 +1382,8 @@ export class GitService {
     private async withTimeout<T>(
         operation: Promise<T>,
         timeoutMs: number = 10 * 60 * 1000, // 10 minutes
-        operationName: string = "Git operation"
+        operationName: string = "Git operation",
+        remoteUrl?: string,
     ): Promise<T> {
         const startTime = Date.now();
         this.debugLog(`[GitService] Starting ${operationName} with ${timeoutMs}ms timeout`);
@@ -1410,24 +1411,23 @@ export class GitService {
                     timeoutMs,
                     actualDuration: duration,
                     timestamp: new Date().toISOString(),
+                    platform: process.platform,
                     possibleCauses: [
                         "Network connectivity issues",
                         "Remote server unresponsive",
                         "Firewall/proxy blocking connection",
                         "Large repository data transfer",
-                        "Authentication server delays",
+                        "GIT_ASKPASS credential helper not responding",
                     ],
                 });
 
-                // Add network connectivity check
-                this.logNetworkDiagnostics();
+                this.logNetworkDiagnostics(remoteUrl);
 
                 throw new Error(
                     `${operationName} failed: Network timeout after ${duration}ms. Please check your connection and try again.`
                 );
             }
 
-            // Log other errors with more context
             console.error(`[GitService] ${operationName} failed after ${duration}ms:`, {
                 error: error instanceof Error ? error.message : String(error),
                 stack: error instanceof Error ? error.stack : undefined,
@@ -1441,27 +1441,37 @@ export class GitService {
     }
 
     /**
-     * Logs network diagnostic information to help debug connectivity issues
+     * Logs network diagnostic information to help debug connectivity issues.
+     * @param remoteUrl Optional git remote URL — its host will be tested alongside standard endpoints.
      */
-    private async logNetworkDiagnostics(): Promise<void> {
+    private async logNetworkDiagnostics(remoteUrl?: string): Promise<void> {
         this.debugLog(`[GitService] Running network diagnostics...`);
 
         const diagnostics = {
             timestamp: new Date().toISOString(),
-            userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "N/A",
-            onlineStatus: typeof navigator !== "undefined" ? (navigator as any).onLine : "Unknown",
+            platform: process.platform,
+            arch: process.arch,
             connectionTests: {} as Record<
                 string,
                 { status: string; responseTime?: number; httpStatus?: number; error?: string; }
             >,
         };
 
-        // Test basic connectivity
         const testEndpoints = [
             { name: "GitLab", url: "https://gitlab.com", timeout: 5000 },
             { name: "Frontier API", url: "https://api.frontierrnd.com", timeout: 5000 },
             { name: "Google DNS", url: "https://8.8.8.8", timeout: 3000 },
         ];
+
+        if (remoteUrl) {
+            try {
+                const parsed = new URL(remoteUrl);
+                const origin = parsed.origin;
+                testEndpoints.unshift({ name: `Git Remote (${parsed.hostname})`, url: origin, timeout: 5000 });
+            } catch {
+                // URL parsing failed — skip
+            }
+        }
 
         for (const endpoint of testEndpoints) {
             try {
@@ -1507,10 +1517,10 @@ export class GitService {
             timestamp: new Date().toISOString(),
         });
 
-        // Get some context before pushing
+        let remoteUrl: string | undefined;
         try {
             const currentBranch = await dugiteGit.currentBranch(dir);
-            const remoteUrl = await this.getRemoteUrl(dir);
+            remoteUrl = await this.getRemoteUrl(dir);
             const status = await dugiteGit.statusMatrix(dir);
             const changedFiles = status.filter(
                 (entry) => entry[1] !== entry[2] || entry[2] !== entry[3]
@@ -1537,14 +1547,12 @@ export class GitService {
                 console.log(
                     `[GitService] ⬆️  Push progress: ${phase || "uploading"} ${loaded || 0}/${total || 0}`
                 );
-                // Don't forward git's transfer size — it only reflects pointer
-                // files, not the real LFS payload already uploaded earlier.
                 this.updateSyncProgress("pushing", { phase, loaded, total });
             },
         });
 
         try {
-            await this.withTimeout(pushOperation, timeoutMs, "Push operation");
+            await this.withTimeout(pushOperation, timeoutMs, "Push operation", remoteUrl);
             console.log("[GitService] ✓ Push completed successfully");
             this.debugLog(`[GitService] Push completed successfully`);
             if (this.progressCallback) {
@@ -1720,8 +1728,9 @@ export class GitService {
 
             // 3. Fetch remote changes to get latest state
             this.progressTracker.currentPhase = "fetching";
+            const remoteUrl = await this.getRemoteUrl(dir);
             console.log("[GitService] ⬇️  Fetching remote changes from origin");
-            this.debugLog("[GitService] Fetching remote changes");
+            this.debugLog("[GitService] Fetching remote changes", { remoteUrl });
             if (this.progressCallback) {
                 this.progressCallback("fetching", 0, 0, "Checking for remote changes");
             }
@@ -1734,7 +1743,8 @@ export class GitService {
                         this.updateSyncProgress("fetching", { phase, loaded, total, transferInfo });
                     }),
                     2 * 60 * 1000,
-                    "Fetch operation"
+                    "Fetch operation",
+                    remoteUrl,
                 );
                 console.log("[GitService] ✓ Fetch completed successfully");
                 this.debugLog("[GitService] Fetch completed successfully");
@@ -1744,14 +1754,17 @@ export class GitService {
             } catch (fetchError) {
                 const errorMessage =
                     fetchError instanceof Error ? fetchError.message : String(fetchError);
+                const gitStderr = (fetchError as any)?.gitStderr;
                 console.error("[GitService] Fetch operation failed:", {
                     error: errorMessage,
+                    gitStderr: gitStderr || "(not available — likely JS-level timeout)",
                     directory: dir,
+                    remoteUrl,
                     hasAuth: !!auth.username,
+                    platform: process.platform,
                     timestamp: new Date().toISOString(),
                 });
 
-                // Provide more helpful error message based on error type
                 let userFriendlyMessage = "fetch failed";
                 if (errorMessage.includes("ENOTFOUND") || errorMessage.includes("getaddrinfo")) {
                     userFriendlyMessage =
@@ -1765,14 +1778,23 @@ export class GitService {
                 } else if (errorMessage.includes("403") || errorMessage.includes("forbidden")) {
                     userFriendlyMessage =
                         "fetch failed: Access denied (check repository permissions)";
+                } else if (
+                    errorMessage.includes("could not read Username") ||
+                    errorMessage.includes("could not read Password") ||
+                    errorMessage.includes("terminal prompts disabled")
+                ) {
+                    userFriendlyMessage =
+                        "fetch failed: Credential helper error (try logging out and back in)";
                 } else if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
                     userFriendlyMessage =
                         "fetch failed: Connection timeout (server not responding)";
                 } else if (errorMessage.includes("ECONNREFUSED")) {
                     userFriendlyMessage = "fetch failed: Connection refused (server may be down)";
+                } else if (errorMessage.includes("SSL") || errorMessage.includes("certificate")) {
+                    userFriendlyMessage =
+                        "fetch failed: SSL/certificate error (check system certificates)";
                 }
 
-                // Create enhanced error with user-friendly message
                 const enhancedError = new Error(userFriendlyMessage);
                 (enhancedError as any).originalError = fetchError;
                 throw enhancedError;
@@ -1836,7 +1858,8 @@ export class GitService {
                 await this.withTimeout(
                     dugiteGit.fastForward(dir, currentBranch, auth),
                     2 * 60 * 1000,
-                    "Fast-forward operation"
+                    "Fast-forward operation",
+                    remoteUrl,
                 );
 
                 console.log("[GitService] ✓ Fast-forward merge completed successfully");
@@ -1894,7 +1917,8 @@ export class GitService {
                 await this.withTimeout(
                     dugiteGit.fetchOrigin(dir, auth),
                     2 * 60 * 1000,
-                    "Pre-conflict-analysis fetch"
+                    "Pre-conflict-analysis fetch",
+                    remoteUrl,
                 );
                 this.debugLog("[GitService] Pre-conflict-analysis fetch completed successfully");
 
@@ -2385,10 +2409,12 @@ export class GitService {
             // creating a merge commit against a stale remote head, which would cause
             // the subsequent push to be rejected as a non-fast-forward update.
             this.debugLog("[GitService] Fetching latest changes before merge completion");
+            const mergeRemoteUrl = await this.getRemoteUrl(dir);
             await this.withTimeout(
                 dugiteGit.fetchOrigin(dir, auth),
                 2 * 60 * 1000,
-                "Pre-merge fetch operation"
+                "Pre-merge fetch operation",
+                mergeRemoteUrl,
             );
 
             // Get the current state AFTER fetch so our merge commit reflects the latest

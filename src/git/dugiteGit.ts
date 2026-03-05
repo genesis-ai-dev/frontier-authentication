@@ -39,16 +39,28 @@ export function setGitBinaryPath(localGitDir: string, execPath: string): void {
 export function setAskpassPath(scriptPath: string): void {
     askpassScriptPath = scriptPath;
 
-    // Create a shell wrapper that invokes the script with node.
     // GIT_ASKPASS requires an executable; the JS file may lack +x after VSIX install.
+    // Create a platform-appropriate wrapper that invokes the script with node.
     const wrapperDir = path.dirname(scriptPath);
-    const wrapperPath = path.join(wrapperDir, "askpass-wrapper.sh");
-    try {
-        const wrapperContent = `#!/bin/sh\nexec node "${scriptPath}" "$@"\n`;
-        fs.writeFileSync(wrapperPath, wrapperContent, { mode: 0o755 });
-        askpassScriptPath = wrapperPath;
-    } catch {
-        // Fall back to the JS file directly (will work if it has +x)
+
+    if (process.platform === "win32") {
+        const wrapperPath = path.join(wrapperDir, "askpass-wrapper.cmd");
+        try {
+            const wrapperContent = `@echo off\r\nnode "${scriptPath}" %*\r\n`;
+            fs.writeFileSync(wrapperPath, wrapperContent);
+            askpassScriptPath = wrapperPath;
+        } catch {
+            // Fall back to the JS file directly
+        }
+    } else {
+        const wrapperPath = path.join(wrapperDir, "askpass-wrapper.sh");
+        try {
+            const wrapperContent = `#!/bin/sh\nexec node "${scriptPath}" "$@"\n`;
+            fs.writeFileSync(wrapperPath, wrapperContent, { mode: 0o755 });
+            askpassScriptPath = wrapperPath;
+        } catch {
+            // Fall back to the JS file directly (will work if it has +x)
+        }
     }
 }
 
@@ -87,6 +99,17 @@ const LFS_OVERRIDE_FLAGS = [
 ];
 
 /**
+ * HTTP timeout flags so that native git fails quickly with a descriptive error
+ * rather than hanging until the JS-level withTimeout fires.
+ * lowSpeedLimit: abort if transfer speed drops below 1 byte/s
+ * lowSpeedTime:  …for 60 consecutive seconds
+ */
+const HTTP_TIMEOUT_FLAGS = [
+    "-c", "http.lowSpeedLimit=1",
+    "-c", "http.lowSpeedTime=60",
+];
+
+/**
  * Low-level exec wrapper that injects the binary path env vars into every call
  * and disables git-lfs filters via one-shot `-c` flags.
  */
@@ -113,8 +136,20 @@ function authEnv(auth: { username: string; password: string }): Record<string, s
         FRONTIER_GIT_USERNAME: auth.username,
         FRONTIER_GIT_PASSWORD: auth.password,
         GIT_TERMINAL_PROMPT: "0",
+        // Prevent system-level git config from injecting credential helpers
+        // (e.g. Windows Credential Manager) that would show GUI prompts.
+        GIT_CONFIG_NOSYSTEM: "1",
     };
 }
+
+/**
+ * Git config flags that disable all credential helpers so that only GIT_ASKPASS
+ * is used for authentication.  Without this, bundled credential managers
+ * (like GCM on Windows) may show interactive GUI prompts.
+ */
+const CREDENTIAL_OVERRIDE_FLAGS = [
+    "-c", "credential.helper=",
+];
 
 // ---------------------------------------------------------------------------
 // Error handling
@@ -482,16 +517,20 @@ export async function fetchOrigin(
     auth: { username: string; password: string },
     onProgress?: ProgressCallback,
 ): Promise<void> {
-    const result = await gitExec(["fetch", "--progress", "origin"], dir, {
-        env: authEnv(auth),
-        processCallback: onProgress
-            ? (cp) => {
-                cp.stderr?.on("data", (data: Buffer) => {
-                    parseGitProgress(data.toString(), onProgress);
-                });
-            }
-            : undefined,
-    });
+    const result = await gitExec(
+        [...CREDENTIAL_OVERRIDE_FLAGS, ...HTTP_TIMEOUT_FLAGS, "fetch", "--progress", "origin"],
+        dir,
+        {
+            env: authEnv(auth),
+            processCallback: onProgress
+                ? (cp) => {
+                    cp.stderr?.on("data", (data: Buffer) => {
+                        parseGitProgress(data.toString(), onProgress);
+                    });
+                }
+                : undefined,
+        },
+    );
     assertSuccess("fetch", result);
 }
 
@@ -516,7 +555,7 @@ export async function push(
     options?: { ref?: string; onProgress?: ProgressCallback },
 ): Promise<void> {
     const branch = options?.ref || (await currentBranch(dir)) || "main";
-    const args = ["push", "-u", "--progress", "origin", branch];
+    const args = [...CREDENTIAL_OVERRIDE_FLAGS, ...HTTP_TIMEOUT_FLAGS, "push", "-u", "--progress", "origin", branch];
     const result = await gitExec(args, dir, {
         env: authEnv(auth),
         processCallback: options?.onProgress
@@ -538,6 +577,7 @@ export async function clone(
     onProgress?: ProgressCallback,
 ): Promise<void> {
     const envOverrides = auth ? authEnv(auth) : {};
+    const credFlags = auth ? CREDENTIAL_OVERRIDE_FLAGS : [];
     const progressCallback = onProgress
         ? (cp: import("child_process").ChildProcess) => {
             cp.stderr?.on("data", (data: Buffer) => {
@@ -572,10 +612,11 @@ export async function clone(
         }
 
         // Fetch all branches
-        const fetchResult = await gitExec(["fetch", "--progress", "origin"], dir, {
-            env: envOverrides,
-            processCallback: progressCallback,
-        });
+        const fetchResult = await gitExec(
+            [...credFlags, ...HTTP_TIMEOUT_FLAGS, "fetch", "--progress", "origin"],
+            dir,
+            { env: envOverrides, processCallback: progressCallback },
+        );
         assertSuccess("fetch", fetchResult);
 
         // Checkout the default branch (try main, then master)
@@ -603,7 +644,7 @@ export async function clone(
         const dirName = path.basename(dir);
         await fs.promises.mkdir(parentDir, { recursive: true });
 
-        const args = ["clone", "--progress", url, dirName];
+        const args = [...credFlags, ...HTTP_TIMEOUT_FLAGS, "clone", "--progress", url, dirName];
         const result = await gitExec(args, parentDir, {
             env: envOverrides,
             processCallback: progressCallback,
