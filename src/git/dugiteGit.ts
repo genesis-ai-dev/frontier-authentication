@@ -130,34 +130,49 @@ const LFS_OVERRIDE_FLAGS = [
 ];
 
 /**
- * Platform-safety flags applied to every git invocation to normalize
- * behavior across Windows, macOS, and Linux — regardless of what the
- * user's ~/.gitconfig or the repo's .git/config may contain.
+ * Platform-safety and performance flags applied to every git invocation to
+ * normalize behavior across Windows, macOS, and Linux — regardless of what
+ * the user's ~/.gitconfig or the repo's .git/config may contain.
  *
- * core.longpaths        — Windows: enables paths >260 chars via \\?\
- *                         prefix.  Without this, deeply nested projects
- *                         or OneDrive-synced folders silently fail.
- * core.autocrlf         — Prevents git from converting LF↔CRLF on
- *                         checkout/commit.  Translation files must be
- *                         stored byte-for-byte as authored.
- * core.fsmonitor        — Disables filesystem monitor integration
- *                         (watchman, fsmonitor--daemon).  These can
- *                         hang when Spotlight or Windows Search are
- *                         indexing the working tree.
- * core.pager            — Disables the pager so git never waits for
- *                         user input (e.g. log output).
- * core.quotePath        — When true (the default), git quotes non-ASCII
- *                         characters in paths with octal escapes.  Since
- *                         this is a translation tool with filenames in
- *                         many scripts, we need raw UTF-8 paths for
- *                         correct parsing in status/ls-files output.
+ * core.longpaths         — Windows: enables paths >260 chars via \\?\
+ *                          prefix.  Without this, deeply nested projects
+ *                          or OneDrive-synced folders silently fail.
+ * core.autocrlf          — Prevents git from converting LF↔CRLF on
+ *                          checkout/commit.  Translation files must be
+ *                          stored byte-for-byte as authored.
+ * core.fsmonitor         — Disables filesystem monitor integration
+ *                          (watchman, fsmonitor--daemon).  These can
+ *                          hang when Spotlight or Windows Search are
+ *                          indexing the working tree.
+ * core.pager             — Disables the pager so git never waits for
+ *                          user input (e.g. log output).
+ * core.quotePath         — When true (the default), git quotes non-ASCII
+ *                          characters in paths with octal escapes.  Since
+ *                          this is a translation tool with filenames in
+ *                          many scripts, we need raw UTF-8 paths for
+ *                          correct parsing in status/ls-files output.
  * core.precomposeUnicode — macOS HFS+/APFS uses NFD (decomposed)
- *                         Unicode.  This flag normalizes to NFC so git
- *                         paths match what Node.js and the rest of our
- *                         code expect.  No-op on other platforms.
- * gc.auto               — Disables automatic garbage collection, which
- *                         can lock the repo for 30+ seconds mid-operation
- *                         and make the app appear frozen.
+ *                          Unicode.  This flag normalizes to NFC so git
+ *                          paths match what Node.js and the rest of our
+ *                          code expect.  No-op on other platforms.
+ * core.protectNTFS       — Rejects paths that are invalid on NTFS
+ *                          (CON, AUX, NUL, trailing dots/spaces, etc.).
+ *                          Already the default on Windows; set everywhere
+ *                          so repos created on macOS/Linux remain safe
+ *                          for Windows collaborators.
+ * core.looseCompression  — Fastest zlib level for loose objects.  Git
+ *                          re-compresses during pack, so optimizing for
+ *                          write speed over ratio is the right trade-off.
+ * gc.auto                — Disables automatic garbage collection, which
+ *                          can lock the repo for 30+ seconds mid-operation
+ *                          and make the app appear frozen.
+ * pack.windowMemory      — Caps delta-search memory to 256 MB.  Prevents
+ *                          OOM on memory-constrained ARM laptops and
+ *                          older machines.
+ * protocol.version       — Git protocol v2 is significantly more efficient
+ *                          for fetch (selective ref advertisement, server-
+ *                          side filtering).  Supported since Git 2.18;
+ *                          we ship 2.47.
  */
 const PLATFORM_SAFETY_FLAGS = [
     "-c", "core.longpaths=true",
@@ -166,18 +181,28 @@ const PLATFORM_SAFETY_FLAGS = [
     "-c", "core.pager=",
     "-c", "core.quotePath=false",
     "-c", "core.precomposeUnicode=true",
+    "-c", "core.protectNTFS=true",
+    "-c", "core.looseCompression=1",
     "-c", "gc.auto=0",
+    "-c", "pack.windowMemory=256m",
+    "-c", "protocol.version=2",
 ];
 
 /**
- * HTTP timeout flags so that native git fails quickly with a descriptive error
- * rather than hanging until the JS-level withTimeout fires.
- * lowSpeedLimit: abort if transfer speed drops below 1 byte/s
- * lowSpeedTime:  …for 60 consecutive seconds
+ * HTTP reliability flags for remote operations (fetch, push, clone).
+ *
+ * http.lowSpeedLimit + lowSpeedTime — abort if transfer speed drops below
+ *     1 byte/s for 60 consecutive seconds, producing a descriptive error
+ *     rather than hanging until the JS-level withTimeout fires.
+ * http.postBuffer — increase the initial POST buffer from the 1 MB default
+ *     to ~150 MB.  With many text files or large initial pushes, the default
+ *     is too small and causes "RPC failed; HTTP 413" or silent hangs while
+ *     git re-packs mid-transfer.
  */
 const HTTP_TIMEOUT_FLAGS = [
     "-c", "http.lowSpeedLimit=1",
     "-c", "http.lowSpeedTime=60",
+    "-c", "http.postBuffer=157286400",
 ];
 
 /**
@@ -211,25 +236,46 @@ const NON_INTERACTIVE_ENV: Record<string, string> = {
  */
 const STALE_LOCK_THRESHOLD_MS = 5 * 60 * 1000;
 
-async function removeStaleIndexLock(dir: string): Promise<boolean> {
-    const lockPath = path.join(dir, ".git", "index.lock");
-    try {
-        const stat = await fs.promises.stat(lockPath);
-        const ageMs = Date.now() - stat.mtimeMs;
-        if (ageMs > STALE_LOCK_THRESHOLD_MS) {
-            await fs.promises.unlink(lockPath);
-            console.warn(
-                `[dugiteGit] Removed stale index.lock (${Math.round(ageMs / 1000)}s old) at ${lockPath}`,
-            );
-            return true;
+/**
+ * Lock files that can be left behind after a crash and block subsequent
+ * git operations. Each is relative to `<repo>/.git/`.
+ */
+const KNOWN_LOCK_FILES = [
+    "index.lock",
+    "shallow.lock",
+    "config.lock",
+    "HEAD.lock",
+    "refs/heads/main.lock",
+    "refs/heads/master.lock",
+];
+
+/**
+ * Try to remove any stale lock file older than the threshold.
+ * Returns true if at least one lock was removed.
+ */
+async function removeStaleLocks(dir: string): Promise<boolean> {
+    let removed = false;
+    for (const lockFile of KNOWN_LOCK_FILES) {
+        const lockPath = path.join(dir, ".git", lockFile);
+        try {
+            const stat = await fs.promises.stat(lockPath);
+            const ageMs = Date.now() - stat.mtimeMs;
+            if (ageMs > STALE_LOCK_THRESHOLD_MS) {
+                await fs.promises.unlink(lockPath);
+                console.warn(
+                    `[dugiteGit] Removed stale ${lockFile} (${Math.round(ageMs / 1000)}s old) at ${lockPath}`,
+                );
+                removed = true;
+            } else {
+                console.warn(
+                    `[dugiteGit] ${lockFile} exists but is only ${Math.round(ageMs / 1000)}s old — not removing (may be held by another operation)`,
+                );
+            }
+        } catch {
+            // Lock file doesn't exist — nothing to do
         }
-        console.warn(
-            `[dugiteGit] index.lock exists but is only ${Math.round(ageMs / 1000)}s old — not removing (may be held by another operation)`,
-        );
-    } catch {
-        // Lock file doesn't exist or can't be accessed — nothing to do
     }
-    return false;
+    return removed;
 }
 
 /**
@@ -256,7 +302,7 @@ async function gitExec(
         const errStr = typeof result.stderr === "string"
             ? result.stderr
             : result.stderr.toString("utf8");
-        if (errStr.includes("index.lock") && await removeStaleIndexLock(dir)) {
+        if (errStr.includes(".lock") && await removeStaleLocks(dir)) {
             result = await exec([...flags, ...args], dir, execOptions);
         }
     }
@@ -663,24 +709,51 @@ export async function mergeCommit(
 // Git operations — Remote operations (fetch, push, clone)
 // ---------------------------------------------------------------------------
 
+/**
+ * Build a processCallback that wires an optional AbortSignal to SIGTERM the
+ * child process, and optionally forwards stderr to a progress parser.
+ */
+function buildProcessCallback(
+    onProgress?: ProgressCallback,
+    signal?: AbortSignal,
+): ((cp: import("child_process").ChildProcess) => void) | undefined {
+    if (!onProgress && !signal) {
+        return undefined;
+    }
+    return (cp) => {
+        if (signal) {
+            const onAbort = () => {
+                if (!cp.killed) {
+                    cp.kill("SIGTERM");
+                }
+            };
+            if (signal.aborted) {
+                onAbort();
+            } else {
+                signal.addEventListener("abort", onAbort, { once: true });
+            }
+        }
+        if (onProgress) {
+            cp.stderr?.on("data", (data: Buffer) => {
+                parseGitProgress(data.toString(), onProgress);
+            });
+        }
+    };
+}
+
 /** Fetch from origin with auth and optional progress reporting. */
 export async function fetchOrigin(
     dir: string,
     auth: { username: string; password: string },
     onProgress?: ProgressCallback,
+    signal?: AbortSignal,
 ): Promise<void> {
     const result = await gitExec(
-        [...CREDENTIAL_OVERRIDE_FLAGS, ...HTTP_TIMEOUT_FLAGS, "fetch", "--progress", "origin"],
+        [...CREDENTIAL_OVERRIDE_FLAGS, ...HTTP_TIMEOUT_FLAGS, "fetch", "--prune", "--progress", "origin"],
         dir,
         {
             env: authEnv(auth),
-            processCallback: onProgress
-                ? (cp) => {
-                    cp.stderr?.on("data", (data: Buffer) => {
-                        parseGitProgress(data.toString(), onProgress);
-                    });
-                }
-                : undefined,
+            processCallback: buildProcessCallback(onProgress, signal),
         },
     );
     assertSuccess("fetch", result);
@@ -704,19 +777,13 @@ export async function fastForward(
 export async function push(
     dir: string,
     auth: { username: string; password: string },
-    options?: { ref?: string; onProgress?: ProgressCallback },
+    options?: { ref?: string; onProgress?: ProgressCallback; signal?: AbortSignal },
 ): Promise<void> {
     const branch = options?.ref || (await currentBranch(dir)) || "main";
     const args = [...CREDENTIAL_OVERRIDE_FLAGS, ...HTTP_TIMEOUT_FLAGS, "push", "-u", "--progress", "origin", branch];
     const result = await gitExec(args, dir, {
         env: authEnv(auth),
-        processCallback: options?.onProgress
-            ? (cp) => {
-                cp.stderr?.on("data", (data: Buffer) => {
-                    parseGitProgress(data.toString(), options.onProgress);
-                });
-            }
-            : undefined,
+        processCallback: buildProcessCallback(options?.onProgress, options?.signal),
     });
     assertSuccess("push", result);
 }
@@ -727,16 +794,11 @@ export async function clone(
     dir: string,
     auth?: { username: string; password: string },
     onProgress?: ProgressCallback,
+    signal?: AbortSignal,
 ): Promise<void> {
     const envOverrides = auth ? authEnv(auth) : {};
     const credFlags = CREDENTIAL_OVERRIDE_FLAGS;
-    const progressCallback = onProgress
-        ? (cp: import("child_process").ChildProcess) => {
-            cp.stderr?.on("data", (data: Buffer) => {
-                parseGitProgress(data.toString(), onProgress);
-            });
-        }
-        : undefined;
+    const processCallback = buildProcessCallback(onProgress, signal);
 
     // Check if target directory already exists (caller may pre-create it).
     // Native git clone fails if the directory exists and is not empty.
@@ -751,27 +813,23 @@ export async function clone(
     }
 
     if (dirExists) {
-        // Directory exists — use init + fetch + checkout flow
         const hasGit = await fs.promises.stat(path.join(dir, ".git")).then(() => true).catch(() => false);
         if (!hasGit) {
             await init(dir);
         }
 
-        // Add remote if not already present
         const remotes = await listRemotes(dir);
         if (!remotes.some((r) => r.remote === "origin")) {
             await addRemote(dir, "origin", url);
         }
 
-        // Fetch all branches
         const fetchResult = await gitExec(
             [...credFlags, ...HTTP_TIMEOUT_FLAGS, "fetch", "--progress", "origin"],
             dir,
-            { env: envOverrides, processCallback: progressCallback },
+            { env: envOverrides, processCallback },
         );
         assertSuccess("fetch", fetchResult);
 
-        // Checkout the default branch (try main, then master)
         for (const branch of ["main", "master"]) {
             try {
                 const checkoutResult = await gitExec(
@@ -779,7 +837,6 @@ export async function clone(
                     dir,
                 );
                 if (checkoutResult.exitCode === 0) {
-                    // Set upstream tracking
                     await gitExec(
                         ["branch", "--set-upstream-to", `origin/${branch}`, branch],
                         dir,
@@ -791,7 +848,6 @@ export async function clone(
             }
         }
     } else {
-        // Directory doesn't exist — use normal git clone
         const parentDir = path.dirname(dir);
         const dirName = path.basename(dir);
         await fs.promises.mkdir(parentDir, { recursive: true });
@@ -799,7 +855,7 @@ export async function clone(
         const args = [...credFlags, ...HTTP_TIMEOUT_FLAGS, "clone", "--progress", url, dirName];
         const result = await gitExec(args, parentDir, {
             env: envOverrides,
-            processCallback: progressCallback,
+            processCallback,
         });
         assertSuccess("clone", result);
     }

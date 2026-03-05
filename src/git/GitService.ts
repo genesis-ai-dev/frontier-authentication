@@ -1377,19 +1377,27 @@ export class GitService {
     }
 
     /**
-     * Wraps git operations with a timeout to prevent hanging indefinitely
+     * Wraps git operations with a timeout to prevent hanging indefinitely.
+     *
+     * When an AbortController is provided, its signal is fired on timeout so
+     * that dugite wrapper functions (fetch/push/clone) can SIGTERM the child
+     * git process instead of leaving it running in the background.
      */
     private async withTimeout<T>(
         operation: Promise<T>,
         timeoutMs: number = 10 * 60 * 1000, // 10 minutes
         operationName: string = "Git operation",
         remoteUrl?: string,
+        abortController?: AbortController,
     ): Promise<T> {
         const startTime = Date.now();
         this.debugLog(`[GitService] Starting ${operationName} with ${timeoutMs}ms timeout`);
 
+        let timer: ReturnType<typeof setTimeout> | undefined;
+
         const timeout = new Promise<never>((_, reject) => {
-            setTimeout(() => {
+            timer = setTimeout(() => {
+                abortController?.abort();
                 reject(new Error(`${operationName} timed out after ${timeoutMs}ms`));
             }, timeoutMs);
         });
@@ -1437,6 +1445,10 @@ export class GitService {
             });
 
             throw error;
+        } finally {
+            if (timer !== undefined) {
+                clearTimeout(timer);
+            }
         }
     }
 
@@ -1501,7 +1513,21 @@ export class GitService {
     }
 
     /**
-     * Safe push operation with timeout and retry logic
+     * Detect whether a push error is a non-fast-forward rejection that can
+     * be recovered by re-fetching and fast-forwarding before retrying.
+     */
+    private static isNonFastForwardError(msg: string): boolean {
+        return (
+            msg.includes("non-fast-forward") ||
+            msg.includes("rejected") ||
+            msg.includes("One or more branches were not updated") ||
+            msg.includes("failed to update ref")
+        );
+    }
+
+    /**
+     * Safe push operation with timeout, abort-on-timeout, and automatic
+     * retry on non-fast-forward rejection (fetch + fast-forward + push).
      */
     private async safePush(
         dir: string,
@@ -1509,6 +1535,7 @@ export class GitService {
         options?: { ref?: string; timeoutMs?: number; }
     ): Promise<void> {
         const { ref, timeoutMs = 10 * 60 * 1000 } = options || {};
+        const MAX_PUSH_RETRIES = 2;
 
         this.debugLog(`[GitService] Starting push operation:`, {
             directory: dir,
@@ -1519,17 +1546,11 @@ export class GitService {
 
         let remoteUrl: string | undefined;
         try {
-            const currentBranch = await dugiteGit.currentBranch(dir);
+            const branch = await dugiteGit.currentBranch(dir);
             remoteUrl = await this.getRemoteUrl(dir);
-            const status = await dugiteGit.statusMatrix(dir);
-            const changedFiles = status.filter(
-                (entry) => entry[1] !== entry[2] || entry[2] !== entry[3]
-            ).length;
-
             this.debugLog(`[GitService] Push context:`, {
-                currentBranch,
+                currentBranch: branch,
                 remoteUrl,
-                changedFiles,
                 hasAuth: !!auth.username,
             });
         } catch (contextError) {
@@ -1541,63 +1562,84 @@ export class GitService {
             this.progressCallback("pushing", 0, 0, "Uploading changes");
         }
 
-        const pushOperation = dugiteGit.push(dir, auth, {
-            ...(ref && { ref }),
-            onProgress: (phase, loaded, total) => {
-                console.log(
-                    `[GitService] ⬆️  Push progress: ${phase || "uploading"} ${loaded || 0}/${total || 0}`
-                );
-                this.updateSyncProgress("pushing", { phase, loaded, total });
-            },
-        });
-
-        try {
-            await this.withTimeout(pushOperation, timeoutMs, "Push operation", remoteUrl);
-            console.log("[GitService] ✓ Push completed successfully");
-            this.debugLog(`[GitService] Push completed successfully`);
-            if (this.progressCallback) {
-                this.progressCallback("pushing", 1, 1, "Upload complete");
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            console.error(`[GitService] Push operation failed:`, {
-                error: errorMessage,
-                directory: dir,
-                ref: ref || "HEAD",
-                timestamp: new Date().toISOString(),
+        for (let attempt = 0; attempt <= MAX_PUSH_RETRIES; attempt++) {
+            const pushController = new AbortController();
+            const pushOperation = dugiteGit.push(dir, auth, {
+                ...(ref && { ref }),
+                signal: pushController.signal,
+                onProgress: (phase, loaded, total) => {
+                    console.log(
+                        `[GitService] ⬆️  Push progress: ${phase || "uploading"} ${loaded || 0}/${total || 0}`
+                    );
+                    this.updateSyncProgress("pushing", { phase, loaded, total });
+                },
             });
 
-            // Provide more helpful error message
-            let userFriendlyMessage = "push failed";
-            if (errorMessage.includes("ENOTFOUND") || errorMessage.includes("getaddrinfo")) {
-                userFriendlyMessage =
-                    "push failed: Cannot reach server (check internet connection)";
-            } else if (errorMessage.includes("401") || errorMessage.includes("authentication")) {
-                userFriendlyMessage =
-                    "push failed: Authentication failed (try logging out and back in)";
-            } else if (errorMessage.includes("403") || errorMessage.includes("forbidden")) {
-                userFriendlyMessage = "push failed: Access denied (check repository permissions)";
-            } else if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
-                userFriendlyMessage = "push failed: Connection timeout (server not responding)";
-            } else if (
-                errorMessage.includes("One or more branches were not updated") ||
-                errorMessage.includes("failed to update ref")
-            ) {
-                // Typical git push error when the remote ref changed
-                // between our last fetch and push (non-fast-forward update).
-                userFriendlyMessage =
-                    "push failed: Remote branch changed since last sync. Please sync again to merge the latest remote changes.";
-            } else if (
-                errorMessage.includes("rejected") ||
-                errorMessage.includes("non-fast-forward")
-            ) {
-                userFriendlyMessage =
-                    "push failed: Remote has changes. Please sync first to merge remote changes.";
-            }
+            try {
+                await this.withTimeout(pushOperation, timeoutMs, "Push operation", remoteUrl, pushController);
+                console.log("[GitService] ✓ Push completed successfully");
+                this.debugLog(`[GitService] Push completed successfully`);
+                if (this.progressCallback) {
+                    this.progressCallback("pushing", 1, 1, "Upload complete");
+                }
+                return;
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                const gitStderr = (error as any)?.originalError?.gitStderr ?? (error as any)?.gitStderr ?? "";
+                const fullMsg = `${errorMessage} ${gitStderr}`;
 
-            const enhancedError = new Error(userFriendlyMessage);
-            (enhancedError as any).originalError = error;
-            throw enhancedError;
+                // On non-fast-forward, fetch + fast-forward and retry the push
+                if (GitService.isNonFastForwardError(fullMsg) && attempt < MAX_PUSH_RETRIES) {
+                    const currentBranch = ref || (await dugiteGit.currentBranch(dir)) || "main";
+                    console.warn(
+                        `[GitService] Push rejected (non-fast-forward), attempt ${attempt + 1}/${MAX_PUSH_RETRIES + 1} — fetching and fast-forwarding before retry`,
+                    );
+                    try {
+                        const retryFetchCtrl = new AbortController();
+                        await this.withTimeout(
+                            dugiteGit.fetchOrigin(dir, auth, undefined, retryFetchCtrl.signal),
+                            2 * 60 * 1000,
+                            "Push-retry fetch",
+                            remoteUrl,
+                            retryFetchCtrl,
+                        );
+                        await dugiteGit.fastForward(dir, currentBranch, auth);
+                        continue;
+                    } catch (ffErr) {
+                        this.debugLog("[GitService] Fast-forward during push retry failed — giving up:", {
+                            error: ffErr instanceof Error ? ffErr.message : String(ffErr),
+                        });
+                    }
+                }
+
+                console.error(`[GitService] Push operation failed:`, {
+                    error: errorMessage,
+                    directory: dir,
+                    ref: ref || "HEAD",
+                    attempt: attempt + 1,
+                    timestamp: new Date().toISOString(),
+                });
+
+                let userFriendlyMessage = "push failed";
+                if (errorMessage.includes("ENOTFOUND") || errorMessage.includes("getaddrinfo")) {
+                    userFriendlyMessage =
+                        "push failed: Cannot reach server (check internet connection)";
+                } else if (errorMessage.includes("401") || errorMessage.includes("authentication")) {
+                    userFriendlyMessage =
+                        "push failed: Authentication failed (try logging out and back in)";
+                } else if (errorMessage.includes("403") || errorMessage.includes("forbidden")) {
+                    userFriendlyMessage = "push failed: Access denied (check repository permissions)";
+                } else if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
+                    userFriendlyMessage = "push failed: Connection timeout (server not responding)";
+                } else if (GitService.isNonFastForwardError(fullMsg)) {
+                    userFriendlyMessage =
+                        "push failed: Remote has newer changes that could not be merged automatically. Please sync again.";
+                }
+
+                const enhancedError = new Error(userFriendlyMessage);
+                (enhancedError as any).originalError = error;
+                throw enhancedError;
+            }
         }
     }
 
@@ -1735,16 +1777,18 @@ export class GitService {
                 this.progressCallback("fetching", 0, 0, "Checking for remote changes");
             }
             try {
+                const fetchController = new AbortController();
                 await this.withTimeout(
                     dugiteGit.fetchOrigin(dir, auth, (phase, loaded, total, transferInfo) => {
                         console.log(
                             `[GitService] ⬇️  Fetch progress: ${phase || "downloading"} ${loaded || 0}/${total || 0}`
                         );
                         this.updateSyncProgress("fetching", { phase, loaded, total, transferInfo });
-                    }),
+                    }, fetchController.signal),
                     2 * 60 * 1000,
                     "Fetch operation",
                     remoteUrl,
+                    fetchController,
                 );
                 console.log("[GitService] ✓ Fetch completed successfully");
                 this.debugLog("[GitService] Fetch completed successfully");
@@ -1859,7 +1903,6 @@ export class GitService {
                     dugiteGit.fastForward(dir, currentBranch, auth),
                     2 * 60 * 1000,
                     "Fast-forward operation",
-                    remoteUrl,
                 );
 
                 console.log("[GitService] ✓ Fast-forward merge completed successfully");
@@ -1914,11 +1957,13 @@ export class GitService {
             // Refetch to ensure we have the absolute latest remote state before analyzing conflicts
             this.debugLog("[GitService] Refetching remote changes before conflict analysis");
             try {
+                const refetchController = new AbortController();
                 await this.withTimeout(
-                    dugiteGit.fetchOrigin(dir, auth),
+                    dugiteGit.fetchOrigin(dir, auth, undefined, refetchController.signal),
                     2 * 60 * 1000,
                     "Pre-conflict-analysis fetch",
                     remoteUrl,
+                    refetchController,
                 );
                 this.debugLog("[GitService] Pre-conflict-analysis fetch completed successfully");
 
@@ -2410,11 +2455,13 @@ export class GitService {
             // the subsequent push to be rejected as a non-fast-forward update.
             this.debugLog("[GitService] Fetching latest changes before merge completion");
             const mergeRemoteUrl = await this.getRemoteUrl(dir);
+            const mergeFetchController = new AbortController();
             await this.withTimeout(
-                dugiteGit.fetchOrigin(dir, auth),
+                dugiteGit.fetchOrigin(dir, auth, undefined, mergeFetchController.signal),
                 2 * 60 * 1000,
                 "Pre-merge fetch operation",
                 mergeRemoteUrl,
+                mergeFetchController,
             );
 
             // Get the current state AFTER fetch so our merge commit reflects the latest
