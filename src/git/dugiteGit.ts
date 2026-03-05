@@ -336,7 +336,11 @@ async function gitExec(
         const errStr = typeof result.stderr === "string"
             ? result.stderr
             : result.stderr.toString("utf8");
-        if (errStr.includes(".lock") && await removeStaleLocks(dir)) {
+        const isLockError =
+            /Unable to create '.*\.lock'/.test(errStr) ||
+            /\.lock.*File exists/.test(errStr) ||
+            /cannot lock ref/.test(errStr);
+        if (isLockError && await removeStaleLocks(dir)) {
             result = await exec([...flags, ...args], dir, execOptions);
         }
     }

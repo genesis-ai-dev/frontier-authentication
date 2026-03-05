@@ -2766,6 +2766,9 @@ export class GitService {
             const buf = await fs.promises.readFile(absolutePath);
 
             // ── Already an LFS pointer? ──
+            // Only catch parsing errors — if the file IS a pointer but handling
+            // fails, that error must propagate (not fall through to raw upload).
+            let existingPointer: ReturnType<typeof this.parseLfsPointer> | undefined;
             try {
                 const asText = buf.toString("utf8");
                 if (asText.length === 0) {
@@ -2773,8 +2776,11 @@ export class GitService {
                         `[GitService] ${filepath} is empty; delegating recovery to upload helper`
                     );
                 }
-                const existingPointer = this.parseLfsPointer(asText);
-                if (existingPointer) {
+                existingPointer = this.parseLfsPointer(asText);
+            } catch {
+                existingPointer = undefined;
+            }
+            if (existingPointer) {
                     this.debugLog(
                         `[GitService] ${filepath} is already an LFS pointer; staging without upload`
                     );
@@ -2848,9 +2854,8 @@ export class GitService {
                             }
                         }
                     }
-                    continue; // pointer already staged — nothing more to do
-                }
-            } catch { /* not a pointer — fall through to raw upload */ }
+                continue; // pointer already staged — nothing more to do
+            }
 
             // Raw bytes — needs upload + pointer creation.
             // If the file is empty and sits in the pointers path, try to recover
@@ -3909,16 +3914,21 @@ export class GitService {
         }
 
         // If the worktree file already contains an LFS pointer, avoid re-uploading.
+        // Only catch parsing errors — if the file IS a pointer but handling
+        // fails, that error must propagate (not fall through to raw upload).
+        let existingPointer: ReturnType<typeof this.parseLfsPointer> | undefined;
         try {
-            let asText = buf.toString("utf8");
+            const asText = buf.toString("utf8");
             if (asText.length === 0) {
-                // Defer empty-pointer handling to upload helper via recovery context
                 this.debugLog(
                     `[GitService] ${filepath} is empty; delegating recovery/corruption handling to upload helper`
                 );
             }
-            const existingPointer = this.parseLfsPointer(asText);
-            if (existingPointer) {
+            existingPointer = this.parseLfsPointer(asText);
+        } catch {
+            existingPointer = undefined;
+        }
+        if (existingPointer) {
                 this.debugLog(
                     `[GitService] ${filepath} is already an LFS pointer; staging without upload`
                 );
@@ -4013,9 +4023,8 @@ export class GitService {
                         }
                     }
                 }
-                return false; // exit early if the file is already an LFS pointer (no upload needed)
-            }
-        } catch { }
+            return false; // exit early if the file is already an LFS pointer (no upload needed)
+        }
         // Upload to LFS via our helper (handles batch, upload, verify and x-http-method)
         this.debugLog(`[GitService] Uploading ${filepath} to LFS`);
         const pointerInfos = await uploadBlobsToLFSBucket(
