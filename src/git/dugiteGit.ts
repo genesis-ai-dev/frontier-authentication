@@ -990,18 +990,18 @@ export async function statusMatrix(dir: string): Promise<StatusMatrixEntry[]> {
         }
 
         if (line.startsWith("1") || line.startsWith("2")) {
-            // Changed entry format (porcelain v2):
-            // 1 XY sub mH mI mW hH hI <path>
-            //   (8 fixed space-separated fields, then the path which may contain spaces)
-            // 2 XY sub mH mI mW hH hI X<score> <path>\t<origPath>
-            //   (9 fixed fields before tab, then path\torigPath)
+            // Porcelain v2 format:
+            // Type 1: "1 XY sub mH mI mW hH hI <path>" (8 fixed fields + path)
+            // Type 2: "2 XY sub mH mI mW hH hI X<score> <path>\t<origPath>"
             const parts = line.split("\t");
             const fields = parts[0].split(" ");
-            const xy = fields[1]; // Two-char status: X=index, Y=workdir
+            const minFields = line.startsWith("2") ? 10 : 9;
+            if (fields.length < minFields || !fields[1] || fields[1].length < 2) {
+                console.warn(`[statusMatrix] Skipping malformed porcelain line: ${line}`);
+                continue;
+            }
+            const xy = fields[1];
 
-            // Type 1: 8 fixed fields (0-7), then <path>
-            // Type 2: 9 fixed fields (0-8, where 8 is X<score>), then <path>\t<origPath>
-            // In both cases we want the *current* (new) path, not the original.
             let filepath: string;
             if (line.startsWith("2")) {
                 filepath = fields.slice(9).join(" ");
@@ -1009,8 +1009,8 @@ export async function statusMatrix(dir: string): Promise<StatusMatrixEntry[]> {
                 filepath = fields.slice(8).join(" ");
             }
 
-            const indexStatus = xy[0]; // X: staged status
-            const workdirStatus = xy[1]; // Y: workdir status
+            const indexStatus = xy[0];
+            const workdirStatus = xy[1];
 
             // HEAD status: 1 if file existed at HEAD, 0 if new
             const headStatus: 0 | 1 = indexStatus === "A" ? 0 : 1;

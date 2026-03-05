@@ -460,11 +460,16 @@ async function uploadBlobsToLFSBucket(
 
         if (!lfsInfoRes.ok) {
             const errorText = await lfsInfoRes.text();
+            const safeHeaders = Object.fromEntries(
+                Object.entries({ ...headers, ...authHeaders }).map(([k, v]) =>
+                    [k, /^authorization$/i.test(k) ? "[REDACTED]" : v]
+                )
+            );
             console.error("[LFS Patch] Request failed:");
             console.error("Status:", lfsInfoRes.status, lfsInfoRes.statusText);
             console.error("Response:", errorText);
             console.error("Request URL:", `${url}/info/lfs/objects/batch`);
-            console.error("Request headers:", { ...headers, ...authHeaders });
+            console.error("Request headers:", safeHeaders);
             const err = new Error(
                 `LFS request failed with status ${lfsInfoRes.status}: ${lfsInfoRes.statusText}\nResponse: ${errorText}`
             );
@@ -635,6 +640,7 @@ async function uploadBlobsToLFSBucket(
                     });
 
                     if (!verificationResp.ok) {
+                        await verificationResp.text().catch(() => {});
                         const err = new Error(
                             `Verification failed for ${fileLabel(index)}, HTTP ${verificationResp.status}: ${verificationResp.statusText}`
                         );
@@ -3527,20 +3533,16 @@ export class GitService {
             // Check internet connectivity by making HEAD requests and checking response codes
             const userIsOnline = await fetch("https://gitlab.com", {
                 method: "HEAD",
-                cache: "no-store", // Prevent caching
+                cache: "no-store",
             })
-                .then((res) => (res as Response).status === 200)
+                .then(async (res) => { await res.text().catch(() => {}); return res.status === 200; })
                 .catch(() => false);
 
             const apiEndpoint = vscode.workspace.getConfiguration("frontier").get<string>("apiEndpoint") || "https://api.frontierrnd.com/api/v1";
-            // Get base URL for health check (remove /api/v1 if present)
             const baseUrl = apiEndpoint.replace(/\/api\/v1\/?$/, "");
 
             const apiIsOnline = await fetch(baseUrl)
-                .then((res) => {
-                    this.debugLog("apiIsOnline", { res });
-                    return (res as Response).status === 200;
-                })
+                .then(async (res) => { await res.text().catch(() => {}); return res.status === 200; })
                 .catch(() => false);
 
             if (!userIsOnline) {

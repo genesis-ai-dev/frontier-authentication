@@ -66,6 +66,7 @@ interface GitHubRelease {
 // ---------------------------------------------------------------------------
 
 let resolvedPaths: GitBinaryPaths | undefined;
+let inflightEnsure: Promise<GitBinaryPaths> | undefined;
 
 /** Returns the currently resolved paths, or undefined if not yet initialized. */
 export function getResolvedPath(): GitBinaryPaths | undefined {
@@ -89,6 +90,21 @@ export function resetResolvedPaths(): void {
  * @returns Resolved paths to the git binary
  */
 export async function ensureGitBinary(
+    context: vscode.ExtensionContext,
+): Promise<GitBinaryPaths> {
+    if (resolvedPaths) {
+        return resolvedPaths;
+    }
+    // Deduplicate concurrent callers — only the first triggers the download,
+    // subsequent callers await the same promise.
+    if (inflightEnsure) {
+        return inflightEnsure;
+    }
+    inflightEnsure = doEnsureGitBinary(context).finally(() => { inflightEnsure = undefined; });
+    return inflightEnsure;
+}
+
+async function doEnsureGitBinary(
     context: vscode.ExtensionContext,
 ): Promise<GitBinaryPaths> {
     if (resolvedPaths) {
@@ -289,6 +305,7 @@ async function findPlatformAsset(): Promise<PlatformAssetInfo> {
             });
 
             if (!response.ok) {
+                await response.text().catch(() => {});
                 throw new Error(
                     `Failed to fetch release info: ${response.status} ${response.statusText}`,
                 );
@@ -372,6 +389,7 @@ async function downloadFile(
             });
 
             if (!response.ok) {
+                await response.text().catch(() => {});
                 throw new Error(`Download failed: ${response.status} ${response.statusText}`);
             }
 
