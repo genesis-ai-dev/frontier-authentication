@@ -175,12 +175,20 @@ function assertSuccess(operation: string, result: IGitResult): void {
     }
 }
 
+/**
+ * Extract stdout as a string with CRLF normalized to LF.
+ * MinGW git on Windows typically outputs LF, but system-level git
+ * config or locale settings can introduce CRLF in edge cases.
+ * Normalizing here keeps all downstream parsers platform-safe.
+ */
 function stdout(result: IGitResult): string {
-    return typeof result.stdout === "string" ? result.stdout : result.stdout.toString("utf8");
+    const raw = typeof result.stdout === "string" ? result.stdout : result.stdout.toString("utf8");
+    return raw.replace(/\r\n/g, "\n");
 }
 
 function stderr(result: IGitResult): string {
-    return typeof result.stderr === "string" ? result.stderr : result.stderr.toString("utf8");
+    const raw = typeof result.stderr === "string" ? result.stderr : result.stderr.toString("utf8");
+    return raw.replace(/\r\n/g, "\n");
 }
 
 // ---------------------------------------------------------------------------

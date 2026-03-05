@@ -211,7 +211,13 @@ async function isValidInstallation(gitRootDir: string): Promise<boolean> {
             ? path.join(gitRootDir, "cmd", "git.exe")
             : path.join(gitRootDir, "bin", "git");
 
-        await fs.promises.access(gitBin, fs.constants.X_OK);
+        // On Windows, X_OK is not supported and falls back to F_OK (exists);
+        // executability is determined by file extension (.exe).
+        // On macOS/Linux, X_OK verifies the execute permission bit.
+        const accessMode = process.platform === "win32"
+            ? fs.constants.F_OK
+            : fs.constants.X_OK;
+        await fs.promises.access(gitBin, accessMode);
         return true;
     } catch {
         return false;
