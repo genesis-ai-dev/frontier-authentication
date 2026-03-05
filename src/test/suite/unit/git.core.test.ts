@@ -18,8 +18,7 @@ suite("Git core actions", () => {
     const service = new GitService(stateStub);
 
     suiteSetup(() => {
-        // Point dugite at system git for tests
-        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+        dugiteGit.useEmbeddedGitBinary();
     });
 
     setup(async () => {

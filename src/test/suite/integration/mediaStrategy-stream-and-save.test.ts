@@ -3,16 +3,10 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { execSync } from "child_process";
 import * as dugiteGit from "../../../git/dugiteGit";
 import { GitLabService } from "../../../gitlab/GitLabService";
 import { SCMManager } from "../../../scm/SCMManager";
 import { StateManager } from "../../../state";
-
-/** Helper: update a git ref. */
-const gitWriteRef = (dir: string, ref: string, value: string): void => {
-    execSync(`git update-ref ${ref} ${value}`, { cwd: dir });
-};
 
 suite("Integration: clone with stream-and-save does not bulk download", () => {
     let workspaceDir: string;
@@ -20,8 +14,7 @@ suite("Integration: clone with stream-and-save does not bulk download", () => {
     let originalClone: any;
 
     suiteSetup(async () => {
-        // Point dugite at system git for tests
-        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+        dugiteGit.useEmbeddedGitBinary();
 
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
         assert.ok(ext, "Extension not found");
@@ -56,7 +49,7 @@ suite("Integration: clone with stream-and-save does not bulk download", () => {
         await dugiteGit.add(workspaceDir, pointerRel);
         const head = await dugiteGit.commit(workspaceDir, "add ptr", { name: "T", email: "t@e" });
         await dugiteGit.addRemote(workspaceDir, "origin", "https://example.com/repo.git");
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", head);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", head);
 
         originalClone = (dugiteGit as any).clone;
         (dugiteGit as any).clone = async () => {};

@@ -7,8 +7,7 @@ import { StateManager } from "../../../state";
 
 suite("Unit: reconcile respects stream-only strategy", () => {
     suiteSetup(() => {
-        // Point dugite at system git for tests
-        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+        dugiteGit.useEmbeddedGitBinary();
     });
 
     test("reconcilePointersFilesystem returns early for stream-only", async () => {

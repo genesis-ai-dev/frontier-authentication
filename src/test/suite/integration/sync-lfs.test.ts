@@ -3,17 +3,11 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { execSync } from "child_process";
 import * as dugiteGit from "../../../git/dugiteGit";
 import { registerMockAuthProvider } from "../../helpers/mockAuthProvider";
 import { GitLabService } from "../../../gitlab/GitLabService";
 import { SCMManager } from "../../../scm/SCMManager";
 import { StateManager } from "../../../state";
-
-/** Helper: update a git ref. */
-const gitWriteRef = (dir: string, ref: string, value: string): void => {
-    execSync(`git update-ref ${ref} ${value}`, { cwd: dir });
-};
 
 suite("Integration: sync uses Git LFS for pointer downloads", () => {
     let mockProvider: vscode.Disposable | undefined;
@@ -22,8 +16,7 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
     let originalGetExtension: any;
 
     suiteSetup(async () => {
-        // Point dugite at system git for tests
-        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+        dugiteGit.useEmbeddedGitBinary();
 
         // Register mock VS Code auth provider and activate extension
         mockProvider = await registerMockAuthProvider();
@@ -75,7 +68,7 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
         // Add remote and create matching remote ref
         const remoteUrl = "https://example.com/repo.git";
         await dugiteGit.addRemote(workspaceDir, "origin", remoteUrl);
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", headOid);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", headOid);
 
         // Mark pointers as LFS-tracked
         await fs.promises.writeFile(
@@ -100,7 +93,7 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
         await dugiteGit.add(workspaceDir, pointerRel);
         const newHead = await dugiteGit.commit(workspaceDir, "add pointer", { name: "Tester", email: "tester@example.com" });
         // Make remote ref match local HEAD to avoid fast-forward path
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", newHead);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", newHead);
 
         // Ensure files dir path exists but target file absent
         const filesAbs = path.join(workspaceDir, ".project/attachments/files/audio/sync.wav");

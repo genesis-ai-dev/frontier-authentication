@@ -15,8 +15,7 @@ suite("E2E: Full Workflows", () => {
     let mockContext: vscode.ExtensionContext;
 
     suiteSetup(async () => {
-        // Point dugite at system git for tests
-        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+        dugiteGit.useEmbeddedGitBinary();
 
         mockProvider = await registerMockAuthProvider();
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");

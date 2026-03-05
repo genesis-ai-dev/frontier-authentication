@@ -3,16 +3,10 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { execSync } from "child_process";
 import * as dugiteGit from "../../../git/dugiteGit";
 import { registerMockAuthProvider } from "../../helpers/mockAuthProvider";
 import { GitService } from "../../../git/GitService";
 import { StateManager } from "../../../state";
-
-/** Helper: update a git ref. */
-const gitWriteRef = (dir: string, ref: string, value: string): void => {
-    execSync(`git update-ref ${ref} ${value}`, { cwd: dir });
-};
 
 suite("Integration: LFS Error Scenarios", () => {
     let mockProvider: vscode.Disposable | undefined;
@@ -21,8 +15,7 @@ suite("Integration: LFS Error Scenarios", () => {
     let originalFetch: any;
 
     suiteSetup(async () => {
-        // Point dugite at system git for tests
-        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+        dugiteGit.useEmbeddedGitBinary();
 
         mockProvider = await registerMockAuthProvider();
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
@@ -143,7 +136,7 @@ suite("Integration: LFS Error Scenarios", () => {
         await dugiteGit.add(workspaceDir, "README.md");
         const baseOid = await dugiteGit.commit(workspaceDir, "Base", { name: "Test", email: "test@example.com" });
 
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", baseOid);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", baseOid);
 
         (globalThis as any).fetch = async (input: any, init?: any) => {
             const url = typeof input === "string" ? input : String(input);

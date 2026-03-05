@@ -3,16 +3,10 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { execSync } from "child_process";
 import * as dugiteGit from "../../../git/dugiteGit";
 import { GitLabService } from "../../../gitlab/GitLabService";
 import { SCMManager } from "../../../scm/SCMManager";
 import { StateManager } from "../../../state";
-
-/** Helper: update a git ref. */
-const gitWriteRef = (dir: string, ref: string, value: string): void => {
-    execSync(`git update-ref ${ref} ${value}`, { cwd: dir });
-};
 
 suite("Integration: clone respects mediaStrategy", () => {
     let workspaceDir: string;
@@ -21,8 +15,7 @@ suite("Integration: clone respects mediaStrategy", () => {
     let originalGetRemoteUrl: any;
 
     suiteSetup(async () => {
-        // Point dugite at system git for tests
-        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+        dugiteGit.useEmbeddedGitBinary();
 
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
         assert.ok(ext, "Extension not found");
@@ -67,7 +60,7 @@ suite("Integration: clone respects mediaStrategy", () => {
         // Simulate remote by setting origin and remote ref to HEAD
         const remoteUrl = "https://example.com/repo.git";
         await dugiteGit.addRemote(workspaceDir, "origin", remoteUrl);
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", newHead);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", newHead);
 
         // Stub dugiteGit.clone to avoid network and skip actual clone since repo already present
         originalClone = (dugiteGit as any).clone;

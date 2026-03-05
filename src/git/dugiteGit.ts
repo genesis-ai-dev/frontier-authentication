@@ -95,6 +95,18 @@ export function setAskpassPath(scriptPath: string): void {
     }
 }
 
+/**
+ * Use dugite's own embedded git binary instead of a runtime-downloaded one.
+ * Clears any previously set path overrides so dugite resolves its bundled
+ * binary for the current platform automatically.
+ *
+ * Intended for test environments where the full gitBinaryManager download
+ * flow hasn't run (and doesn't need to).
+ */
+export function useEmbeddedGitBinary(): void {
+    gitEnvOverrides = {};
+}
+
 /** Returns true when a binary path has been configured. */
 export function isGitBinaryConfigured(): boolean {
     return Object.keys(gitEnvOverrides).length > 0;
@@ -1173,4 +1185,17 @@ export async function status(dir: string, filepath: string): Promise<string | un
     assertSuccess("status", result);
     const output = stdout(result).trim();
     return output || undefined;
+}
+
+/** Write/update a ref to a given SHA. */
+export async function updateRef(dir: string, ref: string, value: string): Promise<void> {
+    const result = await gitExec(["update-ref", ref, value], dir);
+    assertSuccess("update-ref", result);
+}
+
+/** Checkout a ref, optionally forcing. */
+export async function checkout(dir: string, ref: string, force = false): Promise<void> {
+    const args = force ? ["checkout", "-f", ref] : ["checkout", ref];
+    const result = await gitExec(args, dir);
+    assertSuccess("checkout", result);
 }

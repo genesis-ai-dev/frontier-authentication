@@ -3,21 +3,10 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { execSync } from "child_process";
 import * as dugiteGit from "../../../git/dugiteGit";
 import { registerMockAuthProvider } from "../../helpers/mockAuthProvider";
 import { GitService } from "../../../git/GitService";
 import { StateManager } from "../../../state";
-
-/** Helper: update a git ref (replaces isomorphic-git's writeRef). */
-const gitWriteRef = (dir: string, ref: string, value: string): void => {
-    execSync(`git update-ref ${ref} ${value}`, { cwd: dir });
-};
-
-/** Helper: checkout a ref (replaces isomorphic-git's checkout). */
-const gitCheckout = (dir: string, ref: string, force = false): void => {
-    execSync(`git checkout ${force ? "-f " : ""}${ref}`, { cwd: dir });
-};
 
 suite("Integration: GitService Merge Conflicts", () => {
     let mockProvider: vscode.Disposable | undefined;
@@ -26,8 +15,7 @@ suite("Integration: GitService Merge Conflicts", () => {
     let stateManager: StateManager;
 
     suiteSetup(async () => {
-        // Point dugite at system git for tests
-        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+        dugiteGit.useEmbeddedGitBinary();
 
         mockProvider = await registerMockAuthProvider();
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
@@ -83,7 +71,7 @@ suite("Integration: GitService Merge Conflicts", () => {
 
         // Add remote
         await dugiteGit.addRemote(workspaceDir, "origin", "https://example.com/repo.git");
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", baseOid);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", baseOid);
 
         // Modify files locally
         await fs.promises.writeFile(path.join(workspaceDir, "file1.txt"), "local1", "utf8");
@@ -93,12 +81,12 @@ suite("Integration: GitService Merge Conflicts", () => {
         const localOid = await dugiteGit.commit(workspaceDir, "Local changes", { name: "Test", email: "test@example.com" });
 
         // Simulate remote changes (different modifications)
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", baseOid);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", baseOid);
         
         // Create remote commit with different changes
         // Reset to base commit on main branch
-        gitWriteRef(workspaceDir, "refs/heads/main", baseOid);
-        gitCheckout(workspaceDir, "main", true);
+        await dugiteGit.updateRef(workspaceDir, "refs/heads/main", baseOid);
+        await dugiteGit.checkout(workspaceDir, "main", true);
         await fs.promises.writeFile(path.join(workspaceDir, "file1.txt"), "remote1", "utf8");
         await fs.promises.writeFile(path.join(workspaceDir, "file2.txt"), "remote2", "utf8");
         await dugiteGit.add(workspaceDir, "file1.txt");
@@ -106,11 +94,11 @@ suite("Integration: GitService Merge Conflicts", () => {
         const remoteOid = await dugiteGit.commit(workspaceDir, "Remote changes", { name: "Remote", email: "remote@example.com" });
 
         // Update remote ref
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", remoteOid);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", remoteOid);
 
         // Reset main branch to local commit and checkout
-        gitWriteRef(workspaceDir, "refs/heads/main", localOid);
-        gitCheckout(workspaceDir, "main", true);
+        await dugiteGit.updateRef(workspaceDir, "refs/heads/main", localOid);
+        await dugiteGit.checkout(workspaceDir, "main", true);
 
         // Mock fetch to return our simulated remote
         const originalFetchOrigin = dugiteGit.fetchOrigin;
@@ -139,7 +127,7 @@ suite("Integration: GitService Merge Conflicts", () => {
 
         // Add remote
         await dugiteGit.addRemote(workspaceDir, "origin", "https://example.com/repo.git");
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", baseOid);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", baseOid);
 
         const conflictPath = "files/target/TheChosen_201_en-1.codex";
 
@@ -150,19 +138,19 @@ suite("Integration: GitService Merge Conflicts", () => {
         const localOid = await dugiteGit.commit(workspaceDir, "Local adds codex", { name: "Local", email: "local@example.com" });
 
         // Create a remote commit from the base that adds the same path with different content
-        gitWriteRef(workspaceDir, "refs/heads/main", baseOid);
-        gitCheckout(workspaceDir, "main", true);
+        await dugiteGit.updateRef(workspaceDir, "refs/heads/main", baseOid);
+        await dugiteGit.checkout(workspaceDir, "main", true);
 
         await fs.promises.mkdir(path.join(workspaceDir, "files/target"), { recursive: true });
         await fs.promises.writeFile(path.join(workspaceDir, conflictPath), "remote-codex", "utf8");
         await dugiteGit.add(workspaceDir, conflictPath);
         const remoteOid = await dugiteGit.commit(workspaceDir, "Remote adds codex", { name: "Remote", email: "remote@example.com" });
 
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", remoteOid);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", remoteOid);
 
         // Reset working branch to local commit for the sync operation
-        gitWriteRef(workspaceDir, "refs/heads/main", localOid);
-        gitCheckout(workspaceDir, "main", true);
+        await dugiteGit.updateRef(workspaceDir, "refs/heads/main", localOid);
+        await dugiteGit.checkout(workspaceDir, "main", true);
 
         // Mock fetch to no-op (we already set refs/remotes/origin/main)
         const originalFetchOrigin = dugiteGit.fetchOrigin;
@@ -218,7 +206,7 @@ suite("Integration: GitService Merge Conflicts", () => {
 
         // Add remote
         await dugiteGit.addRemote(workspaceDir, "origin", "https://example.com/repo.git");
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", baseOid);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", baseOid);
 
         // Modify pointer locally
         const localPointer = [
@@ -231,8 +219,8 @@ suite("Integration: GitService Merge Conflicts", () => {
         const localOid = await dugiteGit.commit(workspaceDir, "Local LFS change", { name: "Test", email: "test@example.com" });
 
         // Simulate remote change - reset to base on main branch
-        gitWriteRef(workspaceDir, "refs/heads/main", baseOid);
-        gitCheckout(workspaceDir, "main", true);
+        await dugiteGit.updateRef(workspaceDir, "refs/heads/main", baseOid);
+        await dugiteGit.checkout(workspaceDir, "main", true);
         const remotePointer = [
             "version https://git-lfs.github.com/spec/v1",
             "oid sha256:" + "c".repeat(64),
@@ -242,11 +230,11 @@ suite("Integration: GitService Merge Conflicts", () => {
         await dugiteGit.add(workspaceDir, pointerPath);
         const remoteOid = await dugiteGit.commit(workspaceDir, "Remote LFS change", { name: "Remote", email: "remote@example.com" });
 
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", remoteOid);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", remoteOid);
 
         // Reset main branch to local commit
-        gitWriteRef(workspaceDir, "refs/heads/main", localOid);
-        gitCheckout(workspaceDir, "main", true);
+        await dugiteGit.updateRef(workspaceDir, "refs/heads/main", localOid);
+        await dugiteGit.checkout(workspaceDir, "main", true);
 
         const originalFetchOrigin = dugiteGit.fetchOrigin;
         (dugiteGit as any).fetchOrigin = async () => {};
@@ -277,7 +265,7 @@ suite("Integration: GitService Merge Conflicts", () => {
         const baseOid = await dugiteGit.commit(workspaceDir, "Base commit", { name: "Test", email: "test@example.com" });
 
         await dugiteGit.addRemote(workspaceDir, "origin", "https://example.com/repo.git");
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", baseOid);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", baseOid);
 
         // Add file locally
         await fs.promises.writeFile(path.join(workspaceDir, "file.txt"), "local content", "utf8");
@@ -285,17 +273,17 @@ suite("Integration: GitService Merge Conflicts", () => {
         const localOid = await dugiteGit.commit(workspaceDir, "Add file locally", { name: "Test", email: "test@example.com" });
 
         // Add same file remotely with different content - reset to base on main branch
-        gitWriteRef(workspaceDir, "refs/heads/main", baseOid);
-        gitCheckout(workspaceDir, "main", true);
+        await dugiteGit.updateRef(workspaceDir, "refs/heads/main", baseOid);
+        await dugiteGit.checkout(workspaceDir, "main", true);
         await fs.promises.writeFile(path.join(workspaceDir, "file.txt"), "remote content", "utf8");
         await dugiteGit.add(workspaceDir, "file.txt");
         const remoteOid = await dugiteGit.commit(workspaceDir, "Add file remotely", { name: "Remote", email: "remote@example.com" });
 
-        gitWriteRef(workspaceDir, "refs/remotes/origin/main", remoteOid);
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", remoteOid);
 
         // Reset main branch to local commit
-        gitWriteRef(workspaceDir, "refs/heads/main", localOid);
-        gitCheckout(workspaceDir, "main", true);
+        await dugiteGit.updateRef(workspaceDir, "refs/heads/main", localOid);
+        await dugiteGit.checkout(workspaceDir, "main", true);
 
         const originalFetchOrigin = dugiteGit.fetchOrigin;
         (dugiteGit as any).fetchOrigin = async () => {};

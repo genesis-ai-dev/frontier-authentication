@@ -12,7 +12,7 @@ suite("E2E: Error Recovery", () => {
     let workspaceDir: string;
 
     suiteSetup(async () => {
-        dugiteGit.setGitBinaryPath("/usr", "/usr/libexec/git-core");
+        dugiteGit.useEmbeddedGitBinary();
         mockProvider = await registerMockAuthProvider();
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
         assert.ok(ext, "Extension not found");
