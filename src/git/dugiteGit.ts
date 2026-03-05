@@ -964,7 +964,7 @@ export type StatusMatrixEntry = [string, 0 | 1 | 2, 0 | 1 | 2, 0 | 1 | 2];
  */
 export async function statusMatrix(dir: string): Promise<StatusMatrixEntry[]> {
     const result = await gitExec(
-        ["status", "--porcelain=v2", "--untracked-files=all"],
+        ["--no-optional-locks", "status", "--porcelain=v2", "--untracked-files=all"],
         dir,
     );
     assertSuccess("status", result);
@@ -1048,9 +1048,17 @@ export async function statusMatrix(dir: string): Promise<StatusMatrixEntry[]> {
 
         if (line.startsWith("u")) {
             // Unmerged entry: u XY sub m1 m2 m3 mW h1 h2 h3 <path>
-            // 10 fixed space-separated fields (indices 0-9), path may contain spaces.
+            // 11 fixed space-separated fields (indices 0-10), path may contain spaces.
             const fields = line.split(" ");
+            if (fields.length < 11) {
+                console.warn(`[statusMatrix] Skipping malformed unmerged line: ${line}`);
+                continue;
+            }
             const filepath = fields.slice(10).join(" ");
+            if (!filepath) {
+                console.warn(`[statusMatrix] Skipping unmerged line with empty path: ${line}`);
+                continue;
+            }
             entries.set(filepath, [filepath, 1, 2, 2]);
             continue;
         }
@@ -1252,7 +1260,7 @@ export async function hasGitRepository(dir: string): Promise<boolean> {
  */
 export async function status(dir: string, filepath: string): Promise<string | undefined> {
     const result = await gitExec(
-        ["status", "--porcelain=v2", "--", filepath],
+        ["--no-optional-locks", "status", "--porcelain=v2", "--", filepath],
         dir,
     );
     assertSuccess("status", result);

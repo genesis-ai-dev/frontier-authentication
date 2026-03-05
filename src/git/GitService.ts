@@ -583,19 +583,14 @@ async function uploadBlobsToLFSBucket(
 
             // Upload with retry on transient/server errors
             await retryWithBackoff(async () => {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 min timeout
-
                 try {
-                    const resp = await fetch(upload.href, {
+                    const resp = await fetchWithTimeout(upload.href, {
                         method: "PUT",
                         headers: uploadHeaders,
                         body: Buffer.from(fileBytes),
-                        signal: controller.signal,
                         keepalive: false,
+                        timeoutMs: 600_000,
                     });
-
-                    clearTimeout(timeoutId);
 
                     if (!resp.ok) {
                         const errorText = await resp.text();
@@ -612,7 +607,6 @@ async function uploadBlobsToLFSBucket(
                     debugLog(`[LFS Patch] ${fileLabel(index)} uploaded successfully`);
                     onFileStatus?.({ index, size: fileSize, alreadyOnServer: false });
                 } catch (fetchError: any) {
-                    clearTimeout(timeoutId);
                     console.error(`[LFS Patch] Network error uploading ${fileLabel(index)}:`, fetchError);
                     console.error(`[LFS Patch] Error details:`, {
                         message: fetchError.message,
@@ -772,15 +766,12 @@ export async function downloadLFSObject(
         ...(download.header ?? {}),
     };
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 minute timeout
-    const fileResp = await fetch(download.href, {
+    const fileResp = await fetchWithTimeout(download.href, {
         method: "GET",
         headers: dlHeaders,
-        signal: controller.signal,
         keepalive: false,
+        timeoutMs: 600_000,
     });
-    clearTimeout(timeoutId);
 
     if (!fileResp.ok) {
         const errorText = await fileResp.text();
@@ -1396,15 +1387,12 @@ export class GitService {
 
                         try {
                             const dlHeaders: Record<string, string> = { ...(action.header ?? {}) };
-                            const controller = new AbortController();
-                            const timeoutId = setTimeout(() => controller.abort(), 10 * 60 * 1000);
-                            const fileResp = await fetch(action.href, {
+                            const fileResp = await fetchWithTimeout(action.href, {
                                 method: "GET",
                                 headers: dlHeaders,
-                                signal: controller.signal,
                                 keepalive: false,
+                                timeoutMs: 600_000,
                             });
-                            clearTimeout(timeoutId);
                             if (!fileResp.ok) {
                                 const errorText = await fileResp.text();
                                 throw new Error(
