@@ -205,11 +205,11 @@ export class GitOperationError extends Error {
     public readonly operation: string;
 
     constructor(operation: string, result: IGitResult) {
-        const stderr = typeof result.stderr === "string" ? result.stderr : result.stderr.toString("utf8");
-        super(`git ${operation} failed (exit ${result.exitCode}): ${stderr.trim()}`);
+        const stderrStr = stderr(result);
+        super(`git ${operation} failed (exit ${result.exitCode}): ${stderrStr.trim()}`);
         this.name = "GitOperationError";
         this.exitCode = result.exitCode;
-        this.gitStderr = stderr;
+        this.gitStderr = stderrStr;
         this.operation = operation;
     }
 }
@@ -593,7 +593,7 @@ export async function fastForward(
     auth: { username: string; password: string },
 ): Promise<void> {
     const result = await gitExec(
-        ["merge", "--ff-only", `origin/${branch}`],
+        [...CREDENTIAL_OVERRIDE_FLAGS, "merge", "--ff-only", `origin/${branch}`],
         dir,
         { env: authEnv(auth) },
     );
@@ -629,7 +629,7 @@ export async function clone(
     onProgress?: ProgressCallback,
 ): Promise<void> {
     const envOverrides = auth ? authEnv(auth) : {};
-    const credFlags = auth ? CREDENTIAL_OVERRIDE_FLAGS : [];
+    const credFlags = CREDENTIAL_OVERRIDE_FLAGS;
     const progressCallback = onProgress
         ? (cp: import("child_process").ChildProcess) => {
             cp.stderr?.on("data", (data: Buffer) => {
