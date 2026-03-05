@@ -883,12 +883,18 @@ export class GitService {
         let description: string;
         if (event.phase && friendly) {
             const pct = total > 0 ? Math.round((current / total) * 100) : 0;
-            const sizePart = this.extractTransferSize(event.transferInfo);
-            const details = [
-                total > 0 ? `${pct}%` : undefined,
-                sizePart,
-            ].filter(Boolean).join(" — ");
-            description = details ? `${friendly} (${details})` : friendly;
+            // When all objects have been sent, the server is still processing;
+            // show a distinct message so the UI doesn't appear stuck at 100%.
+            if (pct >= 100 && phase === "pushing") {
+                description = "Finishing upload...";
+            } else {
+                const sizePart = this.extractTransferSize(event.transferInfo);
+                const details = [
+                    total > 0 ? `${pct}%` : undefined,
+                    sizePart,
+                ].filter(Boolean).join(" — ");
+                description = details ? `${friendly} (${details})` : friendly;
+            }
         } else if (event.phase) {
             description = total > 0 ? `${event.phase}: ${current}/${total}` : event.phase;
         } else if (total > 0) {
