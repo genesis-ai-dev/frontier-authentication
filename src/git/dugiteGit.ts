@@ -185,6 +185,12 @@ const LFS_OVERRIDE_FLAGS = [
  *                          for fetch (selective ref advertisement, server-
  *                          side filtering).  Supported since Git 2.18;
  *                          we ship 2.47.
+ * safe.directory          — Git 2.35.2+ rejects operations in directories
+ *                          owned by a different user ("dubious ownership").
+ *                          On shared systems, network drives, or when
+ *                          projects live on external storage, this causes
+ *                          unexpected failures for non-developer users.
+ *                          Setting to "*" disables the ownership check.
  */
 const PLATFORM_SAFETY_FLAGS = [
     "-c", "core.longpaths=true",
@@ -198,6 +204,7 @@ const PLATFORM_SAFETY_FLAGS = [
     "-c", "gc.auto=0",
     "-c", "pack.windowMemory=256m",
     "-c", "protocol.version=2",
+    "-c", "safe.directory=*",
 ];
 
 /**
@@ -1103,9 +1110,12 @@ export async function log(
     dir: string,
     options?: { depth?: number; ref?: string },
 ): Promise<LogEntry[]> {
+    // Use NUL (%x00) as the record separator — git commit messages cannot
+    // contain NUL bytes, so this delimiter is collision-proof unlike text
+    // sentinels like "---END---" which could appear in subject lines.
     const args = [
         "log",
-        "--format=%H%n%an%n%ae%n%at%n%s%n---END---",
+        "--format=%H%n%an%n%ae%n%at%n%s%x00",
     ];
     if (options?.depth) {
         args.push(`-${options.depth}`);
@@ -1120,7 +1130,7 @@ export async function log(
     }
 
     const entries: LogEntry[] = [];
-    const blocks = stdout(result).split("---END---\n");
+    const blocks = stdout(result).split("\0");
 
     for (const block of blocks) {
         const lines = block.trim().split("\n");

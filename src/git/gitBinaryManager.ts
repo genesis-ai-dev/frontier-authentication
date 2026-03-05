@@ -364,26 +364,37 @@ async function extractTarball(tarballPath: string, destDir: string): Promise<voi
     });
 }
 
-/** Recursively make binaries executable on Unix. */
+/**
+ * Make binaries executable on Unix (macOS / Linux).
+ *
+ * Walks each known binary directory, including subdirectories (e.g.
+ * libexec/git-core/mergetools/), so that helper scripts and credential
+ * helpers that dugite-native ships are also covered.  Without +x these
+ * would silently fail when git invokes them.
+ */
 async function makeExecutable(dir: string): Promise<void> {
     const binDirs = ["bin", "libexec/git-core"];
-    for (const binDir of binDirs) {
-        const fullPath = path.join(dir, binDir);
+
+    const chmodDir = async (dirPath: string): Promise<void> => {
+        let entries: fs.Dirent[];
         try {
-            const entries = await fs.promises.readdir(fullPath, { withFileTypes: true });
-            for (const entry of entries) {
-                if (entry.isFile()) {
-                    const filePath = path.join(fullPath, entry.name);
-                    await fs.promises.chmod(filePath, 0o755).catch(() => { });
-                }
-            }
+            entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
         } catch {
-            // Directory may not exist
+            return;
         }
+        for (const entry of entries) {
+            const fullPath = path.join(dirPath, entry.name);
+            if (entry.isFile() || entry.isSymbolicLink()) {
+                await fs.promises.chmod(fullPath, 0o755).catch(() => { });
+            } else if (entry.isDirectory()) {
+                await chmodDir(fullPath);
+            }
+        }
+    };
+
+    for (const binDir of binDirs) {
+        await chmodDir(path.join(dir, binDir));
     }
-    // Also make git-lfs executable
-    const lfsPath = path.join(dir, "bin", "git-lfs");
-    await fs.promises.chmod(lfsPath, 0o755).catch(() => { });
 }
 
 /** Format bytes as human-readable. */
