@@ -130,6 +130,32 @@ const LFS_OVERRIDE_FLAGS = [
 ];
 
 /**
+ * Platform-safety flags applied to every git invocation to normalize
+ * behavior across Windows, macOS, and Linux — regardless of what the
+ * user's ~/.gitconfig or the repo's .git/config may contain.
+ *
+ * core.longpaths   — Windows: enables paths >260 chars via \\?\ prefix.
+ *                    Without this, deeply nested projects or OneDrive
+ *                    synced folders silently fail on Windows.
+ * core.autocrlf    — Prevents git from converting LF↔CRLF on
+ *                    checkout/commit.  Translation files must be stored
+ *                    byte-for-byte as authored; any CRLF injection
+ *                    corrupts notebook content and diffs.
+ * core.fsmonitor   — Disables filesystem monitor integration (watchman,
+ *                    macOS FSEvents via built-in fsmonitor--daemon).
+ *                    These can hang or delay operations when Spotlight
+ *                    or Windows Search are indexing the working tree.
+ * core.pager       — Disables the pager so git never waits for user
+ *                    input when output exceeds a screenful (e.g. log).
+ */
+const PLATFORM_SAFETY_FLAGS = [
+    "-c", "core.longpaths=true",
+    "-c", "core.autocrlf=false",
+    "-c", "core.fsmonitor=false",
+    "-c", "core.pager=",
+];
+
+/**
  * HTTP timeout flags so that native git fails quickly with a descriptive error
  * rather than hanging until the JS-level withTimeout fires.
  * lowSpeedLimit: abort if transfer speed drops below 1 byte/s
@@ -142,23 +168,34 @@ const HTTP_TIMEOUT_FLAGS = [
 
 /**
  * Baseline env vars applied to every git invocation to ensure fully
- * non-interactive operation — no terminal prompts, no GUI dialogs.
+ * non-interactive operation — no terminal prompts, no GUI dialogs,
+ * and no interference from system-level git configuration.
+ *
+ * GIT_CONFIG_NOSYSTEM skips /etc/gitconfig (Linux/macOS) and
+ * C:\ProgramData\Git\config (Windows) which may be left over from
+ * a separate Git for Windows / Homebrew git installation and can
+ * inject credential helpers, editors, pagers, or fsmonitor hooks.
+ * User-level config (~/.gitconfig) is still read — proxy settings
+ * and other legitimate user preferences are preserved.  Network
+ * proxies also work via the standard HTTP_PROXY / HTTPS_PROXY env
+ * vars which git honors regardless of config files.
  */
 const NON_INTERACTIVE_ENV: Record<string, string> = {
     GIT_TERMINAL_PROMPT: "0",
     SSH_ASKPASS: "",
+    GIT_CONFIG_NOSYSTEM: "1",
 };
 
 /**
  * Low-level exec wrapper that injects the binary path env vars into every call
- * and disables git-lfs filters via one-shot `-c` flags.
+ * and applies LFS overrides + platform safety flags via one-shot `-c` flags.
  */
 async function gitExec(
     args: string[],
     dir: string,
     options?: IGitExecutionOptions,
 ): Promise<IGitResult> {
-    return exec([...LFS_OVERRIDE_FLAGS, ...args], dir, {
+    return exec([...LFS_OVERRIDE_FLAGS, ...PLATFORM_SAFETY_FLAGS, ...args], dir, {
         ...options,
         env: { ...NON_INTERACTIVE_ENV, ...gitEnvOverrides, ...options?.env },
     });
@@ -811,8 +848,9 @@ export async function statusMatrix(dir: string): Promise<StatusMatrixEntry[]> {
 
         if (line.startsWith("u")) {
             // Unmerged entry: u XY sub m1 m2 m3 mW h1 h2 h3 <path>
+            // 10 fixed space-separated fields (indices 0-9), path may contain spaces.
             const fields = line.split(" ");
-            const filepath = fields[fields.length - 1];
+            const filepath = fields.slice(10).join(" ");
             entries.set(filepath, [filepath, 1, 2, 2]);
             continue;
         }
