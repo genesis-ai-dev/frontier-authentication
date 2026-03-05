@@ -134,25 +134,39 @@ const LFS_OVERRIDE_FLAGS = [
  * behavior across Windows, macOS, and Linux — regardless of what the
  * user's ~/.gitconfig or the repo's .git/config may contain.
  *
- * core.longpaths   — Windows: enables paths >260 chars via \\?\ prefix.
- *                    Without this, deeply nested projects or OneDrive
- *                    synced folders silently fail on Windows.
- * core.autocrlf    — Prevents git from converting LF↔CRLF on
- *                    checkout/commit.  Translation files must be stored
- *                    byte-for-byte as authored; any CRLF injection
- *                    corrupts notebook content and diffs.
- * core.fsmonitor   — Disables filesystem monitor integration (watchman,
- *                    macOS FSEvents via built-in fsmonitor--daemon).
- *                    These can hang or delay operations when Spotlight
- *                    or Windows Search are indexing the working tree.
- * core.pager       — Disables the pager so git never waits for user
- *                    input when output exceeds a screenful (e.g. log).
+ * core.longpaths        — Windows: enables paths >260 chars via \\?\
+ *                         prefix.  Without this, deeply nested projects
+ *                         or OneDrive-synced folders silently fail.
+ * core.autocrlf         — Prevents git from converting LF↔CRLF on
+ *                         checkout/commit.  Translation files must be
+ *                         stored byte-for-byte as authored.
+ * core.fsmonitor        — Disables filesystem monitor integration
+ *                         (watchman, fsmonitor--daemon).  These can
+ *                         hang when Spotlight or Windows Search are
+ *                         indexing the working tree.
+ * core.pager            — Disables the pager so git never waits for
+ *                         user input (e.g. log output).
+ * core.quotePath        — When true (the default), git quotes non-ASCII
+ *                         characters in paths with octal escapes.  Since
+ *                         this is a translation tool with filenames in
+ *                         many scripts, we need raw UTF-8 paths for
+ *                         correct parsing in status/ls-files output.
+ * core.precomposeUnicode — macOS HFS+/APFS uses NFD (decomposed)
+ *                         Unicode.  This flag normalizes to NFC so git
+ *                         paths match what Node.js and the rest of our
+ *                         code expect.  No-op on other platforms.
+ * gc.auto               — Disables automatic garbage collection, which
+ *                         can lock the repo for 30+ seconds mid-operation
+ *                         and make the app appear frozen.
  */
 const PLATFORM_SAFETY_FLAGS = [
     "-c", "core.longpaths=true",
     "-c", "core.autocrlf=false",
     "-c", "core.fsmonitor=false",
     "-c", "core.pager=",
+    "-c", "core.quotePath=false",
+    "-c", "core.precomposeUnicode=true",
+    "-c", "gc.auto=0",
 ];
 
 /**
@@ -187,18 +201,67 @@ const NON_INTERACTIVE_ENV: Record<string, string> = {
 };
 
 /**
+ * If a git operation fails because of a stale index.lock, try to remove it
+ * and retry once.  Lock files are left behind when git (or the extension)
+ * crashes mid-operation.  Non-developer users have no idea how to recover
+ * from this, so we handle it transparently.
+ *
+ * Only removes the lock if it is older than STALE_LOCK_THRESHOLD_MS to
+ * avoid racing with a legitimately running git process.
+ */
+const STALE_LOCK_THRESHOLD_MS = 5 * 60 * 1000;
+
+async function removeStaleIndexLock(dir: string): Promise<boolean> {
+    const lockPath = path.join(dir, ".git", "index.lock");
+    try {
+        const stat = await fs.promises.stat(lockPath);
+        const ageMs = Date.now() - stat.mtimeMs;
+        if (ageMs > STALE_LOCK_THRESHOLD_MS) {
+            await fs.promises.unlink(lockPath);
+            console.warn(
+                `[dugiteGit] Removed stale index.lock (${Math.round(ageMs / 1000)}s old) at ${lockPath}`,
+            );
+            return true;
+        }
+        console.warn(
+            `[dugiteGit] index.lock exists but is only ${Math.round(ageMs / 1000)}s old — not removing (may be held by another operation)`,
+        );
+    } catch {
+        // Lock file doesn't exist or can't be accessed — nothing to do
+    }
+    return false;
+}
+
+/**
  * Low-level exec wrapper that injects the binary path env vars into every call
  * and applies LFS overrides + platform safety flags via one-shot `-c` flags.
+ *
+ * Automatically recovers from stale index.lock files by removing them and
+ * retrying the operation once.
  */
 async function gitExec(
     args: string[],
     dir: string,
     options?: IGitExecutionOptions,
 ): Promise<IGitResult> {
-    return exec([...LFS_OVERRIDE_FLAGS, ...PLATFORM_SAFETY_FLAGS, ...args], dir, {
+    const flags = [...LFS_OVERRIDE_FLAGS, ...PLATFORM_SAFETY_FLAGS];
+    const execOptions: IGitExecutionOptions = {
         ...options,
         env: { ...NON_INTERACTIVE_ENV, ...gitEnvOverrides, ...options?.env },
-    });
+    };
+
+    let result = await exec([...flags, ...args], dir, execOptions);
+
+    if (result.exitCode !== 0) {
+        const errStr = typeof result.stderr === "string"
+            ? result.stderr
+            : result.stderr.toString("utf8");
+        if (errStr.includes("index.lock") && await removeStaleIndexLock(dir)) {
+            result = await exec([...flags, ...args], dir, execOptions);
+        }
+    }
+
+    return result;
 }
 
 /** Git exec helper that merges auth env vars for remote operations. */
