@@ -38,17 +38,18 @@ export function setGitBinaryPath(localGitDir: string, execPath: string): void {
         GIT_EXEC_PATH: execPath,
     };
 
-    if (process.platform === "linux") {
-        const sslCaBundle = path.join(localGitDir, "ssl", "cacert.pem");
-        try {
-            fs.accessSync(sslCaBundle, fs.constants.R_OK);
-            gitEnvOverrides.GIT_SSL_CAINFO = sslCaBundle;
-            console.log(`[dugiteGit] Linux SSL CA bundle: ${sslCaBundle}`);
-        } catch {
-            console.warn(
-                `[dugiteGit] SSL CA bundle not found at ${sslCaBundle} — HTTPS operations may fail on Linux`,
-            );
-        }
+    // When LOCAL_GIT_DIRECTORY is provided, dugite does not set GIT_SSL_CAINFO.
+    // The dugite-native archive ships ssl/cacert.pem for platforms where the
+    // bundled git uses OpenSSL.  If present, point to it so HTTPS works.
+    // On platforms using a native SSL backend (schannel / SecureTransport)
+    // the file may be absent — the native backend uses the OS cert store.
+    const sslCaBundle = path.join(localGitDir, "ssl", "cacert.pem");
+    try {
+        fs.accessSync(sslCaBundle, fs.constants.R_OK);
+        gitEnvOverrides.GIT_SSL_CAINFO = sslCaBundle;
+        console.log(`[dugiteGit] SSL CA bundle: ${sslCaBundle}`);
+    } catch {
+        // Not present — platform likely uses a native SSL backend
     }
 }
 
@@ -191,6 +192,11 @@ const LFS_OVERRIDE_FLAGS = [
  *                          projects live on external storage, this causes
  *                          unexpected failures for non-developer users.
  *                          Setting to "*" disables the ownership check.
+ * user.useConfigOnly      — Prevents git from guessing user.name and
+ *                          user.email from the hostname/username.  All
+ *                          commits must supply author info explicitly
+ *                          (via GIT_AUTHOR_NAME env vars or -c flags),
+ *                          which we already do.
  */
 const PLATFORM_SAFETY_FLAGS = [
     "-c", "core.longpaths=true",
@@ -205,6 +211,7 @@ const PLATFORM_SAFETY_FLAGS = [
     "-c", "pack.windowMemory=256m",
     "-c", "protocol.version=2",
     "-c", "safe.directory=*",
+    "-c", "user.useConfigOnly=true",
 ];
 
 /**
@@ -213,15 +220,18 @@ const PLATFORM_SAFETY_FLAGS = [
  * http.lowSpeedLimit + lowSpeedTime — abort if transfer speed drops below
  *     1 byte/s for 60 consecutive seconds, producing a descriptive error
  *     rather than hanging until the JS-level withTimeout fires.
- * http.postBuffer — increase the initial POST buffer from the 1 MB default
- *     to ~150 MB.  With many text files or large initial pushes, the default
- *     is too small and causes "RPC failed; HTTP 413" or silent hangs while
- *     git re-packs mid-transfer.
+ * http.postBuffer — raise the POST buffer ceiling from the 1 MB default
+ *     to 75 MB.  Git only allocates what the packfile actually needs, up
+ *     to this limit; if it exceeds the limit, git falls back to chunked
+ *     transfer encoding (which some proxies reject with HTTP 413).  75 MB
+ *     is generous for text-heavy translation projects — binary media goes
+ *     through LFS, not git's HTTP transport — while staying well within
+ *     reach of memory-constrained devices.
  */
 const HTTP_TIMEOUT_FLAGS = [
     "-c", "http.lowSpeedLimit=1",
     "-c", "http.lowSpeedTime=60",
-    "-c", "http.postBuffer=157286400",
+    "-c", "http.postBuffer=78643200",
 ];
 
 /**
@@ -264,8 +274,13 @@ const KNOWN_LOCK_FILES = [
     "shallow.lock",
     "config.lock",
     "HEAD.lock",
+    "FETCH_HEAD.lock",
+    "MERGE_HEAD.lock",
+    "packed-refs.lock",
     "refs/heads/main.lock",
     "refs/heads/master.lock",
+    "refs/remotes/origin/main.lock",
+    "refs/remotes/origin/master.lock",
 ];
 
 /**
@@ -807,6 +822,53 @@ export async function push(
     assertSuccess("push", result);
 }
 
+/**
+ * Detect the remote's default branch after a fetch.
+ * Tries (in order): symbolic ref from the remote HEAD, common names
+ * (main, master), then falls back to the first available remote branch.
+ */
+async function detectDefaultBranch(dir: string): Promise<string | undefined> {
+    // 1. symbolic-ref (set by fetch when the server advertises HEAD)
+    const symRef = await gitExec(
+        ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        dir,
+    );
+    if (symRef.exitCode === 0) {
+        const branch = stdout(symRef).trim().replace("origin/", "");
+        if (branch) {
+            return branch;
+        }
+    }
+
+    // 2. Common default branch names
+    for (const candidate of ["main", "master"]) {
+        const check = await gitExec(
+            ["rev-parse", "--verify", `origin/${candidate}`],
+            dir,
+        );
+        if (check.exitCode === 0) {
+            return candidate;
+        }
+    }
+
+    // 3. First available remote branch (handles repos with non-standard defaults)
+    const refs = await gitExec(
+        ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/"],
+        dir,
+    );
+    if (refs.exitCode === 0) {
+        const branches = stdout(refs)
+            .split("\n")
+            .filter((b) => b && !b.endsWith("/HEAD"))
+            .map((b) => b.replace("origin/", ""));
+        if (branches.length > 0) {
+            return branches[0];
+        }
+    }
+
+    return undefined;
+}
+
 /** Clone a repository. */
 export async function clone(
     url: string,
@@ -849,21 +911,17 @@ export async function clone(
         );
         assertSuccess("fetch", fetchResult);
 
-        for (const branch of ["main", "master"]) {
-            try {
-                const checkoutResult = await gitExec(
-                    ["checkout", "-B", branch, `origin/${branch}`],
+        const defaultBranch = await detectDefaultBranch(dir);
+        if (defaultBranch) {
+            const checkoutResult = await gitExec(
+                ["checkout", "-B", defaultBranch, `origin/${defaultBranch}`],
+                dir,
+            );
+            if (checkoutResult.exitCode === 0) {
+                await gitExec(
+                    ["branch", "--set-upstream-to", `origin/${defaultBranch}`, defaultBranch],
                     dir,
                 );
-                if (checkoutResult.exitCode === 0) {
-                    await gitExec(
-                        ["branch", "--set-upstream-to", `origin/${branch}`, branch],
-                        dir,
-                    );
-                    return;
-                }
-            } catch {
-                // Branch doesn't exist on remote, try next
             }
         }
     } else {
@@ -994,11 +1052,12 @@ export async function statusMatrix(dir: string): Promise<StatusMatrixEntry[]> {
         }
     }
 
-    // Also include tracked, unmodified files for full matrix
-    // (isomorphic-git's statusMatrix returns all tracked files)
-    const lsResult = await gitExec(["ls-files", "--cached"], dir);
+    // Also include tracked, unmodified files for full matrix.
+    // Use -z for NUL-delimited output so filenames containing newlines
+    // (valid on Unix, though unlikely for translation projects) parse correctly.
+    const lsResult = await gitExec(["ls-files", "--cached", "-z"], dir);
     if (lsResult.exitCode === 0) {
-        for (const filepath of stdout(lsResult).split("\n")) {
+        for (const filepath of stdout(lsResult).split("\0")) {
             if (filepath && !entries.has(filepath)) {
                 // Tracked, unmodified: HEAD=1, WORKDIR=1, STAGE=1
                 entries.set(filepath, [filepath, 1, 1, 1]);

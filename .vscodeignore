@@ -1,13 +1,17 @@
-.vscode/**
-.vscode-test/**
-out/**
-node_modules/**
-src/**
-.gitignore
-.yarnrc
-webpack.config.js
-vsc-extension-quickstart.md
-**/tsconfig.json
-**/.eslintrc.json
-**/*.map
-**/*.ts
+# Ignore everything, then whitelist only what the VSIX needs.
+# This prevents stray files (docs, scripts, configs) from leaking
+# into the published extension package.
+*
+*/**
+
+# Webpack output (extension.js + askpass helper)
+!dist/**
+
+# Extension manifest and metadata
+!package.json
+!README.md
+!LICENSE
+!CHANGELOG.md
+
+# Exclude source maps from dist/ (nosources-source-map)
+dist/**/*.map

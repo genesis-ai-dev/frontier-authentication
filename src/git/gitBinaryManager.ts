@@ -13,7 +13,14 @@ import * as vscode from "vscode";
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs";
+import * as crypto from "crypto";
 import * as tar from "tar";
+import { Readable } from "stream";
+import { pipeline } from "stream/promises";
+import { execFile as execFileCb } from "child_process";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFileCb);
 
 // ---------------------------------------------------------------------------
 // Configuration — pin to a specific dugite-native release
@@ -126,19 +133,27 @@ export async function ensureGitBinary(
                         progress.report({ message: "Finding platform binary..." });
                     }
 
-                    const asset = await findPlatformAsset();
+                    const { asset, expectedSha256 } = await findPlatformAsset();
 
                     const prefix = attempt > 1 ? `Retry ${attempt}/${MAX_FULL_RETRIES} — ` : "";
 
                     progress.report({ message: `${prefix}Downloading ${formatBytes(asset.size)}...` });
 
                     const tarballPath = path.join(storageDir, "git-download.tar.gz");
-                    await downloadFile(asset.browser_download_url, tarballPath, (pct) => {
+                    const actualSha256 = await downloadFile(asset.browser_download_url, tarballPath, (pct) => {
                         progress.report({
                             message: `${prefix}Downloading... ${pct}%`,
                             increment: pct > 0 ? 1 : 0,
                         });
                     });
+
+                    if (expectedSha256 && actualSha256 !== expectedSha256) {
+                        throw new Error(
+                            `SHA-256 integrity check failed for ${asset.name}. ` +
+                            `Expected: ${expectedSha256.substring(0, 16)}..., ` +
+                            `got: ${actualSha256.substring(0, 16)}...`,
+                        );
+                    }
 
                     progress.report({ message: `${prefix}Extracting...` });
                     await extractTarball(tarballPath, gitRootDir);
@@ -154,6 +169,8 @@ export async function ensureGitBinary(
                     if (!(await isValidInstallation(gitRootDir))) {
                         throw new Error("Git binary verification failed after extraction");
                     }
+
+                    await verifyGitRuns(gitRootDir);
 
                     console.log("[GitBinaryManager] Git binary installed at:", gitRootDir);
                     return; // Success
@@ -221,8 +238,34 @@ async function isValidInstallation(gitRootDir: string): Promise<boolean> {
     }
 }
 
+interface PlatformAssetInfo {
+    asset: GitHubAsset;
+    expectedSha256?: string;
+}
+
+/**
+ * Verify the git binary actually executes by running `git --version`.
+ * Catches architecture mismatches (e.g. x64 binary on ARM without Rosetta),
+ * corrupted binaries that passed the file-existence check, or missing
+ * shared libraries.
+ */
+async function verifyGitRuns(gitRootDir: string): Promise<void> {
+    const gitBin = process.platform === "win32"
+        ? path.join(gitRootDir, "cmd", "git.exe")
+        : path.join(gitRootDir, "bin", "git");
+
+    try {
+        const { stdout } = await execFileAsync(gitBin, ["--version"], { timeout: 10_000 });
+        console.log(`[GitBinaryManager] Verified: ${stdout.trim()}`);
+    } catch (err) {
+        throw new Error(
+            `Git binary exists but failed to execute: ${err instanceof Error ? err.message : String(err)}`,
+        );
+    }
+}
+
 /** Find the tar.gz asset for the current platform from the GitHub release (with retries). */
-async function findPlatformAsset(): Promise<GitHubAsset> {
+async function findPlatformAsset(): Promise<PlatformAssetInfo> {
     const platformKey = `${os.platform()}-${os.arch()}`;
     const targetSuffix = PLATFORM_MAP[platformKey];
 
@@ -265,7 +308,28 @@ async function findPlatformAsset(): Promise<GitHubAsset> {
                 );
             }
 
-            return asset;
+            // Try to fetch the companion .sha256 checksum (best-effort)
+            let expectedSha256: string | undefined;
+            const sha256Asset = release.assets.find((a) => a.name === `${asset.name}.sha256`);
+            if (sha256Asset) {
+                try {
+                    const sha256Resp = await fetch(sha256Asset.browser_download_url, {
+                        headers: { "User-Agent": "frontier-authentication-vscode" },
+                        redirect: "follow",
+                    });
+                    if (sha256Resp.ok) {
+                        const text = await sha256Resp.text();
+                        const hash = text.trim().split(/\s+/)[0];
+                        if (/^[a-f0-9]{64}$/i.test(hash)) {
+                            expectedSha256 = hash.toLowerCase();
+                        }
+                    }
+                } catch {
+                    // SHA-256 file unavailable — proceed without verification
+                }
+            }
+
+            return { asset, expectedSha256 };
         } catch (error) {
             lastError = error instanceof Error ? error : new Error(String(error));
             if (attempt < maxRetries) {
@@ -282,12 +346,21 @@ async function findPlatformAsset(): Promise<GitHubAsset> {
     throw lastError ?? new Error("Failed to find platform asset after retries");
 }
 
-/** Download a file from a URL to a local path with progress reporting. */
+/**
+ * Download a file from a URL to a local path with progress reporting.
+ * Returns the SHA-256 hex digest of the downloaded content for integrity
+ * verification against the published .sha256 companion file.
+ *
+ * Uses stream.pipeline for proper backpressure handling — the previous
+ * implementation ignored WriteStream.write() return values, which could
+ * buffer unbounded data in memory on slow disks or network-backed storage
+ * (OneDrive, Dropbox redirecting globalStorageUri).
+ */
 async function downloadFile(
     url: string,
     destPath: string,
     onProgress?: (percent: number) => void,
-): Promise<void> {
+): Promise<string> {
     const maxRetries = 3;
     let lastError: Error | undefined;
 
@@ -307,38 +380,42 @@ async function downloadFile(
             }
 
             const contentLength = parseInt(response.headers.get("content-length") || "0", 10);
-            const fileStream = fs.createWriteStream(destPath);
-            const reader = response.body.getReader();
-
+            const hash = crypto.createHash("sha256");
             let downloaded = 0;
             let lastReportedPct = -1;
 
-            await reader
-                .read()
-                .then(function process({ done, value }): Promise<void> | undefined {
-                    if (done) {
-                        fileStream.end();
-                        return;
-                    }
-                    fileStream.write(value);
-                    downloaded += value.length;
-                    if (contentLength > 0 && onProgress) {
-                        const pct = Math.round((downloaded / contentLength) * 100);
-                        if (pct !== lastReportedPct) {
-                            lastReportedPct = pct;
-                            onProgress(pct);
+            async function* readChunks(): AsyncGenerator<Uint8Array> {
+                const reader = response.body!.getReader();
+                try {
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done || !value) {
+                            break;
                         }
+
+                        hash.update(value);
+                        downloaded += value.length;
+
+                        if (contentLength > 0 && onProgress) {
+                            const pct = Math.round((downloaded / contentLength) * 100);
+                            if (pct !== lastReportedPct) {
+                                lastReportedPct = pct;
+                                onProgress(pct);
+                            }
+                        }
+
+                        yield value;
                     }
-                    return reader.read().then(process);
-                });
+                } finally {
+                    reader.releaseLock();
+                }
+            }
 
-            // Wait for the file to finish writing
-            await new Promise<void>((resolve, reject) => {
-                fileStream.on("finish", resolve);
-                fileStream.on("error", reject);
-            });
+            const readable = Readable.from(readChunks());
+            const fileStream = fs.createWriteStream(destPath);
+            await pipeline(readable, fileStream);
 
-            return; // Success
+            return hash.digest("hex");
         } catch (error) {
             lastError = error instanceof Error ? error : new Error(String(error));
             if (attempt < maxRetries) {
