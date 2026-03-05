@@ -23,12 +23,33 @@ let askpassScriptPath: string | undefined;
  * Point dugite at the runtime-downloaded git binary.
  * Called once during extension activation after gitBinaryManager has ensured
  * the binary exists.
+ *
+ * On Linux, dugite skips setting GIT_SSL_CAINFO when LOCAL_GIT_DIRECTORY is
+ * provided (it only sets it for the embedded git case).  The dugite-native
+ * archive ships ssl/cacert.pem on Linux, so we point to it explicitly —
+ * without it, every HTTPS git operation would fail with a certificate error.
+ *
+ * macOS uses the system's Secure Transport for SSL (no CA bundle needed).
+ * Windows uses schannel via the system certificate store.
  */
 export function setGitBinaryPath(localGitDir: string, execPath: string): void {
     gitEnvOverrides = {
         LOCAL_GIT_DIRECTORY: localGitDir,
         GIT_EXEC_PATH: execPath,
     };
+
+    if (process.platform === "linux") {
+        const sslCaBundle = path.join(localGitDir, "ssl", "cacert.pem");
+        try {
+            fs.accessSync(sslCaBundle, fs.constants.R_OK);
+            gitEnvOverrides.GIT_SSL_CAINFO = sslCaBundle;
+            console.log(`[dugiteGit] Linux SSL CA bundle: ${sslCaBundle}`);
+        } catch {
+            console.warn(
+                `[dugiteGit] SSL CA bundle not found at ${sslCaBundle} — HTTPS operations may fail on Linux`,
+            );
+        }
+    }
 }
 
 /**
