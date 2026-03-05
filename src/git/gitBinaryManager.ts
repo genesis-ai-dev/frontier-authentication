@@ -13,9 +13,6 @@ import * as vscode from "vscode";
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs";
-import * as crypto from "crypto";
-import { pipeline } from "stream/promises";
-import { createGunzip } from "zlib";
 import * as tar from "tar";
 
 // ---------------------------------------------------------------------------
@@ -315,26 +312,6 @@ async function downloadFile(
 
             let downloaded = 0;
             let lastReportedPct = -1;
-
-            const writeStream = new WritableStream({
-                write(chunk) {
-                    fileStream.write(chunk);
-                    downloaded += chunk.length;
-                    if (contentLength > 0 && onProgress) {
-                        const pct = Math.round((downloaded / contentLength) * 100);
-                        if (pct !== lastReportedPct) {
-                            lastReportedPct = pct;
-                            onProgress(pct);
-                        }
-                    }
-                },
-                close() {
-                    fileStream.end();
-                },
-                abort(err) {
-                    fileStream.destroy(err instanceof Error ? err : new Error(String(err)));
-                },
-            });
 
             await reader
                 .read()

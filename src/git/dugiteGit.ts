@@ -56,18 +56,26 @@ export function setGitBinaryPath(localGitDir: string, execPath: string): void {
  * Set the path to the askpass helper script used for credential injection.
  * Creates a shell wrapper to ensure the script is invocable regardless of
  * file permissions (VSIX extraction doesn't preserve +x).
+ *
+ * Uses process.execPath (absolute path to the running Node binary) rather
+ * than bare "node" so the wrapper works even when Node isn't on PATH
+ * (e.g. NVM-managed installs on macOS, restricted PATH on Linux, or
+ * non-developer Windows machines).
+ *
+ * On Windows the .cmd wrapper may briefly flash a console window when git
+ * invokes it. This is a known limitation of cmd.exe-based wrappers;
+ * the flash is sub-second and the window receives no focus.
  */
 export function setAskpassPath(scriptPath: string): void {
     askpassScriptPath = scriptPath;
 
-    // GIT_ASKPASS requires an executable; the JS file may lack +x after VSIX install.
-    // Create a platform-appropriate wrapper that invokes the script with node.
     const wrapperDir = path.dirname(scriptPath);
+    const nodeBin = process.execPath;
 
     if (process.platform === "win32") {
         const wrapperPath = path.join(wrapperDir, "askpass-wrapper.cmd");
         try {
-            const wrapperContent = `@echo off\r\nnode "${scriptPath}" %*\r\n`;
+            const wrapperContent = `@echo off\r\n"${nodeBin}" "${scriptPath}" %*\r\n`;
             fs.writeFileSync(wrapperPath, wrapperContent);
             askpassScriptPath = wrapperPath;
             console.log(`[dugiteGit] Askpass wrapper created: ${wrapperPath} (win32)`);
@@ -77,7 +85,7 @@ export function setAskpassPath(scriptPath: string): void {
     } else {
         const wrapperPath = path.join(wrapperDir, "askpass-wrapper.sh");
         try {
-            const wrapperContent = `#!/bin/sh\nexec node "${scriptPath}" "$@"\n`;
+            const wrapperContent = `#!/bin/sh\nexec "${nodeBin}" "${scriptPath}" "$@"\n`;
             fs.writeFileSync(wrapperPath, wrapperContent, { mode: 0o755 });
             askpassScriptPath = wrapperPath;
             console.log(`[dugiteGit] Askpass wrapper created: ${wrapperPath} (${process.platform})`);
@@ -133,6 +141,15 @@ const HTTP_TIMEOUT_FLAGS = [
 ];
 
 /**
+ * Baseline env vars applied to every git invocation to ensure fully
+ * non-interactive operation — no terminal prompts, no GUI dialogs.
+ */
+const NON_INTERACTIVE_ENV: Record<string, string> = {
+    GIT_TERMINAL_PROMPT: "0",
+    SSH_ASKPASS: "",
+};
+
+/**
  * Low-level exec wrapper that injects the binary path env vars into every call
  * and disables git-lfs filters via one-shot `-c` flags.
  */
@@ -143,7 +160,7 @@ async function gitExec(
 ): Promise<IGitResult> {
     return exec([...LFS_OVERRIDE_FLAGS, ...args], dir, {
         ...options,
-        env: { ...gitEnvOverrides, ...options?.env },
+        env: { ...NON_INTERACTIVE_ENV, ...gitEnvOverrides, ...options?.env },
     });
 }
 
@@ -158,17 +175,24 @@ function authEnv(auth: { username: string; password: string }): Record<string, s
         GIT_ASKPASS: askpassScriptPath,
         FRONTIER_GIT_USERNAME: auth.username,
         FRONTIER_GIT_PASSWORD: auth.password,
-        GIT_TERMINAL_PROMPT: "0",
+        GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
     };
 }
 
 /**
- * Git config flags that disable all credential helpers so that only GIT_ASKPASS
- * is used for authentication.  Without this, bundled credential managers
- * (like GCM on Windows) may show interactive GUI prompts.
+ * Git config flags that disable all credential helpers and system askpass
+ * programs so that only our GIT_ASKPASS env var is used for authentication.
+ * Without these, bundled credential managers (like GCM on Windows or
+ * osxkeychain on macOS) may show interactive GUI prompts, or a user's
+ * core.askPass config may return stale/wrong credentials.
+ *
+ * Note: credential.helper is a multi-valued git config key. Setting it to
+ * empty via `-c` replaces *all* configured values (system, global, local),
+ * which is exactly the behavior we need — a single override clears the list.
  */
 const CREDENTIAL_OVERRIDE_FLAGS = [
     "-c", "credential.helper=",
+    "-c", "core.askPass=",
 ];
 
 // ---------------------------------------------------------------------------
@@ -738,13 +762,13 @@ export async function statusMatrix(dir: string): Promise<StatusMatrixEntry[]> {
             const fields = parts[0].split(" ");
             const xy = fields[1]; // Two-char status: X=index, Y=workdir
 
-            // For type 2 (rename/copy), path is after the tab
-            // For type 1, path is fields 8+ joined (may contain spaces)
+            // Type 1: 8 fixed fields (0-7), then <path>
+            // Type 2: 9 fixed fields (0-8, where 8 is X<score>), then <path>\t<origPath>
+            // In both cases we want the *current* (new) path, not the original.
             let filepath: string;
             if (line.startsWith("2")) {
-                filepath = parts[1];
+                filepath = fields.slice(9).join(" ");
             } else {
-                // Type 1 has 8 fixed fields (indices 0-7), path is everything from field 8 onward
                 filepath = fields.slice(8).join(" ");
             }
 
