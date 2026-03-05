@@ -1702,7 +1702,14 @@ export class GitService {
                             remoteUrl,
                             retryFetchCtrl,
                         );
-                        await dugiteGit.fastForward(dir, currentBranch, auth);
+                        const ffCtrl = new AbortController();
+                        await this.withTimeout(
+                            dugiteGit.fastForward(dir, currentBranch, auth, ffCtrl.signal),
+                            2 * 60 * 1000,
+                            "Push-retry fast-forward",
+                            remoteUrl,
+                            ffCtrl,
+                        );
                         continue;
                     } catch (ffErr) {
                         this.debugLog("[GitService] Fast-forward during push retry failed — giving up:", {
@@ -3199,14 +3206,21 @@ export class GitService {
                     const dirUri = vscode.Uri.file(dir);
                     await vscode.workspace.fs.createDirectory(dirUri);
 
-                    await dugiteGit.clone(url, dir, auth ?? undefined, (phase, loaded, total) => {
-                        if (phase === "receiving objects") {
-                            progress.report({
-                                message: `${phase}: ${loaded}/${total} objects`,
-                                increment: ((loaded ?? 0) / (total || 1)) * 100,
-                            });
-                        }
-                    });
+                    const cloneCtrl = new AbortController();
+                    await this.withTimeout(
+                        dugiteGit.clone(url, dir, auth ?? undefined, (phase, loaded, total) => {
+                            if (phase === "receiving objects") {
+                                progress.report({
+                                    message: `${phase}: ${loaded}/${total} objects`,
+                                    increment: ((loaded ?? 0) / (total || 1)) * 100,
+                                });
+                            }
+                        }, cloneCtrl.signal),
+                        15 * 60 * 1000,
+                        "Clone",
+                        url,
+                        cloneCtrl,
+                    );
                 } catch (error) {
                     console.error("Clone error:", error);
                     throw new Error(

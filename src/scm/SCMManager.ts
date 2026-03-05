@@ -644,6 +644,23 @@ export class SCMManager {
                 return { hasConflicts: false };
             }
 
+            // If device was offline, report it instead of showing success
+            if (syncResult.offline) {
+                clearInterval(animationInterval);
+                if (this.syncStatusBarItem) {
+                    this.syncStatusBarItem.text = `$(cloud-offline) Sync skipped (offline)`;
+                    this.syncStatusBarItem.show();
+                    setTimeout(() => {
+                        this.syncStatusBarItem?.hide();
+                    }, 4000);
+                }
+                this.syncEventEmitter.fire({
+                    status: "skipped",
+                    message: "Sync skipped: device is offline",
+                });
+                return { hasConflicts: false };
+            }
+
             // If we have conflicts, return them to client
             if (syncResult.hadConflicts && syncResult.conflicts) {
                 return {
@@ -900,6 +917,13 @@ export class SCMManager {
                 this.syncEventEmitter.fire({ status: "error", message: "Publish failed: sync lock was held by another operation" });
                 throw new Error(
                     "Publish failed: another sync operation was in progress. Please try again."
+                );
+            }
+
+            if (syncResult.offline) {
+                this.syncEventEmitter.fire({ status: "error", message: "Publish failed: device is offline" });
+                throw new Error(
+                    "Publish failed: you appear to be offline. Please check your internet connection and try again."
                 );
             }
 
