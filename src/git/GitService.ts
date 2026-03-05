@@ -210,8 +210,11 @@ function isValidLFSInfoResponseData(val: unknown): val is LFSBatchResponse {
         debugLog("[LFS Patch] Response validation passed");
         return true;
     } catch (error) {
-        console.error("[LFS Patch] Error validating response:", error);
-        return false;
+        // Re-throw rather than returning false — callers must distinguish
+        // "structurally invalid response" (false) from "validation code itself crashed".
+        throw new Error(
+            `LFS response validation error: ${error instanceof Error ? error.message : String(error)}`
+        );
     }
 }
 /**
@@ -1002,6 +1005,8 @@ export class GitService {
                     string,
                     { filesAbs: string; filepath: string; size: number; }[]
                 >();
+                const readFailures: string[] = [];
+                const conversionFailures: string[] = [];
 
                 for (let i = 0; i < totalFiles; i++) {
                     const [filepath] = pointerPaths[i];
@@ -1017,7 +1022,8 @@ export class GitService {
                             contentLength: content.length,
                         });
                     } catch (error) {
-                        this.debugLog("[GitService] Failed to read file", { filepath, error });
+                        console.warn("[GitService] Failed to read pointer file", { filepath, error });
+                        readFailures.push(filepath);
                         continue;
                     }
 
@@ -1084,10 +1090,7 @@ export class GitService {
                                 `[GitService] Failed to convert blob in pointers dir for ${filepath}:`,
                                 e
                             );
-                            this.debugLog("[GitService] Failed to convert blob to pointer", {
-                                filepath,
-                                error: e,
-                            });
+                            conversionFailures.push(filepath);
                         }
                         continue;
                     }
@@ -1110,6 +1113,28 @@ export class GitService {
                         targets.push({ filesAbs, filepath, size: pointer.size });
                         oidToTargets.set(pointer.oid, targets);
                     }
+                }
+
+                // Surface any analysis-phase failures
+                if (readFailures.length > 0 || conversionFailures.length > 0) {
+                    const parts: string[] = [];
+                    if (readFailures.length > 0) {
+                        parts.push(
+                            `${readFailures.length} pointer file(s) could not be read: ${readFailures.slice(0, 5).join(", ")}` +
+                            (readFailures.length > 5 ? ` (+${readFailures.length - 5} more)` : "")
+                        );
+                    }
+                    if (conversionFailures.length > 0) {
+                        parts.push(
+                            `${conversionFailures.length} blob-to-pointer conversion(s) failed: ${conversionFailures.slice(0, 5).join(", ")}` +
+                            (conversionFailures.length > 5 ? ` (+${conversionFailures.length - 5} more)` : "")
+                        );
+                    }
+                    console.warn(`[GitService] reconcilePointersFilesystem analysis issues: ${parts.join("; ")}`);
+                    vscode.window.showWarningMessage(
+                        `Some media files could not be processed: ${parts.join("; ")}. ` +
+                        `These files may be unavailable. Try syncing again.`
+                    );
                 }
 
                 const oidsToDownload = enableDownloads ? Array.from(oidToTargets.keys()) : [];
@@ -1263,7 +1288,12 @@ export class GitService {
                             }
                         }
                     } catch (e) {
-                        console.warn("[GitService] Retry batch after healing failed:", e);
+                        const detail = e instanceof Error ? e.message : String(e);
+                        console.error(
+                            `[GitService] Retry LFS batch request after healing failed: ${detail}. ` +
+                            `${missingOids.length} OID(s) will remain unavailable for download.`,
+                            e
+                        );
                     }
                 }
 
@@ -1283,6 +1313,8 @@ export class GitService {
 
                 // Phase 3: concurrent downloads with progress and connection reuse by origin
                 let completed = 0;
+                let downloadFailureCount = 0;
+                const downloadFailedOids: string[] = [];
                 const concurrency = vscode.workspace
                     .getConfiguration("frontier")
                     .get<number>("lfsDownloadConcurrency", 12);
@@ -1348,7 +1380,14 @@ export class GitService {
                                 targetCount: (oidToTargets.get(oid) ?? []).length,
                             });
                         } catch (e) {
-                            this.debugLog(`[GitService] Failed downloading oid ${oid}:`, e);
+                            console.warn(`[GitService] Failed downloading oid ${oid}:`, e);
+                            downloadFailureCount++;
+                            if (downloadFailedOids.length < 10) {
+                                const targets = oidToTargets.get(oid) ?? [];
+                                downloadFailedOids.push(
+                                    ...targets.map((t) => t.filepath)
+                                );
+                            }
                         } finally {
                             completed += 1;
                             const progressMessage =
@@ -1365,7 +1404,18 @@ export class GitService {
                 const workers = Array.from({ length: Math.max(1, concurrency) }, () => runWorker());
                 await Promise.all(workers);
 
-                progress.report({ message: "📎 File download complete" });
+                if (downloadFailureCount > 0) {
+                    const fileList = downloadFailedOids.slice(0, 5).join(", ");
+                    const msg =
+                        `${downloadFailureCount} media file(s) could not be downloaded: ${fileList}` +
+                        (downloadFailedOids.length > 5 ? ` (+${downloadFailedOids.length - 5} more)` : "") +
+                        `. Try syncing again to retry.`;
+                    console.warn(`[GitService] ${msg}`);
+                    vscode.window.showWarningMessage(msg);
+                    progress.report({ message: `📎 Download complete with ${downloadFailureCount} failure(s)` });
+                } else {
+                    progress.report({ message: "📎 File download complete" });
+                }
                 this.debugLog("[GitService] Completed reconcilePointersFilesystem");
             }
         );
@@ -2797,6 +2847,7 @@ export class GitService {
             let processedBytes = 0;
             let skippedBytes = 0;
             let skippedCount = 0;
+            const skippedLfsFiles: string[] = [];
 
             for (let i = 0; i < rawBytesFiles.length; i += LFS_UPLOAD_BATCH_SIZE) {
                 const batch = rawBytesFiles.slice(i, i + LFS_UPLOAD_BATCH_SIZE);
@@ -2858,9 +2909,11 @@ export class GitService {
                         : undefined;
 
                     if (!matchedInfo) {
-                        this.debugLog(
-                            `[GitService] Upload skipped or no pointer for ${filepath} (empty/corrupted)`
+                        console.warn(
+                            `[GitService] LFS upload skipped for "${filepath}" — file may be empty or corrupted. ` +
+                            `It will NOT be included in this commit.`
                         );
+                        skippedLfsFiles.push(filepath);
                         continue;
                     }
 
@@ -2891,6 +2944,14 @@ export class GitService {
             if (skippedCount > 0) {
                 this.debugLog(
                     `[GitService] ${skippedCount} LFS file(s) already on server (${GitService.formatBytes(skippedBytes)} skipped)`
+                );
+            }
+
+            if (skippedLfsFiles.length > 0) {
+                throw new Error(
+                    `${skippedLfsFiles.length} LFS file(s) could not be uploaded (empty or corrupted) ` +
+                    `and were excluded from the commit: ${skippedLfsFiles.join(", ")}. ` +
+                    `Check these files and try again.`
                 );
             }
         }
@@ -3092,53 +3153,40 @@ export class GitService {
         );
 
         // Handle media files (LFS) based on strategy
-        try {
-            if (auth) {
-                const strategy = mediaStrategy || "auto-download"; // Default to auto-download for backward compatibility
+        if (auth) {
+            const strategy = mediaStrategy || "auto-download";
 
-                switch (strategy) {
-                    case "auto-download":
-                        // Start LFS reconciliation in background so opening the project isn't blocked
-                        this.reconcilePointersFilesystem(dir, auth).catch((e: unknown) => {
-                            console.warn("[GitService] Background media download failed:", e);
-                        });
-                        break;
-
-                    case "stream-and-save":
-                        // Stream media files and download in background
-                        // CRITICAL: Populate files folder with pointers for consistency
-                        this.debugLog(
-                            "[GitService] Media strategy set to stream-and-save - populating files folder with pointers"
+            switch (strategy) {
+                case "auto-download":
+                    // Background — don't block project open, but notify on failure
+                    this.reconcilePointersFilesystem(dir, auth).catch((e: unknown) => {
+                        const detail = e instanceof Error ? e.message : String(e);
+                        console.error("[GitService] Background media download failed:", e);
+                        vscode.window.showWarningMessage(
+                            `Media download failed: ${detail}. Some media files may be unavailable. Try syncing again.`
                         );
-                        await this.populateFilesWithPointers(dir).catch((e) => {
-                            console.warn(
-                                "[GitService] Failed to populate files folder with pointers:",
-                                e
-                            );
-                        });
-                        break;
+                    });
+                    break;
 
-                    case "stream-only":
-                        // Don't download media files - they will be streamed on demand
-                        // CRITICAL: Populate files folder with pointers for consistency
-                        this.debugLog(
-                            "[GitService] Media strategy set to stream-only - populating files folder with pointers"
-                        );
-                        await this.populateFilesWithPointers(dir).catch((e) => {
-                            console.warn(
-                                "[GitService] Failed to populate files folder with pointers:",
-                                e
-                            );
-                        });
-                        break;
+                case "stream-and-save":
+                    // Populate is CRITICAL for consistency — let errors propagate
+                    this.debugLog(
+                        "[GitService] Media strategy set to stream-and-save - populating files folder with pointers"
+                    );
+                    await this.populateFilesWithPointers(dir);
+                    break;
 
-                    default:
-                        // Fallback to auto-download for unknown strategies
-                        await this.reconcilePointersFilesystem(dir, auth);
-                }
+                case "stream-only":
+                    // Populate is CRITICAL for consistency — let errors propagate
+                    this.debugLog(
+                        "[GitService] Media strategy set to stream-only - populating files folder with pointers"
+                    );
+                    await this.populateFilesWithPointers(dir);
+                    break;
+
+                default:
+                    await this.reconcilePointersFilesystem(dir, auth);
             }
-        } catch (e) {
-            console.warn("[GitService] Media files download after clone failed:", e);
         }
     }
 
@@ -3166,6 +3214,7 @@ export class GitService {
 
             // Copy each pointer file to files directory
             let copiedCount = 0;
+            const copyFailures: string[] = [];
             for (const pointerFilePath of pointerFiles) {
                 try {
                     // Get relative path from pointers directory
@@ -3182,16 +3231,24 @@ export class GitService {
                     await fs.promises.copyFile(pointerFilePath, targetPath);
                     copiedCount++;
                 } catch (error) {
-                    this.debugLog(
-                        `[populateFilesWithPointers] Failed to copy ${pointerFilePath}:`,
-                        error
-                    );
+                    const rel = path.relative(pointersDir, pointerFilePath);
+                    console.error(`[populateFilesWithPointers] Failed to copy ${rel}:`, error);
+                    copyFailures.push(rel);
                 }
             }
 
             this.debugLog(
                 `[populateFilesWithPointers] Copied ${copiedCount} pointer files to files folder`
             );
+
+            if (copyFailures.length > 0) {
+                throw new Error(
+                    `populateFilesWithPointers: ${copyFailures.length} of ${pointerFiles.length} ` +
+                    `pointer file(s) could not be copied to the files directory. ` +
+                    `Media references will be broken for: ${copyFailures.slice(0, 10).join(", ")}` +
+                    (copyFailures.length > 10 ? ` (and ${copyFailures.length - 10} more)` : "")
+                );
+            }
         } catch (error) {
             console.error("[populateFilesWithPointers] Error:", error);
             throw error;
