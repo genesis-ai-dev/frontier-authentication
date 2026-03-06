@@ -791,6 +791,15 @@ export class SCMManager {
         visibility?: "private" | "internal" | "public";
         groupId?: string;
     }): Promise<void> {
+        // Guard against concurrent sync operations for the entire publish flow.
+        // publishWorkspace calls gitService.syncChanges() directly (bypassing
+        // SCMManager.syncChanges()), so without this guard a scheduled auto-sync
+        // can slip through _syncChangesInner, pass the early lock check, start a
+        // slow fetchOrigin, and then collide with publish's lock acquisition —
+        // producing a spurious "Sync skipped" warning to the user.
+        this.isSyncInProgress = true;
+        this.syncEventEmitter.fire({ status: "started", message: "Publishing workspace..." });
+
         try {
             console.log("Starting workspace publish with options:", options);
 
@@ -900,7 +909,7 @@ export class SCMManager {
             };
 
             console.log("Running full sync as part of publish...");
-            this.syncEventEmitter.fire({ status: "started", message: "Publishing: syncing changes" });
+            this.syncEventEmitter.fire({ status: "progress", message: "Publishing: syncing changes" });
 
             const syncResult = await this.gitService.syncChanges(workspacePath, auth, author, {
                 commitMessage: "Initial commit",
@@ -979,6 +988,8 @@ export class SCMManager {
                 throw new Error(`Failed to publish workspace: ${errorMessage}`);
             }
             throw error;
+        } finally {
+            this.isSyncInProgress = false;
         }
     }
 
