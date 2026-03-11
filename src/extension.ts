@@ -214,8 +214,8 @@ export async function activate(context: vscode.ExtensionContext) {
         } catch (error) {
             console.error("[Frontier] Failed to initialize git binary:", error);
             const choice = await vscode.window.showErrorMessage(
-                "Failed to download the sync runtime. You can still work offline, but syncing " +
-                "will be unavailable until the runtime is installed. You can retry from Sync Settings.",
+                "Sync setup couldn't be completed. You can still work offline, but syncing " +
+                "won't be available until setup finishes. You can retry from Sync Settings.",
                 "Retry Now",
                 "Continue Offline",
             );
@@ -456,7 +456,7 @@ export async function activate(context: vscode.ExtensionContext) {
             const remoteUrl = await gitService.getRemoteUrl(projectPath);
             if (!remoteUrl) {
                 throw new Error(
-                    "No remote URL found for project. This project may not be connected to a remote repository."
+                    "This project doesn't have a corresponding project on the server. It may not be set up for syncing."
                 );
             }
 
@@ -507,10 +507,10 @@ export async function activate(context: vscode.ExtensionContext) {
 
                 if (errorMsg.includes("404") || errorMsg.includes("not found")) {
                     throw new Error(
-                        `Media file not found on server (OID: ${oid.substring(0, 8)}...)`
+                        `Media file not found on the server.`
                     );
                 } else if (errorMsg.includes("401") || errorMsg.includes("403")) {
-                    throw new Error("Authentication failed. Please log in again.");
+                    throw new Error("Access denied. Please log in again.");
                 } else if (errorMsg.includes("timeout") || errorMsg.includes("ETIMEDOUT")) {
                     throw new Error("Download timed out. Please check your internet connection.");
                 } else {

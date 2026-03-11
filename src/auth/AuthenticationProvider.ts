@@ -385,7 +385,7 @@ export class FrontierAuthProvider implements vscode.AuthenticationProvider, vsco
     async createSession(scopes: readonly string[]): Promise<vscode.AuthenticationSession> {
         // This would be where you implement your login flow
         // For now, we'll just throw as this should be handled by your webview
-        throw new Error("Please use the login button in the Frontier sidebar to authenticate");
+        throw new Error("Please use the login button in the Frontier sidebar to sign in");
     }
 
     async removeSession(sessionId: string): Promise<void> {
@@ -454,7 +454,7 @@ export class FrontierAuthProvider implements vscode.AuthenticationProvider, vsco
             this._onDidChangeAuthentication.fire();
         } catch (error) {
             console.error("Failed to store authentication token:", error);
-            throw new Error("Failed to save authentication state");
+            throw new Error("Failed to save login session");
         }
     }
 
@@ -984,7 +984,7 @@ export class FrontierAuthProvider implements vscode.AuthenticationProvider, vsco
             });
         } catch (error) {
             console.error("Failed to store authentication tokens:", error);
-            throw new Error("Failed to save authentication state");
+            throw new Error("Failed to save login session");
         }
     }
 }

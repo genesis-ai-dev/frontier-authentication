@@ -129,7 +129,7 @@ async function doEnsureGitBinary(
     await vscode.window.withProgress(
         {
             location: vscode.ProgressLocation.Notification,
-            title: "Downloading Git runtime...",
+            title: "Downloading sync runtime...",
             cancellable: false,
         },
         async (progress) => {
@@ -143,22 +143,22 @@ async function doEnsureGitBinary(
 
                     if (attempt > 1) {
                         progress.report({
-                            message: `Retry ${attempt}/${MAX_FULL_RETRIES} — Finding platform binary...`,
+                            message: `Retry ${attempt}/${MAX_FULL_RETRIES} — Preparing to download sync runtime...`,
                         });
                     } else {
-                        progress.report({ message: "Finding platform binary..." });
+                        progress.report({ message: "Preparing to download sync runtime..." });
                     }
 
                     const { asset, expectedSha256 } = await findPlatformAsset();
 
                     const prefix = attempt > 1 ? `Retry ${attempt}/${MAX_FULL_RETRIES} — ` : "";
 
-                    progress.report({ message: `${prefix}Downloading ${formatBytes(asset.size)}...` });
+                    progress.report({ message: `${prefix}Downloading sync runtime (${formatBytes(asset.size)})...` });
 
                     const tarballPath = path.join(storageDir, "git-download.tar.gz");
                     const actualSha256 = await downloadFile(asset.browser_download_url, tarballPath, (pct) => {
                         progress.report({
-                            message: `${prefix}Downloading... ${pct}%`,
+                            message: `${prefix}Downloading sync runtime... ${pct}%`,
                             increment: pct > 0 ? 1 : 0,
                         });
                     });
@@ -171,7 +171,7 @@ async function doEnsureGitBinary(
                         );
                     }
 
-                    progress.report({ message: `${prefix}Extracting...` });
+                    progress.report({ message: `${prefix}Installing sync runtime...` });
                     await extractTarball(tarballPath, gitRootDir);
 
                     await fs.promises.unlink(tarballPath).catch(() => { });
@@ -180,7 +180,7 @@ async function doEnsureGitBinary(
                         await makeExecutable(gitRootDir);
                     }
 
-                    progress.report({ message: `${prefix}Verifying...` });
+                    progress.report({ message: `${prefix}Verifying sync runtime...` });
 
                     if (!(await isValidInstallation(gitRootDir))) {
                         throw new Error("Git binary verification failed after extraction");

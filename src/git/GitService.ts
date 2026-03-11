@@ -1176,8 +1176,7 @@ export class GitService {
                     }
                     console.warn(`[GitService] reconcilePointersFilesystem analysis issues: ${parts.join("; ")}`);
                     vscode.window.showWarningMessage(
-                        `Some media files could not be processed: ${parts.join("; ")}. ` +
-                        `These files may be unavailable. Try syncing again.`
+                        `Some media files could not be processed and may be unavailable. Try syncing again.`
                     );
                 }
 
@@ -1351,7 +1350,7 @@ export class GitService {
                     const sampleText =
                         sampleTargets.length > 0 ? ` e.g. ${sampleTargets.join(", ")}` : "";
                     vscode.window.showWarningMessage(
-                        `Some LFS objects are missing on the server and could not be healed automatically (${stillMissing.length} file(s))${sampleText}. Ask the original author to re-upload to heal pointers.`
+                        `${stillMissing.length} media file(s) are missing on the server and couldn't be recovered${sampleText}. The original author may need to re-upload them.`
                     );
                 }
 
@@ -1734,7 +1733,7 @@ export class GitService {
                     userFriendlyMessage =
                         "push failed: Authentication failed (try logging out and back in)";
                 } else if (errorMessage.includes("403") || errorMessage.includes("forbidden")) {
-                    userFriendlyMessage = "push failed: Access denied (check repository permissions)";
+                    userFriendlyMessage = "push failed: Access denied (check your project permissions)";
                 } else if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
                     userFriendlyMessage = "push failed: Connection timeout (server not responding)";
                 } else if (GitService.isNonFastForwardError(fullMsg)) {
@@ -1927,7 +1926,7 @@ export class GitService {
                         "fetch failed: Authentication failed (try logging out and back in)";
                 } else if (errorMessage.includes("403") || errorMessage.includes("forbidden")) {
                     userFriendlyMessage =
-                        "fetch failed: Access denied (check repository permissions)";
+                        "fetch failed: Access denied (check your project permissions)";
                 } else if (
                     errorMessage.includes("could not read Username") ||
                     errorMessage.includes("could not read Password") ||
@@ -3225,7 +3224,7 @@ export class GitService {
         await vscode.window.withProgress(
             {
                 location: vscode.ProgressLocation.Notification,
-                title: "Cloning repository...",
+                title: "Downloading project...",
                 cancellable: false,
             },
             async (progress) => {
@@ -3238,8 +3237,9 @@ export class GitService {
                     await this.withTimeout(
                         dugiteGit.clone(url, dir, auth ?? undefined, (phase, loaded, total) => {
                             if (phase === "receiving objects") {
+                                const percent = total ? Math.round(((loaded ?? 0) / total) * 100) : 0;
                                 progress.report({
-                                    message: `${phase}: ${loaded}/${total} objects`,
+                                    message: `${percent}% complete`,
                                     increment: ((loaded ?? 0) / (total || 1)) * 100,
                                 });
                             }
@@ -3252,7 +3252,7 @@ export class GitService {
                 } catch (error) {
                     console.error("Clone error:", error);
                     throw new Error(
-                        `Failed to clone repository: ${error instanceof Error ? error.message : "Unknown error"}`
+                        `Failed to download project: ${error instanceof Error ? error.message : "Unknown error"}`
                     );
                 }
             }
@@ -3269,7 +3269,7 @@ export class GitService {
                         const detail = e instanceof Error ? e.message : String(e);
                         console.error("[GitService] Background media download failed:", e);
                         vscode.window.showWarningMessage(
-                            `Media download failed: ${detail}. Some media files may be unavailable. Try syncing again.`
+                            `Some media files couldn't be downloaded. They may be unavailable until the next sync.`
                         );
                     });
                     break;
@@ -3404,7 +3404,7 @@ export class GitService {
         } catch (error) {
             console.error("Init error:", error);
             throw new Error(
-                `Failed to initialize repository: ${error instanceof Error ? error.message : "Unknown error"}`
+                `Failed to set up project: ${error instanceof Error ? error.message : "Unknown error"}`
             );
         }
     }
@@ -3573,7 +3573,7 @@ export class GitService {
                                 return;
                             }
                             vscode.window.showWarningMessage(
-                                `Missing LFS content for ${filepath}. Ask the original author to re-upload the file to heal the pointer.`
+                                `Media file "${path.basename(filepath)}" is missing. The original author may need to re-upload it.`
                             );
                             this.stateManager.incrementMetric("lfsHealFailed");
                         } catch (healErr) {
@@ -3582,7 +3582,7 @@ export class GitService {
                                 healErr
                             );
                             vscode.window.showWarningMessage(
-                                `Could not heal missing LFS object for ${filepath}. Please re-upload the original file.`
+                                `Couldn't recover media file "${path.basename(filepath)}". Please re-upload the original file.`
                             );
                             this.stateManager.incrementMetric("lfsHealFailed");
                         }
@@ -3594,7 +3594,7 @@ export class GitService {
         } catch (err) {
             console.warn(`[GitService] Failed to ensure LFS content for ${filepath}:`, err);
             vscode.window.showWarningMessage(
-                `LFS content for "${path.basename(filepath)}" could not be retrieved. The file may show as a pointer until next sync.`
+                `Media file "${path.basename(filepath)}" could not be loaded. It may become available after the next sync.`
             );
         }
     }
@@ -3671,7 +3671,7 @@ export class GitService {
             }
             if (!apiIsOnline) {
                 vscode.window.showWarningMessage(
-                    "The API is offline. Please try again later. Your local changes are saved, and will sync to the cloud when the API is back online."
+                    "The server is currently unavailable. Please try again later. Your local changes are saved and will sync when the connection is restored."
                 );
             }
             return userIsOnline && apiIsOnline;

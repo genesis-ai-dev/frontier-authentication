@@ -178,12 +178,11 @@ export class SCMManager {
                 await this.initializeSCM(workspacePath);
             }
 
-            const action = project.url.includes("already exists") ? "cloned" : "created and cloned";
-            vscode.window.showInformationMessage(`Project ${options.name} ${action} successfully!`);
+            vscode.window.showInformationMessage(`Project "${options.name}" is ready!`);
         } catch (error) {
             if (error instanceof Error) {
                 vscode.window.showErrorMessage(
-                    `Failed to create and clone project: ${error.message}`
+                    `Failed to set up project: ${error.message}`
                 );
             }
             throw error;
@@ -229,17 +228,17 @@ export class SCMManager {
                 await this.initializeSCM(workspacePath);
             }
 
-            vscode.window.showInformationMessage("Repository cloned successfully!");
+            vscode.window.showInformationMessage("Project downloaded successfully!");
         } catch (error) {
             if (error instanceof Error) {
-                vscode.window.showErrorMessage(`Failed to clone repository: ${error.message}`);
+                vscode.window.showErrorMessage(`Failed to download project: ${error.message}`);
             }
             throw error;
         }
     }
 
     private async promptForWorkspacePath(defaultName: string): Promise<string | undefined> {
-        vscode.window.showInformationMessage("Prompting for workspace path");
+        vscode.window.showInformationMessage("Choose where to save the project");
         // Use the default downloads directory or home directory
         const homeDir = process.env.HOME || process.env.USERPROFILE;
         const defaultUri = vscode.Uri.file(path.join(homeDir || "", defaultName));
@@ -305,7 +304,7 @@ export class SCMManager {
         } catch (error) {
             console.error("Clone error:", error);
             throw new Error(
-                `Failed to clone repository: ${
+                `Failed to download project: ${
                     error instanceof Error ? error.message : "Unknown error"
                 }`
             );
@@ -464,7 +463,7 @@ export class SCMManager {
         if (this.gitService.isSyncLocked()) {
             this.syncEventEmitter.fire({ status: "skipped", message: "Sync already in progress" });
             vscode.window.showInformationMessage(
-                "Sync already in progress. Please wait for the current synchronization to complete."
+                "Sync already in progress. Please wait for it to finish."
             );
             return { hasConflicts: false };
         }
@@ -495,7 +494,7 @@ export class SCMManager {
         try {
             const token = await this.gitLabService.getToken();
             if (!token) {
-                throw new Error("GitLab token not found. Please authenticate first.");
+                throw new Error("Not logged in. Please sign in first.");
             }
 
             const auth = {
@@ -634,7 +633,7 @@ export class SCMManager {
                     }, 4000);
                 }
                 vscode.window.showWarningMessage(
-                    "Sync skipped: another synchronization appears to be in progress. If this persists, ensure .git/frontier-sync.lock does not exist."
+                    "Sync skipped: another sync is already in progress. If this keeps happening, try restarting the app."
                 );
                 // Fire sync skipped event
                 this.syncEventEmitter.fire({
@@ -760,7 +759,7 @@ export class SCMManager {
             // Push changes
             const token = await this.gitLabService.getToken();
             if (!token) {
-                throw new Error("GitLab token not found. Please authenticate first.");
+                throw new Error("Not logged in. Please sign in first.");
             }
 
             const auth = {
@@ -770,10 +769,10 @@ export class SCMManager {
 
             await this.gitService.push(workspacePath, auth);
 
-            vscode.window.showInformationMessage("Changes committed and pushed successfully");
+            vscode.window.showInformationMessage("Changes uploaded successfully");
         } catch (error) {
             if (error instanceof Error) {
-                vscode.window.showErrorMessage(`Failed to commit changes: ${error.message}`);
+                vscode.window.showErrorMessage(`Failed to upload changes: ${error.message}`);
             }
         }
     }
@@ -974,7 +973,7 @@ export class SCMManager {
             this.syncEventEmitter.fire({ status: "completed", message: "Publish sync complete" });
 
             vscode.window.showInformationMessage(
-                `Workspace published successfully to ${project.url}`
+                `Project published successfully!`
             );
         } catch (error) {
             console.error("Error in publishWorkspace:", error);
@@ -984,8 +983,8 @@ export class SCMManager {
             });
             if (error instanceof Error) {
                 const errorMessage = error.message;
-                vscode.window.showErrorMessage(`Failed to publish workspace: ${errorMessage}`);
-                throw new Error(`Failed to publish workspace: ${errorMessage}`);
+                vscode.window.showErrorMessage(`Failed to publish project: ${errorMessage}`);
+                throw new Error(`Failed to publish workspace: ${errorMessage}`); // Keep technical for error propagation
             }
             throw error;
         } finally {

@@ -252,7 +252,7 @@ export function registerCommands(
         // Add debug logging toggle command
         vscode.commands.registerCommand("frontier.toggleDebugLogging", async () => {
             if (!gitService) {
-                vscode.window.showErrorMessage("Git service not available");
+                vscode.window.showErrorMessage("Sync service not available. Please restart and try again.");
                 return;
             }
 
@@ -264,7 +264,7 @@ export function registerCommands(
             gitService.setDebugLogging(newSetting);
 
             const status = newSetting ? "enabled" : "disabled";
-            vscode.window.showInformationMessage(`Debug logging ${status}`);
+            vscode.window.showInformationMessage(`Detailed logging ${status}.`);
 
             return newSetting;
         }),
@@ -274,11 +274,11 @@ export function registerCommands(
             try {
                 await authProvider.cleanupDuplicateSessions();
                 vscode.window.showInformationMessage(
-                    "Duplicate authentication sessions cleaned up"
+                    "Duplicate login sessions cleaned up."
                 );
             } catch (error) {
                 vscode.window.showErrorMessage(
-                    `Failed to cleanup sessions: ${error instanceof Error ? error.message : String(error)}`
+                    `Failed to clean up duplicate login sessions: ${error instanceof Error ? error.message : String(error)}`
                 );
             }
         }),
@@ -287,7 +287,7 @@ export function registerCommands(
         vscode.commands.registerCommand("frontier.refreshAuthSession", async () => {
             try {
                 if (!authProvider.isAuthenticated) {
-                    vscode.window.showWarningMessage("Not currently authenticated");
+                    vscode.window.showWarningMessage("You're not signed in. Please log in first.");
                     return;
                 }
 
@@ -297,14 +297,14 @@ export function registerCommands(
                     // This will recreate the session with the correct user info
                     await authProvider.setToken(token);
                     vscode.window.showInformationMessage(
-                        "Authentication session refreshed with correct username"
+                        "Your login session has been refreshed."
                     );
                 } else {
-                    vscode.window.showErrorMessage("Could not retrieve authentication token");
+                    vscode.window.showErrorMessage("Could not refresh your login. Please try signing in again.");
                 }
             } catch (error) {
                 vscode.window.showErrorMessage(
-                    `Failed to refresh session: ${error instanceof Error ? error.message : String(error)}`
+                    `Failed to refresh your login. Please try signing in again.`
                 );
             }
         }),
@@ -313,16 +313,16 @@ export function registerCommands(
         vscode.commands.registerCommand("frontier.refreshUserInfo", async () => {
             try {
                 if (!authProvider.isAuthenticated) {
-                    vscode.window.showWarningMessage("Not currently authenticated");
+                    vscode.window.showWarningMessage("You're not signed in. Please log in first.");
                     return;
                 }
 
                 // Force refresh user info cache
                 await authProvider.fetchAndCacheUserInfo();
-                vscode.window.showInformationMessage("User information cache refreshed");
+                vscode.window.showInformationMessage("Your account information has been updated.");
             } catch (error) {
                 vscode.window.showErrorMessage(
-                    `Failed to refresh user info: ${error instanceof Error ? error.message : String(error)}`
+                    `Couldn't update your account information. Please try again.`
                 );
             }
         }),
@@ -343,7 +343,7 @@ export function registerCommands(
                 config.get<string>("apiEndpoint") || "https://api.frontierrnd.com/api/v1";
 
             const input = await vscode.window.showInputBox({
-                prompt: "Enter Frontier API Endpoint",
+                prompt: "Enter the Frontier server address",
                 value: current,
                 ignoreFocusOut: true,
             });
@@ -357,7 +357,7 @@ export function registerCommands(
                 await config.update("apiEndpoint", input, target);
 
                 const selection = await vscode.window.showInformationMessage(
-                    `Frontier API Endpoint updated to: ${input}. Please reload the window for changes to take full effect.`,
+                    `Server address updated. Please reload the window for changes to take effect.`,
                     "Reload Window"
                 );
 
