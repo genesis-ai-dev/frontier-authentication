@@ -186,8 +186,16 @@ export async function activate(context: vscode.ExtensionContext) {
     }
 
     // Initialize git binary (downloads dugite-native if needed).
+    // In test mode (ExtensionMode.Test), skip the download entirely — tests
+    // call dugiteGit.useEmbeddedGitBinary() to use dugite's bundled binary,
+    // so downloading a separate copy is wasted time and network traffic.
     // Offers the user a manual retry when all automatic attempts are exhausted.
     let gitInitialized = false;
+    if (context.extensionMode === vscode.ExtensionMode.Test) {
+        console.log("[Frontier] Test mode detected — skipping git binary download (tests use embedded binary)");
+        dugiteGit.useEmbeddedGitBinary();
+        gitInitialized = true;
+    }
     while (!gitInitialized) {
         try {
             const gitPaths = await gitBinaryManager.ensureGitBinary(context);

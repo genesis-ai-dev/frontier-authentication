@@ -2640,9 +2640,26 @@ export class GitService {
             // remote tip. This guarantees that the resulting merge commit will be a
             // fast-forward of the remote (barring a race where someone pushes again
             // between this fetch and our push).
-            const localHead = await dugiteGit.resolveRef(dir, currentBranch);
+            let localHead: string;
+            let remoteHead: string;
+            try {
+                localHead = await dugiteGit.resolveRef(dir, currentBranch);
+            } catch (refErr) {
+                throw new Error(
+                    `Cannot resolve local branch '${currentBranch}': ${refErr instanceof Error ? refErr.message : String(refErr)}. ` +
+                    `The merge was not completed — no changes have been pushed.`
+                );
+            }
             const remoteRef = this.getRemoteRef(currentBranch);
-            const remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
+            try {
+                remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
+            } catch (refErr) {
+                throw new Error(
+                    `Cannot resolve remote ref '${remoteRef}': the remote branch may have been deleted. ` +
+                    `${refErr instanceof Error ? refErr.message : String(refErr)}. ` +
+                    `The merge was not completed — no changes have been pushed.`
+                );
+            }
             const commitMessage = `Merge branch 'origin/${currentBranch}'`;
             this.debugLog(`Creating merge commit with message: ${commitMessage}`);
 
@@ -3907,6 +3924,19 @@ export class GitService {
         filepath: string,
         authFromCaller?: { username: string; password: string; }
     ): Promise<boolean> {
+        // Verify file exists before attempting to stage it.
+        // A missing file here usually means the resolver failed to write it or
+        // it was removed between conflict resolution and staging (TOCTOU).
+        const absolutePathToPointerFill = path.join(dir, filepath);
+        try {
+            await fs.promises.access(absolutePathToPointerFill);
+        } catch {
+            throw new Error(
+                `Cannot stage ${filepath}: file does not exist on disk. ` +
+                `It may have been removed between conflict resolution and staging.`
+            );
+        }
+
         // If not LFS-tracked, do normal add
         if (!(await this.isLfsTracked(dir, filepath))) {
             this.debugLog(`[GitService] ${filepath} is not LFS-tracked; adding as normal`);
@@ -3915,7 +3945,6 @@ export class GitService {
         }
         this.debugLog(`[GitService] ${filepath} is LFS-tracked; adding as LFS`);
         // Read original bytes
-        const absolutePathToPointerFill = path.join(dir, filepath);
         let buf = await fs.promises.readFile(absolutePathToPointerFill);
 
         // Resolve remote URL
