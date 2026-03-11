@@ -135,7 +135,7 @@
         }
     },
     "scripts": {
-        "vscode:prepublish": "pnpm run package",
+        "vscode:prepublish": "npm run test && pnpm run package",
         "clean": "node -e \"const fs=require('fs');['out','dist'].forEach(d=>{try{fs.rmSync(d,{recursive:true,force:true})}catch{}})\"",
         "compile": "webpack",
         "watch": "webpack --watch",
