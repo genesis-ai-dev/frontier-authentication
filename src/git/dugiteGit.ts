@@ -611,9 +611,11 @@ export async function addAll(dir: string): Promise<void> {
     assertSuccess("add -A", result);
 }
 
-/** Remove a file from the index (unstage / mark for deletion). */
+/** Remove a file from the index (unstage / mark for deletion).
+ *  Uses --ignore-unmatch so removing a file that isn't in the index is a no-op
+ *  rather than a fatal error (e.g. orphaned files that only exist on the remote). */
 export async function remove(dir: string, filepath: string): Promise<void> {
-    const result = await gitExec(["rm", "--cached", "--", filepath], dir);
+    const result = await gitExec(["rm", "--cached", "--ignore-unmatch", "--", filepath], dir);
     assertSuccess("rm --cached", result);
 }
 
@@ -642,7 +644,7 @@ export async function removeMany(
 
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
             try {
-                const result = await gitExec(["rm", "--cached", "--", ...batch], dir);
+                const result = await gitExec(["rm", "--cached", "--ignore-unmatch", "--", ...batch], dir);
                 assertSuccess("rm --cached (batch)", result);
                 lastError = undefined;
                 break;
@@ -983,8 +985,13 @@ export async function statusMatrix(dir: string): Promise<StatusMatrixEntry[]> {
         if (line.startsWith("?")) {
             // Untracked: ? <path>
             const filepath = line.substring(2);
-            // HEAD=0 (absent), WORKDIR=2 (present), STAGE=0 (not staged)
-            entries.set(filepath, [filepath, 0, 2, 0]);
+            // After `git rm --cached`, a file appears as both a staged
+            // deletion (type 1 with X=D) and untracked (?). The tracked
+            // entry carries the correct HEAD/STAGE info — don't overwrite it.
+            if (!entries.has(filepath)) {
+                // HEAD=0 (absent), WORKDIR=2 (present), STAGE=0 (not staged)
+                entries.set(filepath, [filepath, 0, 2, 0]);
+            }
             continue;
         }
 

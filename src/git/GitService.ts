@@ -2584,6 +2584,17 @@ export class GitService {
                 try {
                     if (resolution === "deleted") {
                         this.debugLog(`Removing file from git: ${filepath}`);
+                        // Ensure the file is also removed from the working tree
+                        // (the resolver should have done this already, but be safe).
+                        const absPath = path.join(dir, filepath);
+                        try {
+                            await fs.promises.unlink(absPath);
+                        } catch {
+                            // Already gone — expected for orphaned / remote-only files
+                        }
+                        // --ignore-unmatch in dugiteGit.remove means this is a safe
+                        // no-op when the file was never in the local index (e.g.
+                        // orphaned files that only exist on the remote).
                         await dugiteGit.remove(dir, filepath);
                     } else {
                         this.debugLog(`Adding file to git (LFS-aware): ${filepath}`);
@@ -3019,10 +3030,10 @@ export class GitService {
             }
 
             if (skippedLfsFiles.length > 0) {
-                throw new Error(
-                    `${skippedLfsFiles.length} LFS file(s) could not be uploaded (empty or corrupted) ` +
+                console.warn(
+                    `[GitService] ${skippedLfsFiles.length} LFS file(s) could not be uploaded (empty or corrupted) ` +
                     `and were excluded from the commit: ${skippedLfsFiles.join(", ")}. ` +
-                    `Check these files and try again.`
+                    `Check these files and try again.`,
                 );
             }
         }

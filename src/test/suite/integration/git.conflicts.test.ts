@@ -312,4 +312,78 @@ suite("Integration: GitService Merge Conflicts", () => {
 
     // TODO: Fix assertion failure - test expects conflict detection but hadConflicts is false
     // (commented-out test left as-is — references old isomorphic-git API)
+
+    test("completeMerge handles deleted resolution for files not in the index (orphaned files)", async () => {
+        // Setup: Create base commit without the orphaned files
+        await fs.promises.writeFile(path.join(workspaceDir, "README.md"), "readme", "utf8");
+        await dugiteGit.add(workspaceDir, "README.md");
+        const baseOid = await dugiteGit.commit(workspaceDir, "Base commit", {
+            name: "Test",
+            email: "test@example.com",
+        });
+
+        // Add remote and create a remote commit that adds orphaned files
+        await dugiteGit.addRemote(workspaceDir, "origin", "https://example.com/repo.git");
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", baseOid);
+
+        // Create a remote branch with the orphaned files
+        await dugiteGit.updateRef(workspaceDir, "refs/heads/main", baseOid);
+        await dugiteGit.checkout(workspaceDir, "main", true);
+
+        await fs.promises.mkdir(path.join(workspaceDir, "files"), { recursive: true });
+        await fs.promises.writeFile(
+            path.join(workspaceDir, "chat-threads.json"),
+            '{"threads":[]}',
+            "utf8"
+        );
+        await fs.promises.writeFile(
+            path.join(workspaceDir, "files/smart_edits.json"),
+            "{}",
+            "utf8"
+        );
+        await dugiteGit.add(workspaceDir, "chat-threads.json");
+        await dugiteGit.add(workspaceDir, "files/smart_edits.json");
+        const remoteOid = await dugiteGit.commit(
+            workspaceDir,
+            "Remote adds orphaned files",
+            { name: "Remote", email: "remote@example.com" }
+        );
+        await dugiteGit.updateRef(workspaceDir, "refs/remotes/origin/main", remoteOid);
+
+        // Reset local branch to the base commit (does NOT have those files)
+        await dugiteGit.updateRef(workspaceDir, "refs/heads/main", baseOid);
+        await dugiteGit.checkout(workspaceDir, "main", true);
+
+        // Delete the orphaned files from disk (simulates the codex-editor resolver)
+        try { await fs.promises.unlink(path.join(workspaceDir, "chat-threads.json")); } catch {}
+        try { await fs.promises.unlink(path.join(workspaceDir, "files/smart_edits.json")); } catch {}
+
+        // Mock fetch and push
+        const originalFetchOrigin = dugiteGit.fetchOrigin;
+        const originalPush = dugiteGit.push;
+        (dugiteGit as any).fetchOrigin = async () => {};
+        (dugiteGit as any).push = async () => {};
+
+        try {
+            // completeMerge with "deleted" resolution for files NOT in the local index.
+            // Before the --ignore-unmatch fix this would throw
+            // "Merge aborted: 2 resolved file(s) could not be staged".
+            await assert.doesNotReject(
+                () =>
+                    gitService.completeMerge(
+                        workspaceDir,
+                        { username: "oauth2", password: "token" },
+                        { name: "Test", email: "test@example.com" },
+                        [
+                            { filepath: "chat-threads.json", resolution: "deleted" },
+                            { filepath: "files/smart_edits.json", resolution: "deleted" },
+                        ]
+                    ),
+                "completeMerge should not fail when deleting files not in the index"
+            );
+        } finally {
+            (dugiteGit as any).fetchOrigin = originalFetchOrigin;
+            (dugiteGit as any).push = originalPush;
+        }
+    });
 });

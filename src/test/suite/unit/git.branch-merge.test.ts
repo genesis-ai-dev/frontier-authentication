@@ -158,15 +158,21 @@ suite("GitService Branch & Merge Scenarios", () => {
             // Mock: branch exists but not tracking
             const originalFetchOrigin = dugiteGit.fetchOrigin;
             const originalResolveRef = dugiteGit.resolveRef;
+            const originalPush = dugiteGit.push;
             
             (dugiteGit as any).fetchOrigin = async () => {};
+            (dugiteGit as any).push = async () => {};
             
             (dugiteGit as any).resolveRef = async (_dir: string, ref: string) => {
                 if (ref && ref.includes("origin/")) {
-                    // Remote ref doesn't exist
-                    throw new Error("Reference not found");
+                    // syncChanges checks for GitOperationError with exitCode 128
+                    throw new dugiteGit.GitOperationError("rev-parse", {
+                        exitCode: 128,
+                        stdout: "",
+                        stderr: `fatal: bad revision '${ref}'\n`,
+                    } as any);
                 }
-                return "local-commit-hash";
+                return originalResolveRef(_dir, ref);
             };
 
             try {
@@ -182,6 +188,7 @@ suite("GitService Branch & Merge Scenarios", () => {
             } finally {
                 (dugiteGit as any).fetchOrigin = originalFetchOrigin;
                 (dugiteGit as any).resolveRef = originalResolveRef;
+                (dugiteGit as any).push = originalPush;
             }
         });
     });
@@ -194,17 +201,18 @@ suite("GitService Branch & Merge Scenarios", () => {
             const testFile = path.join(repoDir, "test.txt");
             await fs.promises.writeFile(testFile, "content", "utf8");
             await dugiteGit.add(repoDir, "test.txt");
-            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
+            const oid = await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
 
-            // Mock fetch and push
+            // Set up remote ref so resolveRef returns real OIDs
+            await dugiteGit.updateRef(repoDir, "refs/remotes/origin/main", oid);
+
+            // Mock fetch, mergeCommit, and push
             const originalFetchOrigin = dugiteGit.fetchOrigin;
-            const originalResolveRef = dugiteGit.resolveRef;
-            const originalCommit = dugiteGit.commit;
+            const originalMergeCommit = dugiteGit.mergeCommit;
             const originalPush = dugiteGit.push;
             
             (dugiteGit as any).fetchOrigin = async () => {};
-            (dugiteGit as any).resolveRef = async () => "commit-hash";
-            (dugiteGit as any).commit = async () => "merge-commit-hash";
+            (dugiteGit as any).mergeCommit = async () => "merge-commit-hash";
             (dugiteGit as any).push = async () => {};
 
             try {
@@ -220,8 +228,7 @@ suite("GitService Branch & Merge Scenarios", () => {
                 assert.ok(true);
             } finally {
                 (dugiteGit as any).fetchOrigin = originalFetchOrigin;
-                (dugiteGit as any).resolveRef = originalResolveRef;
-                (dugiteGit as any).commit = originalCommit;
+                (dugiteGit as any).mergeCommit = originalMergeCommit;
                 (dugiteGit as any).push = originalPush;
             }
         });
@@ -233,22 +240,23 @@ suite("GitService Branch & Merge Scenarios", () => {
             const testFile = path.join(repoDir, "test.txt");
             await fs.promises.writeFile(testFile, "content", "utf8");
             await dugiteGit.add(repoDir, "test.txt");
-            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
+            const oid = await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
+
+            // Set up remote ref so resolveRef returns real OIDs
+            await dugiteGit.updateRef(repoDir, "refs/remotes/origin/main", oid);
 
             // Mock operations
             const originalFetchOrigin = dugiteGit.fetchOrigin;
-            const originalResolveRef = dugiteGit.resolveRef;
             const originalRemove = dugiteGit.remove;
-            const originalCommit = dugiteGit.commit;
+            const originalMergeCommit = dugiteGit.mergeCommit;
             const originalPush = dugiteGit.push;
             
             let removeCalled = false;
             (dugiteGit as any).fetchOrigin = async () => {};
-            (dugiteGit as any).resolveRef = async () => "commit-hash";
             (dugiteGit as any).remove = async () => {
                 removeCalled = true;
             };
-            (dugiteGit as any).commit = async () => "merge-commit-hash";
+            (dugiteGit as any).mergeCommit = async () => "merge-commit-hash";
             (dugiteGit as any).push = async () => {};
 
             try {
@@ -262,9 +270,8 @@ suite("GitService Branch & Merge Scenarios", () => {
                 assert.strictEqual(removeCalled, true, "Should call dugiteGit.remove for deleted files");
             } finally {
                 (dugiteGit as any).fetchOrigin = originalFetchOrigin;
-                (dugiteGit as any).resolveRef = originalResolveRef;
                 (dugiteGit as any).remove = originalRemove;
-                (dugiteGit as any).commit = originalCommit;
+                (dugiteGit as any).mergeCommit = originalMergeCommit;
                 (dugiteGit as any).push = originalPush;
             }
         });
@@ -276,26 +283,28 @@ suite("GitService Branch & Merge Scenarios", () => {
             const initFile = path.join(repoDir, "init.txt");
             await fs.promises.writeFile(initFile, "init", "utf8");
             await dugiteGit.add(repoDir, "init.txt");
-            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
+            const oid = await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
+
+            // Set up remote ref so resolveRef returns real OIDs
+            await dugiteGit.updateRef(repoDir, "refs/remotes/origin/main", oid);
 
             // Create new file
             const newFile = path.join(repoDir, "new.txt");
             await fs.promises.writeFile(newFile, "new content", "utf8");
 
-            // Mock operations
+            // Mock operations — completeMerge calls stageResolvedFileWithLFS
+            // for non-deleted files, which internally calls dugiteGit.add.
             const originalFetchOrigin = dugiteGit.fetchOrigin;
-            const originalResolveRef = dugiteGit.resolveRef;
             const originalAdd = dugiteGit.add;
-            const originalCommit = dugiteGit.commit;
+            const originalMergeCommit = dugiteGit.mergeCommit;
             const originalPush = dugiteGit.push;
             
             let addCalled = false;
             (dugiteGit as any).fetchOrigin = async () => {};
-            (dugiteGit as any).resolveRef = async () => "commit-hash";
             (dugiteGit as any).add = async () => {
                 addCalled = true;
             };
-            (dugiteGit as any).commit = async () => "merge-commit-hash";
+            (dugiteGit as any).mergeCommit = async () => "merge-commit-hash";
             (dugiteGit as any).push = async () => {};
 
             try {
@@ -309,9 +318,8 @@ suite("GitService Branch & Merge Scenarios", () => {
                 assert.strictEqual(addCalled, true, "Should stage created files");
             } finally {
                 (dugiteGit as any).fetchOrigin = originalFetchOrigin;
-                (dugiteGit as any).resolveRef = originalResolveRef;
                 (dugiteGit as any).add = originalAdd;
-                (dugiteGit as any).commit = originalCommit;
+                (dugiteGit as any).mergeCommit = originalMergeCommit;
                 (dugiteGit as any).push = originalPush;
             }
         });
@@ -349,20 +357,21 @@ suite("GitService Branch & Merge Scenarios", () => {
             const testFile = path.join(repoDir, "test.txt");
             await fs.promises.writeFile(testFile, "content", "utf8");
             await dugiteGit.add(repoDir, "test.txt");
-            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
+            const oid = await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
+
+            // Set up remote ref so resolveRef returns real OIDs
+            await dugiteGit.updateRef(repoDir, "refs/remotes/origin/main", oid);
 
             // Mock: fetch should be called before reading remote ref
             const originalFetchOrigin = dugiteGit.fetchOrigin;
-            const originalResolveRef = dugiteGit.resolveRef;
-            const originalCommit = dugiteGit.commit;
+            const originalMergeCommit = dugiteGit.mergeCommit;
             const originalPush = dugiteGit.push;
             
             let fetchCallCount = 0;
             (dugiteGit as any).fetchOrigin = async () => {
                 fetchCallCount++;
             };
-            (dugiteGit as any).resolveRef = async () => "commit-hash";
-            (dugiteGit as any).commit = async () => "merge-commit-hash";
+            (dugiteGit as any).mergeCommit = async () => "merge-commit-hash";
             (dugiteGit as any).push = async () => {};
 
             try {
@@ -377,8 +386,7 @@ suite("GitService Branch & Merge Scenarios", () => {
                 assert.ok(fetchCallCount > 0, "Should fetch before reading remote reference");
             } finally {
                 (dugiteGit as any).fetchOrigin = originalFetchOrigin;
-                (dugiteGit as any).resolveRef = originalResolveRef;
-                (dugiteGit as any).commit = originalCommit;
+                (dugiteGit as any).mergeCommit = originalMergeCommit;
                 (dugiteGit as any).push = originalPush;
             }
         });
@@ -390,30 +398,21 @@ suite("GitService Branch & Merge Scenarios", () => {
             const testFile = path.join(repoDir, "test.txt");
             await fs.promises.writeFile(testFile, "content", "utf8");
             await dugiteGit.add(repoDir, "test.txt");
-            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
+            const oid = await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
 
-            // Mock: first fetch gets old ref, second fetch (in completeMerge) gets new ref
+            // Set up remote ref so resolveRef returns real OIDs
+            await dugiteGit.updateRef(repoDir, "refs/remotes/origin/main", oid);
+
+            // Mock: fetch should be called, mergeCommit and push are no-ops
             const originalFetchOrigin = dugiteGit.fetchOrigin;
-            const originalResolveRef = dugiteGit.resolveRef;
-            const originalCommit = dugiteGit.commit;
+            const originalMergeCommit = dugiteGit.mergeCommit;
             const originalPush = dugiteGit.push;
             
             let fetchCount = 0;
             (dugiteGit as any).fetchOrigin = async () => {
                 fetchCount++;
             };
-            
-            let resolveRefCount = 0;
-            (dugiteGit as any).resolveRef = async () => {
-                resolveRefCount++;
-                // First call returns old ref, subsequent calls return new ref
-                if (resolveRefCount === 1) {
-                    return "old-remote-hash";
-                }
-                return "new-remote-hash";
-            };
-            
-            (dugiteGit as any).commit = async () => "merge-commit-hash";
+            (dugiteGit as any).mergeCommit = async () => "merge-commit-hash";
             (dugiteGit as any).push = async () => {};
 
             try {
@@ -428,8 +427,7 @@ suite("GitService Branch & Merge Scenarios", () => {
                 assert.ok(fetchCount > 0, "Should fetch to get latest remote state");
             } finally {
                 (dugiteGit as any).fetchOrigin = originalFetchOrigin;
-                (dugiteGit as any).resolveRef = originalResolveRef;
-                (dugiteGit as any).commit = originalCommit;
+                (dugiteGit as any).mergeCommit = originalMergeCommit;
                 (dugiteGit as any).push = originalPush;
             }
         });

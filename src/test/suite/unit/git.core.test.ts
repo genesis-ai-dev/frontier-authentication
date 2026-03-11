@@ -79,6 +79,55 @@ suite("Git core actions", () => {
         assert.strictEqual(bEntry?.[2], 0);
     });
 
+    test("remove is a no-op for files not in the index", async () => {
+        await service.init(repoDir);
+        // Create an initial commit so HEAD exists
+        await fs.promises.writeFile(path.join(repoDir, "init.txt"), "hello", "utf8");
+        await dugiteGit.add(repoDir, "init.txt");
+        await dugiteGit.commit(repoDir, "init", { name: "T", email: "t@example.com" });
+
+        // remove() on a file that was never tracked should NOT throw
+        await assert.doesNotReject(
+            () => dugiteGit.remove(repoDir, "nonexistent-file.json"),
+            "remove() should not throw for files not in the index (--ignore-unmatch)"
+        );
+    });
+
+    test("removeMany is a no-op for files not in the index", async () => {
+        await service.init(repoDir);
+        await fs.promises.writeFile(path.join(repoDir, "init.txt"), "hello", "utf8");
+        await dugiteGit.add(repoDir, "init.txt");
+        await dugiteGit.commit(repoDir, "init", { name: "T", email: "t@example.com" });
+
+        await assert.doesNotReject(
+            () => dugiteGit.removeMany(repoDir, [
+                "orphan-a.json",
+                "files/orphan-b.json",
+                "files/orphan-c.json",
+            ]),
+            "removeMany() should not throw for files not in the index"
+        );
+    });
+
+    test("remove still works for tracked files", async () => {
+        await service.init(repoDir);
+        const fp = path.join(repoDir, "tracked.txt");
+        await fs.promises.writeFile(fp, "content", "utf8");
+        await dugiteGit.add(repoDir, "tracked.txt");
+        await dugiteGit.commit(repoDir, "add tracked", { name: "T", email: "t@example.com" });
+
+        // remove() on a tracked file should succeed and unstage it
+        await assert.doesNotReject(() => dugiteGit.remove(repoDir, "tracked.txt"));
+
+        // File should be marked as deleted in the index after removal
+        const status = await dugiteGit.statusMatrix(repoDir);
+        const entry = status.find(([f]) => f === "tracked.txt");
+        assert.ok(entry, "tracked.txt should still appear in status");
+        // HEAD=1 (was committed), WORKDIR=1 (still on disk), STAGE=0 (removed from index)
+        assert.strictEqual(entry?.[1], 1, "should have been in HEAD");
+        assert.strictEqual(entry?.[3], 0, "should be removed from staging");
+    });
+
     test("push uses provided auth (no network)", async () => {
         await service.init(repoDir);
         const remote = "https://example.com/demo.git";

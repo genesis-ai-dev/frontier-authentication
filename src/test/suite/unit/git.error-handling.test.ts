@@ -199,7 +199,7 @@ suite("GitService Error Handling", () => {
                         await service.push(repoDir, { username: "oauth2", password: "token" });
                     },
                     (error: Error) => {
-                        return error.message.includes("Remote branch changed since last sync");
+                        return error.message.includes("Remote has newer changes");
                     },
                     "Should throw user-friendly branch protection error"
                 );
@@ -222,7 +222,7 @@ suite("GitService Error Handling", () => {
                         await service.push(repoDir, { username: "oauth2", password: "token" });
                     },
                     (error: Error) => {
-                        return error.message.includes("Remote branch changed since last sync");
+                        return error.message.includes("Remote has newer changes");
                     },
                     "Should throw user-friendly remote changed error"
                 );
@@ -310,7 +310,7 @@ suite("GitService Error Handling", () => {
                         );
                     },
                     (error: Error) => {
-                        return error.message.includes("Remote branch changed since last sync");
+                        return error.message.includes("Remote has newer changes");
                     },
                     "Should handle race condition gracefully"
                 );
