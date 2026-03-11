@@ -3630,7 +3630,19 @@ export class GitService {
             return;
         }
 
-        // Fallback: regular add
+        // Fallback: regular add — verify the file exists first so we get a
+        // clear error rather than a cryptic git exit-code if the resolver
+        // failed to write the file (or it was removed between resolution
+        // and staging).
+        const absPath = path.join(dir, filepath);
+        try {
+            await fs.promises.access(absPath);
+        } catch {
+            throw new Error(
+                `Cannot stage ${filepath}: file does not exist on disk. ` +
+                `It may have been removed between conflict resolution and staging.`
+            );
+        }
         await dugiteGit.add(dir, filepath);
     }
 
