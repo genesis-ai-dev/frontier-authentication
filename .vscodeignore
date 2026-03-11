@@ -5,6 +5,7 @@
 */**
 
 # Webpack output (extension.js + askpass helper)
+!dist/
 !dist/**
 
 # Extension manifest and metadata
