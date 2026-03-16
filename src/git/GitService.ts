@@ -1570,7 +1570,9 @@ export class GitService {
         const testEndpoints = [
             { name: "GitLab", url: "https://gitlab.com", timeout: 5000 },
             { name: "Frontier API", url: "https://api.frontierrnd.com", timeout: 5000 },
-            { name: "Google DNS", url: "https://8.8.8.8", timeout: 3000 },
+            { name: "Cloudflare", url: "https://1.1.1.1", timeout: 3000 },
+            { name: "Google DNS", url: "https://dns.google", timeout: 3000 },
+            { name: "Cloudflare.com", url: "https://cloudflare.com", timeout: 3000 },
         ];
 
         if (remoteUrl) {
