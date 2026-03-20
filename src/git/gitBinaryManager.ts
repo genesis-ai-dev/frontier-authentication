@@ -123,6 +123,24 @@ async function doEnsureGitBinary(
         return resolvedPaths;
     }
 
+    // Fast-fail when offline: no point retrying downloads that cannot succeed.
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000);
+        const resp = await fetch("https://api.github.com", {
+            method: "HEAD",
+            signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        if (!resp.ok) {
+            throw new Error("GitHub API unreachable");
+        }
+    } catch {
+        throw new Error(
+            "Git binary is not cached and the network is unavailable. Sync features require an initial online setup."
+        );
+    }
+
     // Download with progress UI, retrying the entire flow up to MAX_FULL_RETRIES times
     const MAX_FULL_RETRIES = 3;
 

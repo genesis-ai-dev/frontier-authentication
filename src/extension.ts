@@ -198,6 +198,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }
     while (!gitInitialized) {
         try {
+            // ensureGitBinary checks local cache first, only downloads if needed.
             const gitPaths = await gitBinaryManager.ensureGitBinary(context);
             dugiteGit.setGitBinaryPath(gitPaths.localGitDir, gitPaths.execPath);
 
@@ -213,16 +214,42 @@ export async function activate(context: vscode.ExtensionContext) {
             gitInitialized = true;
         } catch (error) {
             console.error("[Frontier] Failed to initialize git binary:", error);
-            const choice = await vscode.window.showErrorMessage(
-                "Sync setup couldn't be completed. You can still work offline, but syncing " +
-                "won't be available until setup finishes. You can retry from Sync Settings.",
-                "Retry Now",
-                "Continue Offline",
+
+            // If offline, skip the retry prompt — there's nothing to download.
+            let online = false;
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 3000);
+                const resp = await fetch("https://www.google.com", {
+                    method: "HEAD",
+                    signal: controller.signal,
+                });
+                online = resp.ok;
+                clearTimeout(timeout);
+            } catch {
+                online = false;
+            }
+
+            if (!online) {
+                console.log("[Frontier] Offline — git binary not cached locally, continuing without sync");
+                break;
+            }
+
+            const autoContinue = new Promise<string | undefined>((resolve) =>
+                setTimeout(() => resolve(undefined), 15_000)
             );
+            const choice = await Promise.race([
+                vscode.window.showErrorMessage(
+                    "Sync setup couldn't be completed. You can still work offline, but syncing " +
+                    "won't be available until setup finishes. You can retry from Sync Settings.",
+                    "Retry Now",
+                    "Continue Offline",
+                ),
+                autoContinue,
+            ]);
             if (choice !== "Retry Now") {
                 break;
             }
-            // Reset resolved paths so ensureGitBinary retries from scratch
             gitBinaryManager.resetResolvedPaths();
         }
     }
