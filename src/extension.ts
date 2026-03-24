@@ -146,6 +146,8 @@ export interface FrontierAPI {
      */
     getGitBinaryPath: () => { localGitDir: string; execPath: string } | undefined;
     isGitBinaryAvailable: () => boolean;
+    /** Returns true when git operations can succeed (native binary OR isomorphic-git fallback). */
+    isGitAvailable: () => boolean;
     retryGitBinaryDownload: () => Promise<boolean>;
 }
 
@@ -589,6 +591,12 @@ export async function activate(context: vscode.ExtensionContext) {
         getGitBinaryPath: () => gitBinaryManager.getResolvedPath(),
 
         isGitBinaryAvailable: () => gitBinaryManager.getResolvedPath() !== undefined,
+
+        isGitAvailable: () => {
+            // Always true: isomorphic-git is bundled as a fallback when
+            // the native binary is unavailable.
+            return true;
+        },
 
         retryGitBinaryDownload: async (): Promise<boolean> => {
             try {
