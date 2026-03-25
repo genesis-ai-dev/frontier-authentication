@@ -391,6 +391,12 @@ export async function checkMetadataVersionsForSync(
     context: vscode.ExtensionContext,
     isManualSync: boolean = false
 ): Promise<boolean> {
+    // Check pinned extensions first — pins override requiredExtensions
+    const pinResult = await checkPinnedExtensionsForSync(context, isManualSync);
+    if (!pinResult.canSync) {
+        return false;
+    }
+
     const result = await checkAndUpdateMetadataVersions();
 
     if (result.canSync) {
@@ -398,10 +404,20 @@ export async function checkMetadataVersionsForSync(
     }
 
     if (result.needsUserAction && result.outdatedExtensions) {
+        // Filter out extensions that are covered by a pin
+        const nonPinnedOutdated = result.outdatedExtensions.filter(
+            (ext) => !pinResult.pinnedIds.has(ext.extensionId)
+        );
+
+        if (nonPinnedOutdated.length === 0) {
+            // All outdated extensions are pinned — pins override, allow sync
+            return true;
+        }
+
         const shouldShow = shouldShowVersionModal(context, isManualSync);
 
         if (shouldShow) {
-            return await showMetadataVersionMismatchNotification(context, result.outdatedExtensions);
+            return await showMetadataVersionMismatchNotification(context, nonPinnedOutdated);
         } else {
             debug(
                 "[MetadataVersionChecker] Auto-sync blocked due to outdated extensions (in cooldown period)"
@@ -526,6 +542,47 @@ async function showPinMismatchNotification(
     }
 
     return false;
+}
+
+/**
+ * Checks if pinnedExtensions in metadata.json match the running versions.
+ * If mismatched, shows a blocking modal prompting the user to reload.
+ * Returns true if sync can proceed, false if blocked.
+ *
+ * Also returns the set of pinned extension IDs so callers can skip
+ * requiredExtensions checks for those extensions.
+ */
+export async function checkPinnedExtensionsForSync(
+    context: vscode.ExtensionContext,
+    isManualSync: boolean,
+    pins?: PinnedExtensions
+): Promise<{ canSync: boolean; pinnedIds: Set<string> }> {
+    const resolvedPins = pins ?? (await readLocalPinnedExtensions());
+    if (!resolvedPins || Object.keys(resolvedPins).length === 0) {
+        return { canSync: true, pinnedIds: new Set() };
+    }
+
+    const pinnedIds = new Set(Object.keys(resolvedPins));
+    const mismatches = findPinMismatches(resolvedPins);
+
+    if (mismatches.length === 0) {
+        return { canSync: true, pinnedIds };
+    }
+
+    debug(
+        `[PinVersionChecker] Pin mismatch: ${mismatches
+            .map((m) => `${m.extensionId} running=${m.runningVersion} pinned=${m.pinnedVersion}`)
+            .join(", ")}`
+    );
+
+    const shouldShow = shouldShowVersionModal(context, isManualSync);
+    if (shouldShow) {
+        const canSync = await showPinMismatchNotification(mismatches);
+        return { canSync, pinnedIds };
+    }
+
+    debug("[PinVersionChecker] Auto-sync blocked due to pin mismatch (in cooldown period)");
+    return { canSync: false, pinnedIds };
 }
 
 export function registerVersionCheckCommands(context: vscode.ExtensionContext): void {
