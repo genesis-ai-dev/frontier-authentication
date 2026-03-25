@@ -3,13 +3,15 @@
  *
  * Delegates every call to either the native dugite wrapper
  * (dugiteGitNative.ts) or the pure-JS isomorphic-git adapter
- * (isomorphicGitAdapter.ts) based on whether the native git binary
- * has been configured.
+ * (isomorphicGitAdapter.ts) based on the shared VS Code setting
+ * `codex-editor.gitBackendMode` (and whether the native binary
+ * has been configured).
  *
  * Consumer files import from this module — their imports remain
  * unchanged regardless of which backend is active.
  */
 
+import * as vscode from "vscode";
 import * as native from "./dugiteGitNative";
 import * as fallback from "./isomorphicGitAdapter";
 
@@ -36,6 +38,10 @@ export function setForceBuiltin(force: boolean): void {
 
 function shouldUseNative(): boolean {
     if (_forceBuiltin) return false;
+    const mode = vscode.workspace
+        .getConfiguration("codex-editor")
+        .get<string>("gitBackendMode");
+    if (mode === "builtin") return false;
     return native.isGitBinaryConfigured();
 }
 

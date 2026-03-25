@@ -196,6 +196,8 @@ export async function activate(context: vscode.ExtensionContext) {
     if (context.extensionMode === vscode.ExtensionMode.Test) {
         console.log("[Frontier] Test mode detected — skipping git binary download (tests use embedded binary)");
         dugiteGit.useEmbeddedGitBinary();
+        const askpassPath = path.join(context.extensionPath, "dist", "askpass.js");
+        dugiteGit.setAskpassPath(askpassPath);
         gitInitialized = true;
     }
     while (!gitInitialized) {
@@ -310,6 +312,19 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Register status bar item
     // Removed redundant registration here
+
+    // Log when codex-editor's git backend preference changes so operators
+    // can verify both extensions are reading the same value.
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration((e) => {
+            if (e.affectsConfiguration("codex-editor.gitBackendMode")) {
+                const mode = vscode.workspace
+                    .getConfiguration("codex-editor")
+                    .get<string>("gitBackendMode");
+                console.log(`[Frontier] Git backend mode changed to: ${mode}`);
+            }
+        })
+    );
 
     const frontierAPI: FrontierAPI = {
         // Export the authentication provider for other extensions
@@ -603,6 +618,15 @@ export async function activate(context: vscode.ExtensionContext) {
                 gitBinaryManager.resetResolvedPaths();
                 const gitPaths = await gitBinaryManager.ensureGitBinary(context);
                 dugiteGit.setGitBinaryPath(gitPaths.localGitDir, gitPaths.execPath);
+
+                const askpassPath = path.join(context.extensionPath, "dist", "askpass.js");
+                try {
+                    await import("fs").then((fsModule) => fsModule.promises.chmod(askpassPath, 0o755));
+                } catch {
+                    // May fail on read-only filesystems; git will fall back gracefully
+                }
+                dugiteGit.setAskpassPath(askpassPath);
+
                 console.log("[Frontier] Git binary downloaded via retry:", gitPaths.localGitDir);
                 return true;
             } catch (error) {

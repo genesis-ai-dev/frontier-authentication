@@ -86,41 +86,12 @@ export async function currentBranch(dir: string): Promise<string | null> {
 }
 
 export async function findMergeBase(dir: string, oid1: string, oid2: string): Promise<string[]> {
-    const visited1 = new Set<string>();
-    const visited2 = new Set<string>();
-
-    const queue1: string[] = [oid1];
-    const queue2: string[] = [oid2];
-
-    // BFS from both sides simultaneously; the first OID seen from both
-    // directions is the merge base.
-    while (queue1.length > 0 || queue2.length > 0) {
-        if (queue1.length > 0) {
-            const current = queue1.shift()!;
-            if (visited1.has(current)) continue;
-            visited1.add(current);
-            if (visited2.has(current)) return [current];
-            try {
-                const { commit: c } = await git.readCommit({ fs, dir, oid: current });
-                queue1.push(...c.parent);
-            } catch {
-                // Invalid OID or shallow boundary
-            }
-        }
-        if (queue2.length > 0) {
-            const current = queue2.shift()!;
-            if (visited2.has(current)) continue;
-            visited2.add(current);
-            if (visited1.has(current)) return [current];
-            try {
-                const { commit: c } = await git.readCommit({ fs, dir, oid: current });
-                queue2.push(...c.parent);
-            } catch {
-                // Invalid OID or shallow boundary
-            }
-        }
+    try {
+        const oids = await git.findMergeBase({ fs, dir, oids: [oid1, oid2] });
+        return oids;
+    } catch {
+        return [];
     }
-    return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -145,10 +116,16 @@ export async function deleteRemote(dir: string, name: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export async function add(dir: string, filepath: string): Promise<void> {
+    let fileExists = true;
     try {
         await fs.promises.access(path.join(dir, filepath));
-        await git.add({ fs, dir, filepath });
     } catch {
+        fileExists = false;
+    }
+
+    if (fileExists) {
+        await git.add({ fs, dir, filepath });
+    } else {
         await git.remove({ fs, dir, filepath });
     }
 }
@@ -156,10 +133,24 @@ export async function add(dir: string, filepath: string): Promise<void> {
 export async function addMany(
     dir: string,
     filepaths: string[],
-    _options?: { batchSize?: number; maxRetries?: number },
+    options?: { batchSize?: number; maxRetries?: number },
 ): Promise<void> {
+    const maxRetries = options?.maxRetries ?? 3;
     for (const filepath of filepaths) {
-        await add(dir, filepath);
+        let lastError: Error | undefined;
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                await add(dir, filepath);
+                lastError = undefined;
+                break;
+            } catch (err) {
+                lastError = err instanceof Error ? err : new Error(String(err));
+                if (attempt < maxRetries) {
+                    await new Promise((r) => setTimeout(r, 100 * Math.pow(2, attempt)));
+                }
+            }
+        }
+        if (lastError) throw lastError;
     }
 }
 
@@ -179,18 +170,36 @@ export async function addAll(dir: string): Promise<void> {
 export async function remove(dir: string, filepath: string): Promise<void> {
     try {
         await git.remove({ fs, dir, filepath });
-    } catch {
-        // Ignore errors for files not in the index (matches --ignore-unmatch)
+    } catch (err) {
+        // Only ignore "not in index" errors (matches dugite's --ignore-unmatch).
+        // Propagate real failures (corrupt index, permissions, etc.).
+        const isNotInIndex =
+            err && typeof err === "object" && (err as any).code === "NotFoundError";
+        if (!isNotInIndex) throw err;
     }
 }
 
 export async function removeMany(
     dir: string,
     filepaths: string[],
-    _options?: { batchSize?: number; maxRetries?: number },
+    options?: { batchSize?: number; maxRetries?: number },
 ): Promise<void> {
+    const maxRetries = options?.maxRetries ?? 3;
     for (const filepath of filepaths) {
-        await remove(dir, filepath);
+        let lastError: Error | undefined;
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                await remove(dir, filepath);
+                lastError = undefined;
+                break;
+            } catch (err) {
+                lastError = err instanceof Error ? err : new Error(String(err));
+                if (attempt < maxRetries) {
+                    await new Promise((r) => setTimeout(r, 100 * Math.pow(2, attempt)));
+                }
+            }
+        }
+        if (lastError) throw lastError;
     }
 }
 
@@ -269,12 +278,32 @@ export async function fastForward(
     _auth: { username: string; password: string },
     _signal?: AbortSignal,
 ): Promise<void> {
-    // Update the local branch ref to match origin/<branch>
+    const localOid = await git.resolveRef({ fs, dir, ref: `refs/heads/${branch}` });
     const remoteOid = await git.resolveRef({ fs, dir, ref: `refs/remotes/origin/${branch}` });
-    await git.writeRef({ fs, dir, ref: `refs/heads/${branch}`, value: remoteOid, force: true });
 
-    // Checkout to update the working tree
-    await git.checkout({ fs, dir, ref: branch, force: true });
+    if (localOid === remoteOid) {
+        return;
+    }
+
+    const bases = await git.findMergeBase({ fs, dir, oids: [localOid, remoteOid] });
+
+    // Local is ahead of remote — already up to date, nothing to fast-forward.
+    // Matches native git's `merge --ff-only` "Already up to date" behavior.
+    if (bases.length > 0 && bases[0] === remoteOid) {
+        return;
+    }
+
+    // Remote is ahead of local — fast-forward local branch to remote.
+    if (bases.length > 0 && bases[0] === localOid) {
+        await git.writeRef({ fs, dir, ref: `refs/heads/${branch}`, value: remoteOid, force: true });
+        await git.checkout({ fs, dir, ref: branch, force: true });
+        return;
+    }
+
+    // Diverged histories — cannot fast-forward, fall through to auto-resolution.
+    throw new Error(
+        `Not possible to fast-forward: local (${localOid.substring(0, 8)}) is not an ancestor of remote (${remoteOid.substring(0, 8)})`,
+    );
 }
 
 export async function push(
@@ -303,15 +332,50 @@ export async function clone(
     _signal?: AbortSignal,
 ): Promise<void> {
     await fs.promises.mkdir(dir, { recursive: true });
-    await git.clone({
-        fs,
-        http,
-        dir,
-        url,
-        singleBranch: false,
-        onProgress: mapProgress(onProgressCb),
-        onAuth: onAuth(auth),
-    });
+
+    let hasGitDir = false;
+    try {
+        await fs.promises.access(path.join(dir, ".git"));
+        hasGitDir = true;
+    } catch {
+        // .git doesn't exist yet
+    }
+
+    if (hasGitDir) {
+        // Recovery path: directory already has .git (e.g., retry after a failed clone).
+        // Mirrors dugiteGitNative's init+fetch+checkout approach.
+        const remotes = await git.listRemotes({ fs, dir });
+        if (!remotes.some((r) => r.remote === "origin")) {
+            await git.addRemote({ fs, dir, remote: "origin", url });
+        }
+        await git.fetch({
+            fs,
+            http,
+            dir,
+            remote: "origin",
+            onProgress: mapProgress(onProgressCb),
+            onAuth: onAuth(auth),
+        });
+        const branches = await git.listBranches({ fs, dir, remote: "origin" });
+        const defaultBranch = branches.includes("main")
+            ? "main"
+            : branches.includes("master")
+              ? "master"
+              : branches.filter((b) => b !== "HEAD")[0];
+        if (defaultBranch) {
+            await git.checkout({ fs, dir, ref: defaultBranch, force: true });
+        }
+    } else {
+        await git.clone({
+            fs,
+            http,
+            dir,
+            url,
+            singleBranch: false,
+            onProgress: mapProgress(onProgressCb),
+            onAuth: onAuth(auth),
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -327,8 +391,12 @@ export async function statusMatrixAtRef(
     dir: string,
     ref: string,
 ): Promise<StatusMatrixEntry[]> {
-    // List files at the given ref
-    const refTree = await listTreeRecursive(dir, ref);
+    let refTree: Map<string, string>;
+    try {
+        refTree = await listTreeRecursive(dir, ref);
+    } catch {
+        return [];
+    }
     // List files at HEAD
     let headTree: Map<string, string>;
     try {

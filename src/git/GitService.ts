@@ -1613,10 +1613,36 @@ export class GitService {
     }
 
     /**
+     * Extract the HTTP status code from an isomorphic-git HttpError or
+     * a dugite error message.  Returns `undefined` when not identifiable.
+     */
+    private static extractHttpStatus(error: unknown): number | undefined {
+        if (error && typeof error === "object" && (error as any).code === "HttpError") {
+            return (error as any).data?.statusCode as number | undefined;
+        }
+        const msg = error instanceof Error ? error.message : String(error);
+        const match = msg.match(/\b(4\d{2}|5\d{2})\b/);
+        return match ? parseInt(match[1], 10) : undefined;
+    }
+
+    /**
      * Detect whether a push error is a non-fast-forward rejection that can
      * be recovered by re-fetching and fast-forwarding before retrying.
+     *
+     * Native dugite surfaces this in stderr text; isomorphic-git throws a
+     * PushRejectedError with `.code === "PushRejectedError"` and
+     * `.data.reason === "not-fast-forward"`.  The `originalError` parameter
+     * lets us check the structured code directly, surviving minification.
      */
-    private static isNonFastForwardError(msg: string): boolean {
+    private static isNonFastForwardError(msg: string, originalError?: unknown): boolean {
+        if (
+            originalError &&
+            typeof originalError === "object" &&
+            (originalError as any).code === "PushRejectedError"
+        ) {
+            const reason = (originalError as any).data?.reason;
+            return reason === "not-fast-forward" || reason === undefined;
+        }
         return (
             msg.includes("non-fast-forward") ||
             msg.includes("rejected") ||
@@ -1689,7 +1715,7 @@ export class GitService {
                 const fullMsg = `${errorMessage} ${gitStderr}`;
 
                 // On non-fast-forward, fetch + fast-forward and retry the push
-                if (GitService.isNonFastForwardError(fullMsg) && attempt < MAX_PUSH_RETRIES) {
+                if (GitService.isNonFastForwardError(fullMsg, error) && attempt < MAX_PUSH_RETRIES) {
                     const currentBranch = ref || (await dugiteGit.currentBranch(dir)) || "main";
                     console.warn(
                         `[GitService] Push rejected (non-fast-forward), attempt ${attempt + 1}/${MAX_PUSH_RETRIES + 1} — fetching and fast-forwarding before retry`,
@@ -1728,19 +1754,22 @@ export class GitService {
                 });
 
                 let userFriendlyMessage = "push failed";
+                const httpStatus = GitService.extractHttpStatus(error);
                 if (errorMessage.includes("ENOTFOUND") || errorMessage.includes("getaddrinfo")) {
                     userFriendlyMessage =
                         "push failed: Cannot reach server (check internet connection)";
-                } else if (errorMessage.includes("401") || errorMessage.includes("authentication")) {
+                } else if (httpStatus === 401 || errorMessage.includes("401") || errorMessage.includes("authentication")) {
                     userFriendlyMessage =
                         "push failed: Authentication failed (try logging out and back in)";
-                } else if (errorMessage.includes("403") || errorMessage.includes("forbidden")) {
+                } else if (httpStatus === 403 || errorMessage.includes("403") || errorMessage.includes("forbidden")) {
                     userFriendlyMessage = "push failed: Access denied (check your project permissions)";
                 } else if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
                     userFriendlyMessage = "push failed: Connection timeout (server not responding)";
-                } else if (GitService.isNonFastForwardError(fullMsg)) {
+                } else if (GitService.isNonFastForwardError(fullMsg, error)) {
                     userFriendlyMessage =
                         "push failed: Remote has newer changes that could not be merged automatically. Please sync again.";
+                } else if (httpStatus && httpStatus >= 500) {
+                    userFriendlyMessage = `push failed: Server error (HTTP ${httpStatus})`;
                 }
 
                 const enhancedError = new Error(userFriendlyMessage);
@@ -1917,16 +1946,18 @@ export class GitService {
                 });
 
                 let userFriendlyMessage = "fetch failed";
+                const fetchHttpStatus = GitService.extractHttpStatus(fetchError);
                 if (errorMessage.includes("ENOTFOUND") || errorMessage.includes("getaddrinfo")) {
                     userFriendlyMessage =
                         "fetch failed: Cannot reach server (check internet connection)";
                 } else if (
+                    fetchHttpStatus === 401 ||
                     errorMessage.includes("401") ||
                     errorMessage.includes("authentication")
                 ) {
                     userFriendlyMessage =
                         "fetch failed: Authentication failed (try logging out and back in)";
-                } else if (errorMessage.includes("403") || errorMessage.includes("forbidden")) {
+                } else if (fetchHttpStatus === 403 || errorMessage.includes("403") || errorMessage.includes("forbidden")) {
                     userFriendlyMessage =
                         "fetch failed: Access denied (check your project permissions)";
                 } else if (
@@ -1944,6 +1975,8 @@ export class GitService {
                 } else if (errorMessage.includes("SSL") || errorMessage.includes("certificate")) {
                     userFriendlyMessage =
                         "fetch failed: SSL/certificate error (check system certificates)";
+                } else if (fetchHttpStatus && fetchHttpStatus >= 500) {
+                    userFriendlyMessage = `fetch failed: Server error (HTTP ${fetchHttpStatus})`;
                 }
 
                 const enhancedError = new Error(userFriendlyMessage);
@@ -1957,14 +1990,16 @@ export class GitService {
             const remoteRef = `refs/remotes/origin/${currentBranch}`;
 
             // 5. Check if remote branch exists.
-            // Only treat exit code 128 ("bad revision") as a missing ref.
+            // Native dugite signals a missing ref with exit code 128 ("bad revision").
+            // The isomorphic-git fallback throws a NotFoundError instead.
             // Other failures (repo corruption, permission errors) must propagate
             // so they aren't silently hidden behind a blind push.
             try {
                 remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
             } catch (err) {
                 const isRefNotFound =
-                    err instanceof dugiteGit.GitOperationError && err.exitCode === 128;
+                    (err instanceof dugiteGit.GitOperationError && err.exitCode === 128) ||
+                    (err instanceof Error && (err as any).code === "NotFoundError");
                 if (isRefNotFound) {
                     this.debugLog("Remote branch doesn't exist, pushing our changes");
                     await this.safePush(dir, auth);
@@ -3432,10 +3467,25 @@ export class GitService {
         try {
             await dugiteGit.addRemote(dir, name, url);
         } catch (error) {
-            // If remote already exists, update it
-            if (error instanceof Error && error.message.includes("already exists")) {
+            const isAlreadyExists =
+                (error instanceof Error && error.message.includes("already exists")) ||
+                (error && typeof error === "object" && (error as any).code === "AlreadyExistsError");
+            if (isAlreadyExists) {
+                const existingRemotes = await dugiteGit.listRemotes(dir);
+                const oldUrl = existingRemotes.find((r) => r.remote === name)?.url;
                 await dugiteGit.deleteRemote(dir, name);
-                await dugiteGit.addRemote(dir, name, url);
+                try {
+                    await dugiteGit.addRemote(dir, name, url);
+                } catch (readdError) {
+                    if (oldUrl) {
+                        try {
+                            await dugiteGit.addRemote(dir, name, oldUrl);
+                        } catch {
+                            // Best-effort restore
+                        }
+                    }
+                    throw readdError;
+                }
             } else {
                 throw error;
             }

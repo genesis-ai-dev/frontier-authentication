@@ -78,7 +78,16 @@ suite("GitService Branch & Merge Scenarios", () => {
             const testFile = path.join(repoDir, "test.txt");
             await fs.promises.writeFile(testFile, "local", "utf8");
             await dugiteGit.add(repoDir, "test.txt");
-            await dugiteGit.commit(repoDir, "Local commit", { name: "Test", email: "test@example.com" });
+            const localOid = await dugiteGit.commit(repoDir, "Local commit", { name: "Test", email: "test@example.com" });
+
+            // Create a second commit to simulate remote being ahead
+            await fs.promises.writeFile(testFile, "remote update", "utf8");
+            await dugiteGit.add(repoDir, "test.txt");
+            const remoteOid = await dugiteGit.commit(repoDir, "Remote commit", { name: "Remote", email: "remote@example.com" });
+
+            // Reset local branch back so local is behind remote
+            await dugiteGit.updateRef(repoDir, "refs/heads/main", localOid);
+            await dugiteGit.updateRef(repoDir, "refs/remotes/origin/main", remoteOid);
 
             // Mock: fetch brings remote changes, local is behind
             const originalFetchOrigin = dugiteGit.fetchOrigin;
@@ -112,11 +121,26 @@ suite("GitService Branch & Merge Scenarios", () => {
         test("local branch diverged from remote (needs merge)", async () => {
             await service.addRemote(repoDir, "origin", "https://example.com/repo.git");
             
-            // Create initial commit
+            // Create initial commit (common ancestor)
             const testFile = path.join(repoDir, "test.txt");
-            await fs.promises.writeFile(testFile, "local", "utf8");
+            await fs.promises.writeFile(testFile, "base", "utf8");
+            await dugiteGit.add(repoDir, "test.txt");
+            const baseOid = await dugiteGit.commit(repoDir, "Base commit", { name: "Test", email: "test@example.com" });
+
+            // Create a "remote" commit branching from base
+            await fs.promises.writeFile(testFile, "remote changes", "utf8");
+            await dugiteGit.add(repoDir, "test.txt");
+            const remoteOid = await dugiteGit.commit(repoDir, "Remote commit", { name: "Remote", email: "remote@example.com" });
+
+            // Reset local branch to base and make a different local commit (divergence)
+            await dugiteGit.updateRef(repoDir, "refs/heads/main", baseOid);
+            await dugiteGit.checkout(repoDir, "main", true);
+            await fs.promises.writeFile(testFile, "local changes", "utf8");
             await dugiteGit.add(repoDir, "test.txt");
             await dugiteGit.commit(repoDir, "Local commit", { name: "Test", email: "test@example.com" });
+
+            // Set the remote tracking ref
+            await dugiteGit.updateRef(repoDir, "refs/remotes/origin/main", remoteOid);
 
             // Mock: fetch brings remote changes, branches diverged
             const originalFetchOrigin = dugiteGit.fetchOrigin;
@@ -125,7 +149,6 @@ suite("GitService Branch & Merge Scenarios", () => {
             (dugiteGit as any).fetchOrigin = async () => {};
             
             (dugiteGit as any).fastForward = async () => {
-                // Fast-forward fails with merge conflict
                 const error: any = new Error("Merge conflict");
                 error.name = "MergeConflictError";
                 throw error;

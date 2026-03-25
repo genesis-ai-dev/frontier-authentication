@@ -108,7 +108,7 @@ export function useEmbeddedGitBinary(): void {
     gitEnvOverrides = {};
 }
 
-/** Returns true when a binary path has been configured. */
+/** Returns true when a downloaded binary path has been configured via setGitBinaryPath(). */
 export function isGitBinaryConfigured(): boolean {
     return Object.keys(gitEnvOverrides).length > 0;
 }
@@ -799,18 +799,17 @@ export async function fetchOrigin(
     assertSuccess("fetch", result);
 }
 
-/** Fast-forward merge to the remote tracking branch. */
+/** Fast-forward merge to the remote tracking branch (local-only, no network). */
 export async function fastForward(
     dir: string,
     branch: string,
-    auth: { username: string; password: string },
+    _auth: { username: string; password: string },
     signal?: AbortSignal,
 ): Promise<void> {
     const result = await gitExec(
-        [...CREDENTIAL_OVERRIDE_FLAGS, "merge", "--ff-only", `origin/${branch}`],
+        ["merge", "--ff-only", `origin/${branch}`],
         dir,
         {
-            env: authEnv(auth),
             processCallback: buildProcessCallback(undefined, signal),
         },
     );

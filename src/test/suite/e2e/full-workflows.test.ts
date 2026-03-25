@@ -69,11 +69,21 @@ suite("E2E: Full Workflows", () => {
         // Create file
         await fs.promises.writeFile(path.join(workspaceDir, "test.txt"), "content", "utf8");
 
-        // Mock fetch/push
+        // Mock fetch to simulate remote matching local after sync commits
         const originalFetchOrigin = dugiteGit.fetchOrigin;
         const originalPush = dugiteGit.push;
+        const originalResolveRef = dugiteGit.resolveRef;
         (dugiteGit as any).fetchOrigin = async () => {};
         (dugiteGit as any).push = async () => {};
+
+        // Mock resolveRef for remote ref to return current HEAD,
+        // simulating "remote is up to date" after the mocked fetch
+        (dugiteGit as any).resolveRef = async (dir: string, ref: string) => {
+            if (ref.includes("origin/")) {
+                return originalResolveRef(dir, "HEAD");
+            }
+            return originalResolveRef(dir, ref);
+        };
 
         try {
             const result = await gitService.syncChanges(
@@ -86,6 +96,7 @@ suite("E2E: Full Workflows", () => {
         } finally {
             (dugiteGit as any).fetchOrigin = originalFetchOrigin;
             (dugiteGit as any).push = originalPush;
+            (dugiteGit as any).resolveRef = originalResolveRef;
         }
     });
 });
