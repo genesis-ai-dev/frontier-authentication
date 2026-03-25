@@ -666,6 +666,10 @@ export class SCMManager {
                     status: "completed",
                     message: "Synchronization complete",
                 });
+                // Signal to the Codex Conductor that a sync completed.
+                // The conductor observes this via IStorageService to detect
+                // mid-session pin changes in metadata.json.
+                await this.context.workspaceState.update('syncCompletedAt', Date.now());
             }
         }
     }
