@@ -1534,7 +1534,7 @@ export class GitService {
                 );
             }
 
-            console.error(`[GitService] ${operationName} failed after ${duration}ms:`, {
+            console.warn(`[GitService] ${operationName} failed after ${duration}ms:`, {
                 error: error instanceof Error ? error.message : String(error),
                 stack: error instanceof Error ? error.stack : undefined,
                 operation: operationName,
