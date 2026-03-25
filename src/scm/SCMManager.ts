@@ -16,6 +16,7 @@ import {
     handleOutdatedExtensionsForSync,
     ExtensionVersionInfo,
     checkPinnedExtensionsForSync,
+    findPinMismatches,
 } from "../utils/extensionVersionChecker";
 
 export class SCMManager {
