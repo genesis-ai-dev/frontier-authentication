@@ -18,8 +18,8 @@ export function compareVersions(a: string, b: string): number {
     for (let i = 0; i < len; i++) {
         const ai = pa[i] ?? 0;
         const bi = pb[i] ?? 0;
-        if (ai > bi) return 1;
-        if (ai < bi) return -1;
+        if (ai > bi) { return 1; }
+        if (ai < bi) { return -1; }
     }
     return 0;
 }
@@ -45,7 +45,7 @@ const VERSION_MODAL_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 function getCurrentExtensionVersion(extensionId: string): string | null {
     const extension = vscode.extensions.getExtension(extensionId);
-    return (extension as any)?.packageJSON?.version || null;
+    return (extension?.packageJSON as { version: string } | undefined)?.version || null;
 }
 
 export function getInstalledExtensionVersions(): {
@@ -151,8 +151,8 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
 
         if (!codexEditorVersion || !frontierAuthVersion) {
             const missingExtensions: string[] = [];
-            if (!codexEditorVersion) missingExtensions.push("Codex Editor");
-            if (!frontierAuthVersion) missingExtensions.push("Frontier Authentication");
+            if (!codexEditorVersion) { missingExtensions.push("Codex Editor"); }
+            if (!frontierAuthVersion) { missingExtensions.push("Frontier Authentication"); }
 
             console.error(
                 `[MetadataVersionChecker] ❌ Missing required extensions: ${missingExtensions.join(", ")}`
@@ -188,8 +188,8 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
         if (!metadataCodexVersion || !metadataFrontierVersion) {
             debug("[MetadataVersionChecker] ➕ Adding missing extension version requirements to metadata");
             needsUpdate = true;
-            if (!metadataCodexVersion) versionsToUpdate.codexEditor = codexEditorVersion;
-            if (!metadataFrontierVersion) versionsToUpdate.frontierAuthentication = frontierAuthVersion;
+            if (!metadataCodexVersion) { versionsToUpdate.codexEditor = codexEditorVersion; }
+            if (!metadataFrontierVersion) { versionsToUpdate.frontierAuthentication = frontierAuthVersion; }
         }
 
         if (metadataCodexVersion) {
@@ -319,12 +319,12 @@ export function buildOutdatedExtensionsMessage(outdatedExtensions: ExtensionVers
     const names = outdatedExtensions.map((e) => e.displayName);
 
     const formatNames = (arr: string[]): string => {
-        if (arr.length <= 1) return arr[0] || "";
-        if (arr.length === 2) return `${arr[0]} and ${arr[1]}`;
+        if (arr.length <= 1) { return arr[0] || ""; }
+        if (arr.length === 2) { return `${arr[0]} and ${arr[1]}`; }
         return `${arr.slice(0, -1).join(", ")}, and ${arr[arr.length - 1]}`;
     };
 
-    if (names.length === 0) return "To sync, update:"; // safety fallback
+    if (names.length === 0) { return "To sync, update:"; } // safety fallback
     const bullets = names.map((n) => `- ${n}`).join("\n");
     return `To sync, update:\n${bullets}`;
 }
@@ -436,7 +436,7 @@ export function registerVersionCheckCommands(context: vscode.ExtensionContext): 
         async (): Promise<boolean> => {
             try {
                 const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-                if (!workspacePath) return true;
+                if (!workspacePath) { return true; }
 
                 // Mimic the remote metadata fetch/check
                 const { getInstalledExtensionVersions } = await import("./extensionVersionChecker");
@@ -467,8 +467,8 @@ export function registerVersionCheckCommands(context: vscode.ExtensionContext): 
                                 const required = remoteMetadata.meta?.requiredExtensions;
                                 if (required) {
                                     const { codexEditorVersion, frontierAuthVersion } = getInstalledExtensionVersions();
-                                    if (required.codexEditor && codexEditorVersion && compareVersions(codexEditorVersion, required.codexEditor) < 0) mismatch = true;
-                                    if (required.frontierAuthentication && frontierAuthVersion && compareVersions(frontierAuthVersion, required.frontierAuthentication) < 0) mismatch = true;
+                                    if (required.codexEditor && codexEditorVersion && compareVersions(codexEditorVersion, required.codexEditor) < 0) { mismatch = true; }
+                                    if (required.frontierAuthentication && frontierAuthVersion && compareVersions(frontierAuthVersion, required.frontierAuthentication) < 0) { mismatch = true; }
                                 }
                             } catch {}
                         }

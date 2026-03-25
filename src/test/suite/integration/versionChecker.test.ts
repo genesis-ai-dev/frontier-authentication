@@ -44,7 +44,7 @@ suite("Integration: extensionVersionChecker", () => {
             return "Update Extensions"; // simulate user clicking
         };
         (vscode.commands.executeCommand as any) = async (cmd: string) => {
-            if (cmd === "workbench.view.extensions") openedExtensions = true;
+            if (cmd === "workbench.view.extensions") { openedExtensions = true; }
             return undefined;
         };
 

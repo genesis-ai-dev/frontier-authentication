@@ -99,7 +99,7 @@ export class SCMManager {
             const settingsPath = path.join(workspacePath, ".project", "localProjectSettings.json");
             const content = await fs.promises.readFile(settingsPath, "utf8");
             const settings = JSON.parse(content);
-            if (!settings.lfsSourceRemoteUrl) return;
+            if (!settings.lfsSourceRemoteUrl) { return; }
             delete settings.lfsSourceRemoteUrl;
             await fs.promises.writeFile(settingsPath, JSON.stringify(settings, null, 4));
         } catch {
