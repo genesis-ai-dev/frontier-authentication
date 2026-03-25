@@ -15,6 +15,7 @@ import {
     getInstalledExtensionVersions,
     handleOutdatedExtensionsForSync,
     ExtensionVersionInfo,
+    checkPinnedExtensionsForSync,
 } from "../utils/extensionVersionChecker";
 
 export class SCMManager {
@@ -415,6 +416,20 @@ export class SCMManager {
         });
     }
 
+    private async handleRemotePinValidation(
+        remotePins: Record<string, { version: string; url: string }> | undefined,
+        isManualSync: boolean
+    ): Promise<{ canSync: boolean; pinnedIds: Set<string> }> {
+        // Write remote pins to workspaceState so the Codex Conductor
+        // (workbench contribution) can pick them up via IStorageService,
+        // even if sync aborts before merge lands metadata.json on disk.
+        await this.context.workspaceState.update("remotePinnedExtensions", remotePins);
+
+        // Use the shared utility to check for mismatches, respect cooldowns, and show notifications.
+        // This ensures remote pin detection behaves exactly like the local sync-gate.
+        return await checkPinnedExtensionsForSync(this.context, isManualSync, remotePins);
+    }
+
     async syncChanges(
         options?: { commitMessage?: string },
         isManualSync: boolean = false
@@ -526,8 +541,18 @@ export class SCMManager {
                                         codexEditor?: string;
                                         frontierAuthentication?: string;
                                     };
+                                    pinnedExtensions?: Record<string, { version: string; url: string }>;
                                 };
                             };
+
+                            // Write remote pins to workspaceState and check for mismatches.
+                            // Pins override requiredExtensions version checks.
+                            const remotePins = remoteMetadata.meta?.pinnedExtensions;
+                            const { canSync: canSyncPins, pinnedIds } =
+                                await this.handleRemotePinValidation(remotePins, isManualSync);
+                            if (!canSyncPins) {
+                                return { hasConflicts: false };
+                            }
 
                             const required = remoteMetadata.meta?.requiredExtensions;
                             if (required) {
@@ -538,6 +563,7 @@ export class SCMManager {
                                 if (
                                     required.codexEditor &&
                                     codexEditorVersion &&
+                                    !pinnedIds.has("project-accelerate.codex-editor-extension") &&
                                     compareVersions(codexEditorVersion, required.codexEditor) < 0
                                 ) {
                                     outdated.push({
@@ -553,6 +579,7 @@ export class SCMManager {
                                 if (
                                     required.frontierAuthentication &&
                                     frontierAuthVersion &&
+                                    !pinnedIds.has("frontier-rnd.frontier-authentication") &&
                                     compareVersions(
                                         frontierAuthVersion,
                                         required.frontierAuthentication
