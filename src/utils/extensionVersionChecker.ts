@@ -414,6 +414,120 @@ export async function checkMetadataVersionsForSync(
     return false;
 }
 
+// ── Pinned extension sync gate ──────────────────────────────────────────────
+
+export interface PinnedExtensionEntry {
+    version: string;
+    url: string;
+}
+
+export type PinnedExtensions = Record<string, PinnedExtensionEntry>;
+
+/** Type guard to validate the PinnedExtensions structure. */
+export function isPinnedExtensions(obj: unknown): obj is PinnedExtensions {
+    if (!obj || typeof obj !== "object") {
+        return false;
+    }
+    for (const [key, value] of Object.entries(obj)) {
+        if (typeof key !== "string") {
+            return false;
+        }
+        const entry = value as Partial<PinnedExtensionEntry>;
+        if (typeof entry?.version !== "string" || typeof entry?.url !== "string") {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Reads pinnedExtensions from the local metadata.json.
+ * Returns the map if present, or undefined if absent/unreadable.
+ */
+async function readLocalPinnedExtensions(): Promise<PinnedExtensions | undefined> {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+        return undefined;
+    }
+    try {
+        const metadataUri = vscode.Uri.joinPath(workspaceFolder.uri, "metadata.json");
+        const content = await vscode.workspace.fs.readFile(metadataUri);
+        const metadata = JSON.parse(new TextDecoder().decode(content));
+        const pins = metadata?.meta?.pinnedExtensions;
+        return isPinnedExtensions(pins) ? pins : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+interface PinnedExtensionMismatch {
+    extensionId: string;
+    pinnedVersion: string;
+    runningVersion: string | null;
+}
+
+/** Strip publisher prefix and -extension suffix, title-case the rest. */
+function extensionDisplayName(extensionId: string): string {
+    const name = extensionId.includes(".")
+        ? extensionId.slice(extensionId.indexOf(".") + 1)
+        : extensionId;
+    return name
+        .replace(/-extension$/, "")
+        .split("-")
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ");
+}
+
+/**
+ * Compares running extension versions against pinnedExtensions.
+ * Returns mismatches (pin exists but running version differs).
+ */
+export function findPinMismatches(pins: PinnedExtensions): PinnedExtensionMismatch[] {
+    const mismatches: PinnedExtensionMismatch[] = [];
+
+    for (const [extensionId, pin] of Object.entries(pins)) {
+        const runningVersion = getCurrentExtensionVersion(extensionId);
+
+        if (!runningVersion || compareVersions(runningVersion, pin.version) !== 0) {
+            mismatches.push({ extensionId, pinnedVersion: pin.version, runningVersion });
+        }
+    }
+
+    return mismatches;
+}
+
+function buildPinMismatchMessage(mismatches: PinnedExtensionMismatch[]): string {
+    const bullets = mismatches
+        .map((m) => `- ${extensionDisplayName(m.extensionId)} (pinned to v${m.pinnedVersion})`)
+        .join("\n");
+    return `To sync, reload Codex:\n${bullets}`;
+}
+
+/**
+ * Shows a non-modal notification for pin mismatches. Always returns false —
+ * either the user reloads (killing this session) or dismisses (blocking sync).
+ */
+async function showPinMismatchNotification(
+    mismatches: PinnedExtensionMismatch[]
+): Promise<false> {
+    const message = buildPinMismatchMessage(mismatches);
+
+    try {
+        const selection = await vscode.window.showInformationMessage(
+            message,
+            "Reload Codex"
+        );
+
+        if (selection === "Reload Codex") {
+            await vscode.commands.executeCommand("workbench.action.reloadWindow");
+        }
+    } catch (error) {
+        console.error("[PinVersionChecker] Error showing notification:", error);
+    }
+
+    return false;
+}
+
 export function registerVersionCheckCommands(context: vscode.ExtensionContext): void {
     // Generic check command that other extensions (e.g., Codex) can call
     vscode.commands.registerCommand(
