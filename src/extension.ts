@@ -149,6 +149,8 @@ export interface FrontierAPI {
     /** Returns true when git operations can succeed (native binary OR isomorphic-git fallback). */
     isGitAvailable: () => boolean;
     retryGitBinaryDownload: () => Promise<boolean>;
+    /** Delete the downloaded git binary directory so it is re-downloaded on next reload. */
+    deleteGitBinary: () => Promise<boolean>;
 }
 
 export interface ResolvedFile {
@@ -202,8 +204,11 @@ export async function activate(context: vscode.ExtensionContext) {
     }
     while (!gitInitialized) {
         try {
-            // ensureGitBinary checks local cache first, only downloads if needed.
             const gitPaths = await gitBinaryManager.ensureGitBinary(context);
+            if (!gitPaths) {
+                console.log("[Frontier] Native git unavailable — continuing with builtin sync");
+                break;
+            }
             dugiteGit.setGitBinaryPath(gitPaths.localGitDir, gitPaths.execPath);
 
             const askpassPath = path.join(context.extensionPath, "dist", "askpass.js");
@@ -218,43 +223,7 @@ export async function activate(context: vscode.ExtensionContext) {
             gitInitialized = true;
         } catch (error) {
             console.error("[Frontier] Failed to initialize git binary:", error);
-
-            // If offline, skip the retry prompt — there's nothing to download.
-            let online = false;
-            try {
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 3000);
-                const resp = await fetch("https://www.google.com", {
-                    method: "HEAD",
-                    signal: controller.signal,
-                });
-                online = resp.ok;
-                clearTimeout(timeout);
-            } catch {
-                online = false;
-            }
-
-            if (!online) {
-                console.log("[Frontier] Offline — git binary not cached locally, continuing without sync");
-                break;
-            }
-
-            const autoContinue = new Promise<string | undefined>((resolve) =>
-                setTimeout(() => resolve(undefined), 15_000)
-            );
-            const choice = await Promise.race([
-                vscode.window.showErrorMessage(
-                    "Sync setup couldn't be completed. You can still work offline, but syncing " +
-                    "won't be available until setup finishes. You can retry from Sync Settings.",
-                    "Retry Now",
-                    "Continue Offline",
-                ),
-                autoContinue,
-            ]);
-            if (choice !== "Retry Now") {
-                break;
-            }
-            gitBinaryManager.resetResolvedPaths();
+            break;
         }
     }
 
@@ -617,6 +586,9 @@ export async function activate(context: vscode.ExtensionContext) {
             try {
                 gitBinaryManager.resetResolvedPaths();
                 const gitPaths = await gitBinaryManager.ensureGitBinary(context);
+                if (!gitPaths) {
+                    return false;
+                }
                 dugiteGit.setGitBinaryPath(gitPaths.localGitDir, gitPaths.execPath);
 
                 const askpassPath = path.join(context.extensionPath, "dist", "askpass.js");
@@ -631,6 +603,21 @@ export async function activate(context: vscode.ExtensionContext) {
                 return true;
             } catch (error) {
                 console.error("[Frontier] Git binary retry failed:", error);
+                return false;
+            }
+        },
+
+        deleteGitBinary: async (): Promise<boolean> => {
+            try {
+                gitBinaryManager.resetResolvedPaths();
+                const fsModule = await import("fs");
+                const gitDir = path.join(context.globalStorageUri.fsPath, "git");
+                await fsModule.promises.rm(gitDir, { recursive: true, force: true });
+                await gitBinaryManager.resetGitRetryCount(context);
+                console.log("[Frontier] Git binary directory deleted:", gitDir);
+                return true;
+            } catch (error) {
+                console.error("[Frontier] Failed to delete git binary:", error);
                 return false;
             }
         },

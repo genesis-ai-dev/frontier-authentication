@@ -23,6 +23,51 @@ import { promisify } from "util";
 const execFileAsync = promisify(execFileCb);
 
 // ---------------------------------------------------------------------------
+// Integrity helpers (self-contained — no cross-extension imports)
+// ---------------------------------------------------------------------------
+
+const HASH_MARKER = "sha256.txt";
+const MAX_BINARY_RETRIES = 3;
+const RETRY_KEY = "binaryRetryCount.git";
+
+const computeGitBinaryHash = (filePath: string): Promise<string> =>
+    new Promise((resolve, reject) => {
+        const hash = crypto.createHash("sha256");
+        const stream = fs.createReadStream(filePath);
+        stream.on("data", (chunk) => hash.update(chunk));
+        stream.on("end", () => resolve(hash.digest("hex")));
+        stream.on("error", reject);
+    });
+
+const writeGitHashMarker = (dir: string, hash: string): void => {
+    fs.writeFileSync(path.join(dir, HASH_MARKER), hash, "utf8");
+};
+
+const readGitHashMarker = (dir: string): string | null => {
+    try {
+        return fs.readFileSync(path.join(dir, HASH_MARKER), "utf8").trim();
+    } catch {
+        return null;
+    }
+};
+
+const getGitRetryCount = (ctx: vscode.ExtensionContext): number =>
+    ctx.globalState.get<number>(RETRY_KEY) ?? 0;
+
+const incrementGitRetryCount = async (ctx: vscode.ExtensionContext): Promise<number> => {
+    const count = getGitRetryCount(ctx) + 1;
+    await ctx.globalState.update(RETRY_KEY, count);
+    return count;
+};
+
+export const resetGitRetryCount = async (ctx: vscode.ExtensionContext): Promise<void> => {
+    await ctx.globalState.update(RETRY_KEY, 0);
+};
+
+const hasExceededGitRetries = (ctx: vscode.ExtensionContext): boolean =>
+    getGitRetryCount(ctx) >= MAX_BINARY_RETRIES;
+
+// ---------------------------------------------------------------------------
 // Configuration — pin to a specific dugite-native release
 // ---------------------------------------------------------------------------
 
@@ -66,7 +111,7 @@ interface GitHubRelease {
 // ---------------------------------------------------------------------------
 
 let resolvedPaths: GitBinaryPaths | undefined;
-let inflightEnsure: Promise<GitBinaryPaths> | undefined;
+let inflightEnsure: Promise<GitBinaryPaths | undefined> | undefined;
 
 /** Returns the currently resolved paths, or undefined if not yet initialized. */
 export function getResolvedPath(): GitBinaryPaths | undefined {
@@ -86,17 +131,19 @@ export function resetResolvedPaths(): void {
  * Ensure the git binary is available. Downloads if needed.
  * Call this during extension activation.
  *
+ * Returns `undefined` when the native binary cannot be obtained
+ * (retries exhausted, offline, unsupported platform). The caller
+ * should fall back to isomorphic-git silently.
+ *
  * @param context The VS Code extension context (for globalStorageUri)
- * @returns Resolved paths to the git binary
+ * @returns Resolved paths to the git binary, or undefined if unavailable
  */
 export async function ensureGitBinary(
     context: vscode.ExtensionContext,
-): Promise<GitBinaryPaths> {
+): Promise<GitBinaryPaths | undefined> {
     if (resolvedPaths) {
         return resolvedPaths;
     }
-    // Deduplicate concurrent callers — only the first triggers the download,
-    // subsequent callers await the same promise.
     if (inflightEnsure) {
         return inflightEnsure;
     }
@@ -106,9 +153,17 @@ export async function ensureGitBinary(
 
 async function doEnsureGitBinary(
     context: vscode.ExtensionContext,
-): Promise<GitBinaryPaths> {
+): Promise<GitBinaryPaths | undefined> {
     if (resolvedPaths) {
         return resolvedPaths;
+    }
+
+    const gitMode = vscode.workspace
+        .getConfiguration("codex-editor")
+        .get<string>("gitBackendMode");
+    if (gitMode === "force-builtin") {
+        console.log("[GitBinaryManager] force-builtin mode — skipping native binary download");
+        return undefined;
     }
 
     const storageDir = context.globalStorageUri.fsPath;
@@ -116,11 +171,54 @@ async function doEnsureGitBinary(
 
     const gitRootDir = path.join(storageDir, "git", DUGITE_NATIVE_TAG);
 
-    // Check if already downloaded and valid
+    // Check if already downloaded and valid (file exists + permissions)
     if (await isValidInstallation(gitRootDir)) {
-        resolvedPaths = buildPaths(gitRootDir);
-        console.log("[GitBinaryManager] Using existing git binary at:", gitRootDir);
-        return resolvedPaths;
+        // Verify SHA-256 marker if one exists (pre-integrity installs have no marker)
+        const storedHash = readGitHashMarker(gitRootDir);
+        const gitBin = process.platform === "win32"
+            ? path.join(gitRootDir, "cmd", "git.exe")
+            : path.join(gitRootDir, "bin", "git");
+        let integrityOk = true;
+
+        if (storedHash) {
+            try {
+                const actualHash = await computeGitBinaryHash(gitBin);
+                integrityOk = actualHash === storedHash;
+                if (!integrityOk) {
+                    console.warn("[GitBinaryManager] SHA-256 mismatch — cached binary may be corrupt");
+                }
+            } catch {
+                integrityOk = false;
+            }
+        }
+
+        if (integrityOk) {
+            // Run an execution test to confirm the binary works
+            try {
+                await verifyGitRuns(gitRootDir);
+                await resetGitRetryCount(context);
+                resolvedPaths = buildPaths(gitRootDir);
+                console.log("[GitBinaryManager] Using existing git binary at:", gitRootDir);
+                return resolvedPaths;
+            } catch (err) {
+                console.warn("[GitBinaryManager] Cached binary failed execution test:", err);
+            }
+        }
+
+        // Integrity or execution test failed — attempt re-download
+        if (hasExceededGitRetries(context)) {
+            console.warn("[GitBinaryManager] Retry limit reached — falling back to builtin sync");
+            return undefined;
+        }
+        await incrementGitRetryCount(context);
+        console.warn("[GitBinaryManager] Deleting cached installation for re-download");
+        await fs.promises.rm(gitRootDir, { recursive: true, force: true }).catch(() => { });
+    }
+
+    // Bail out if retry counter exceeded before attempting download
+    if (hasExceededGitRetries(context)) {
+        console.warn("[GitBinaryManager] Retry limit reached — falling back to builtin sync");
+        return undefined;
     }
 
     // Fast-fail when offline: no point retrying downloads that cannot succeed.
@@ -136,9 +234,8 @@ async function doEnsureGitBinary(
             throw new Error("GitHub API unreachable");
         }
     } catch {
-        throw new Error(
-            "Git binary is not cached and the network is unavailable. Sync features require an initial online setup."
-        );
+        console.warn("[GitBinaryManager] Offline — native git unavailable, falling back to builtin sync");
+        return undefined;
     }
 
     // Download with progress UI, retrying the entire flow up to MAX_FULL_RETRIES times
@@ -206,6 +303,19 @@ async function doEnsureGitBinary(
 
                     await verifyGitRuns(gitRootDir);
 
+                    // Write SHA-256 marker for startup re-verification
+                    const installedGitBin = process.platform === "win32"
+                        ? path.join(gitRootDir, "cmd", "git.exe")
+                        : path.join(gitRootDir, "bin", "git");
+                    try {
+                        const hash = await computeGitBinaryHash(installedGitBin);
+                        writeGitHashMarker(gitRootDir, hash);
+                        console.log(`[GitBinaryManager] SHA-256 of installed binary: ${hash}`);
+                    } catch (hashErr) {
+                        console.warn("[GitBinaryManager] Could not write SHA-256 marker:", hashErr);
+                    }
+
+                    await resetGitRetryCount(context);
                     console.log("[GitBinaryManager] Git binary installed at:", gitRootDir);
                     return; // Success
                 } catch (error) {
@@ -226,6 +336,7 @@ async function doEnsureGitBinary(
                 }
             }
 
+            await incrementGitRetryCount(context);
             throw lastError ?? new Error("Git binary download failed after all retries");
         },
     );
