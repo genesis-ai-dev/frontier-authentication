@@ -1,6 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 import {
+    compareVersions,
     findPinMismatches,
     checkPinnedExtensionsForSync,
     PinnedExtensions,
@@ -53,6 +54,28 @@ suite("Integration: Pinning Logic", () => {
 
         const mismatches = findPinMismatches(pins);
         assert.strictEqual(mismatches.length, 0);
+    });
+
+    test("findPinMismatches requires exact string equality for pin versions", () => {
+        const pins: PinnedExtensions = {
+            "project-accelerate.codex-editor-extension": {
+                version: "0.24.0-pr123",
+                url: "http://example.com/vsix"
+            }
+        };
+
+        const mismatches = findPinMismatches(pins);
+        assert.strictEqual(mismatches.length, 1);
+        assert.strictEqual(mismatches[0].runningVersion, "0.24.0");
+        assert.strictEqual(mismatches[0].pinnedVersion, "0.24.0-pr123");
+    });
+
+    test("compareVersions ignores prerelease affixes for required version checks", () => {
+        assert.strictEqual(compareVersions("0.24.1", "0.24.1-pr123"), 0);
+        assert.strictEqual(compareVersions("0.24.1-pr122", "0.24.1-pr123"), 0);
+        assert.strictEqual(compareVersions("0.24.2-pr1", "0.24.1"), 1);
+        assert.strictEqual(compareVersions("0.24.1-pr5-abc1234", "0.24.1"), 0);
+        assert.strictEqual(compareVersions("0.24.1-pr5-abc1234", "0.24.2"), -1);
     });
 
     test("checkPinnedExtensionsForSync shows non-modal notification and blocks sync", async () => {

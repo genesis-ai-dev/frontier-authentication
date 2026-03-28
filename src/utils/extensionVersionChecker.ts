@@ -8,16 +8,18 @@ import * as vscode from "vscode";
  * conflicts and the issues that were causing metadata.json to be deleted.
  */
 
-// Lightweight version comparator to avoid external semver dependency
+// Compare only the numeric x.y.z core. Affixes like -pr123 or -pr123-shorthash are ignored.
 export function compareVersions(a: string, b: string): number {
-    const normalize = (v: string) => v.trim().replace(/^v/i, "");
-    const parse = (v: string) => normalize(v).split(".").map((x) => parseInt(x, 10));
-    const pa = parse(a);
-    const pb = parse(b);
-    const len = Math.max(pa.length, pb.length);
-    for (let i = 0; i < len; i++) {
-        const ai = pa[i] ?? 0;
-        const bi = pb[i] ?? 0;
+    const pa = extractCoreVersionParts(a);
+    const pb = extractCoreVersionParts(b);
+
+    if (!pa || !pb) {
+        throw new Error(`Invalid version core: a=${a}, b=${b}`);
+    }
+
+    for (let i = 0; i < 3; i++) {
+        const ai = pa[i];
+        const bi = pb[i];
         if (ai > bi) { return 1; }
         if (ai < bi) { return -1; }
     }
@@ -46,6 +48,60 @@ const VERSION_MODAL_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
 function getCurrentExtensionVersion(extensionId: string): string | null {
     const extension = vscode.extensions.getExtension(extensionId);
     return (extension?.packageJSON as { version: string } | undefined)?.version || null;
+}
+
+function extractCoreVersionParts(version: string): [number, number, number] | null {
+    const match = version.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/i);
+    if (!match) {
+        return null;
+    }
+
+    return [
+        parseInt(match[1], 10),
+        parseInt(match[2], 10),
+        parseInt(match[3], 10),
+    ];
+}
+
+export type RequiredVersionCheckResult =
+    | { kind: "ok"; comparison: -1 | 0 | 1 }
+    | { kind: "invalid_required" }
+    | { kind: "unknown_current" };
+
+export function checkRequiredVersion(
+    currentVersion: string | null,
+    requiredVersion: string,
+    extensionName: string
+): RequiredVersionCheckResult {
+    const requiredCore = extractCoreVersionParts(requiredVersion);
+    if (!requiredCore) {
+        console.warn(
+            `[MetadataVersionChecker] Invalid required version for ${extensionName}: ${requiredVersion}. Expected x.y.z. Allowing sync.`
+        );
+        return { kind: "invalid_required" };
+    }
+
+    if (!currentVersion) {
+        console.error(
+            `[MetadataVersionChecker] Missing installed version for ${extensionName} while required version ${requiredVersion} is set. Blocking sync.`
+        );
+        return { kind: "unknown_current" };
+    }
+
+    const currentCore = extractCoreVersionParts(currentVersion);
+    if (!currentCore) {
+        console.error(
+            `[MetadataVersionChecker] Unparseable installed version for ${extensionName}: ${currentVersion}. Blocking sync.`
+        );
+        return { kind: "unknown_current" };
+    }
+
+    for (let i = 0; i < 3; i++) {
+        if (currentCore[i] > requiredCore[i]) { return { kind: "ok", comparison: 1 }; }
+        if (currentCore[i] < requiredCore[i]) { return { kind: "ok", comparison: -1 }; }
+    }
+
+    return { kind: "ok", comparison: 0 };
 }
 
 export function getInstalledExtensionVersions(): {
@@ -193,7 +249,21 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
         }
 
         if (metadataCodexVersion) {
-            if (compareVersions(codexEditorVersion, metadataCodexVersion) < 0) {
+            const codexCheck = checkRequiredVersion(
+                codexEditorVersion,
+                metadataCodexVersion,
+                "Codex Editor"
+            );
+            if (codexCheck.kind === "unknown_current") {
+                return {
+                    canSync: false,
+                    metadataUpdated: false,
+                    reason: `Could not determine installed version for Codex Editor`,
+                    needsUserAction: true,
+                };
+            }
+
+            if (codexCheck.kind === "ok" && codexCheck.comparison < 0) {
                 console.warn(
                     `[MetadataVersionChecker] ⚠️  Codex Editor outdated: ${codexEditorVersion} < ${metadataCodexVersion}`
                 );
@@ -205,7 +275,7 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
                     downloadUrl: "",
                     displayName: "Codex Editor",
                 });
-            } else if (compareVersions(codexEditorVersion, metadataCodexVersion) > 0) {
+            } else if (codexCheck.kind === "ok" && codexCheck.comparison > 0) {
                 debug(
                     `[MetadataVersionChecker] 🚀 Updating Codex Editor version: ${metadataCodexVersion} → ${codexEditorVersion}`
                 );
@@ -215,7 +285,21 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
         }
 
         if (metadataFrontierVersion) {
-            if (compareVersions(frontierAuthVersion, metadataFrontierVersion) < 0) {
+            const frontierCheck = checkRequiredVersion(
+                frontierAuthVersion,
+                metadataFrontierVersion,
+                "Frontier Authentication"
+            );
+            if (frontierCheck.kind === "unknown_current") {
+                return {
+                    canSync: false,
+                    metadataUpdated: false,
+                    reason: `Could not determine installed version for Frontier Authentication`,
+                    needsUserAction: true,
+                };
+            }
+
+            if (frontierCheck.kind === "ok" && frontierCheck.comparison < 0) {
                 console.warn(
                     `[MetadataVersionChecker] ⚠️  Frontier Authentication outdated: ${frontierAuthVersion} < ${metadataFrontierVersion}`
                 );
@@ -227,7 +311,7 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
                     downloadUrl: "",
                     displayName: "Frontier Authentication",
                 });
-            } else if (compareVersions(frontierAuthVersion, metadataFrontierVersion) > 0) {
+            } else if (frontierCheck.kind === "ok" && frontierCheck.comparison > 0) {
                 debug(
                     `[MetadataVersionChecker] 🚀 Updating Frontier Authentication version: ${metadataFrontierVersion} → ${frontierAuthVersion}`
                 );
@@ -504,7 +588,7 @@ export function findPinMismatches(pins: PinnedExtensions): PinnedExtensionMismat
     for (const [extensionId, pin] of Object.entries(pins)) {
         const runningVersion = getCurrentExtensionVersion(extensionId);
 
-        if (!runningVersion || compareVersions(runningVersion, pin.version) !== 0) {
+        if (!runningVersion || runningVersion !== pin.version) {
             mismatches.push({ extensionId, pinnedVersion: pin.version, runningVersion });
         }
     }
@@ -611,7 +695,6 @@ export function registerVersionCheckCommands(context: vscode.ExtensionContext): 
 
                 // Mimic the remote metadata fetch/check
                 const { getInstalledExtensionVersions } = await import("./extensionVersionChecker");
-                const { compareVersions } = await import("./extensionVersionChecker");
 
                 // Fetch remote refs and read remote metadata.json (best effort)
                 try {
@@ -638,8 +721,32 @@ export function registerVersionCheckCommands(context: vscode.ExtensionContext): 
                                 const required = remoteMetadata.meta?.requiredExtensions;
                                 if (required) {
                                     const { codexEditorVersion, frontierAuthVersion } = getInstalledExtensionVersions();
-                                    if (required.codexEditor && codexEditorVersion && compareVersions(codexEditorVersion, required.codexEditor) < 0) { mismatch = true; }
-                                    if (required.frontierAuthentication && frontierAuthVersion && compareVersions(frontierAuthVersion, required.frontierAuthentication) < 0) { mismatch = true; }
+                                    if (required.codexEditor) {
+                                        const codexCheck = checkRequiredVersion(
+                                            codexEditorVersion,
+                                            required.codexEditor,
+                                            "Codex Editor"
+                                        );
+                                        if (
+                                            codexCheck.kind === "unknown_current" ||
+                                            (codexCheck.kind === "ok" && codexCheck.comparison < 0)
+                                        ) {
+                                            mismatch = true;
+                                        }
+                                    }
+                                    if (required.frontierAuthentication) {
+                                        const frontierCheck = checkRequiredVersion(
+                                            frontierAuthVersion,
+                                            required.frontierAuthentication,
+                                            "Frontier Authentication"
+                                        );
+                                        if (
+                                            frontierCheck.kind === "unknown_current" ||
+                                            (frontierCheck.kind === "ok" && frontierCheck.comparison < 0)
+                                        ) {
+                                            mismatch = true;
+                                        }
+                                    }
                                 }
                             } catch {}
                         }

@@ -11,12 +11,11 @@ import { ResolvedFile } from "../extension";
 import { MediaFilesStrategy } from "../types/state";
 import { checkMetadataVersionsForSync } from "../utils/extensionVersionChecker";
 import {
-    compareVersions,
+    checkRequiredVersion,
     getInstalledExtensionVersions,
     handleOutdatedExtensionsForSync,
     ExtensionVersionInfo,
     checkPinnedExtensionsForSync,
-    findPinMismatches,
 } from "../utils/extensionVersionChecker";
 
 export class SCMManager {
@@ -563,13 +562,22 @@ export class SCMManager {
 
                                 if (
                                     required.codexEditor &&
-                                    codexEditorVersion &&
                                     !pinnedIds.has("project-accelerate.codex-editor-extension") &&
-                                    compareVersions(codexEditorVersion, required.codexEditor) < 0
+                                    (() => {
+                                        const codexCheck = checkRequiredVersion(
+                                            codexEditorVersion,
+                                            required.codexEditor,
+                                            "Codex Editor"
+                                        );
+                                        return (
+                                            codexCheck.kind === "unknown_current" ||
+                                            (codexCheck.kind === "ok" && codexCheck.comparison < 0)
+                                        );
+                                    })()
                                 ) {
                                     outdated.push({
                                         extensionId: "project-accelerate.codex-editor-extension",
-                                        currentVersion: codexEditorVersion,
+                                        currentVersion: codexEditorVersion ?? "unknown",
                                         latestVersion: required.codexEditor,
                                         isOutdated: true,
                                         downloadUrl: "",
@@ -579,16 +587,22 @@ export class SCMManager {
 
                                 if (
                                     required.frontierAuthentication &&
-                                    frontierAuthVersion &&
                                     !pinnedIds.has("frontier-rnd.frontier-authentication") &&
-                                    compareVersions(
-                                        frontierAuthVersion,
-                                        required.frontierAuthentication
-                                    ) < 0
+                                    (() => {
+                                        const frontierCheck = checkRequiredVersion(
+                                            frontierAuthVersion,
+                                            required.frontierAuthentication,
+                                            "Frontier Authentication"
+                                        );
+                                        return (
+                                            frontierCheck.kind === "unknown_current" ||
+                                            (frontierCheck.kind === "ok" && frontierCheck.comparison < 0)
+                                        );
+                                    })()
                                 ) {
                                     outdated.push({
                                         extensionId: "frontier-rnd.frontier-authentication",
-                                        currentVersion: frontierAuthVersion,
+                                        currentVersion: frontierAuthVersion ?? "unknown",
                                         latestVersion: required.frontierAuthentication,
                                         isOutdated: true,
                                         downloadUrl: "",
