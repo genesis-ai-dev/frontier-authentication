@@ -78,7 +78,7 @@ suite("Integration: Pinning Logic", () => {
         assert.strictEqual(compareVersions("0.24.1-pr5-abc1234", "0.24.2"), -1);
     });
 
-    test("checkPinnedExtensionsForSync shows non-modal notification and blocks sync", async () => {
+    test("checkPinnedExtensionsForSync shows info notification and blocks sync", async () => {
         const pins: PinnedExtensions = {
             "project-accelerate.codex-editor-extension": { version: "0.24.1", url: "http://example.com/vsix" }
         };
@@ -86,24 +86,25 @@ suite("Integration: Pinning Logic", () => {
         let shownMessage: string | undefined;
         (vscode.window.showInformationMessage as any) = async (msg: string, ...actions: string[]) => {
             shownMessage = msg;
-            return undefined; // user dismisses
+            return undefined;
         };
 
         const result = await checkPinnedExtensionsForSync({ workspaceState: { get: () => 0 } } as any, true, pins);
 
         assert.strictEqual(result.canSync, false);
+        assert.ok(shownMessage?.includes("Extension version pin detected"));
         assert.ok(shownMessage?.includes("Codex Editor"));
         assert.ok(shownMessage?.includes("pinned to v0.24.1"));
     });
 
-    test("checkPinnedExtensionsForSync reloads window when user clicks button", async () => {
+    test("checkPinnedExtensionsForSync does not reload — Conductor owns reload UX", async () => {
         const pins: PinnedExtensions = {
             "project-accelerate.codex-editor-extension": { version: "0.24.1", url: "http://example.com/vsix" }
         };
 
         let reloaded = false;
         (vscode.window.showInformationMessage as any) = async (msg: string, ...actions: string[]) => {
-            return "Reload Codex";
+            return undefined; // no reload button to click
         };
         (vscode.commands.executeCommand as any) = async (cmd: string) => {
             if (cmd === "workbench.action.reloadWindow") { reloaded = true; }
@@ -113,6 +114,6 @@ suite("Integration: Pinning Logic", () => {
         const result = await checkPinnedExtensionsForSync({ workspaceState: { get: () => 0 } } as any, true, pins);
 
         assert.strictEqual(result.canSync, false);
-        assert.strictEqual(reloaded, true);
+        assert.strictEqual(reloaded, false);
     });
 });

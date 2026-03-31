@@ -600,12 +600,16 @@ function buildPinMismatchMessage(mismatches: PinnedExtensionMismatch[]): string 
     const bullets = mismatches
         .map((m) => `- ${extensionDisplayName(m.extensionId)} (pinned to v${m.pinnedVersion})`)
         .join("\n");
-    return `To sync, reload Codex:\n${bullets}`;
+    return `Extension version pin detected — sync paused.\n${bullets}`;
 }
 
 /**
- * Shows a non-modal notification for pin mismatches. Always returns false —
- * either the user reloads (killing this session) or dismisses (blocking sync).
+ * Shows a non-modal info notification for pin mismatches. Always returns
+ * false — sync stays blocked. No "Reload Codex" button: the Conductor
+ * (workbench contribution) owns all reload UX via authoritative reload,
+ * which guarantees the window lands in the correct profile. A plain
+ * `workbench.action.reloadWindow` would bypass that and risk a profile
+ * mismatch loop.
  */
 async function showPinMismatchNotification(
     mismatches: PinnedExtensionMismatch[]
@@ -613,14 +617,7 @@ async function showPinMismatchNotification(
     const message = buildPinMismatchMessage(mismatches);
 
     try {
-        const selection = await vscode.window.showInformationMessage(
-            message,
-            "Reload Codex"
-        );
-
-        if (selection === "Reload Codex") {
-            await vscode.commands.executeCommand("workbench.action.reloadWindow");
-        }
+        vscode.window.showInformationMessage(message);
     } catch (error) {
         console.error("[PinVersionChecker] Error showing notification:", error);
     }
