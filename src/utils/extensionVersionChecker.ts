@@ -473,10 +473,11 @@ export async function handleOutdatedExtensionsForSync(
 
 export async function checkMetadataVersionsForSync(
     context: vscode.ExtensionContext,
-    isManualSync: boolean = false
+    isManualSync: boolean = false,
+    options?: { ignoreRemotePins?: boolean }
 ): Promise<boolean> {
     // Check pinned extensions first — pins override requiredExtensions
-    const pinResult = await checkPinnedExtensionsForSync(context, isManualSync);
+    const pinResult = await checkPinnedExtensionsForSync(context, isManualSync, undefined, options);
     if (!pinResult.canSync) {
         return false;
     }
@@ -544,7 +545,7 @@ export function isPinnedExtensions(obj: unknown): obj is PinnedExtensions {
  * Reads pinnedExtensions from the local metadata.json.
  * Returns the map if present, or undefined if absent/unreadable.
  */
-async function readLocalPinnedExtensions(): Promise<PinnedExtensions | undefined> {
+export async function readLocalPinnedExtensions(): Promise<PinnedExtensions | undefined> {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
     if (!workspaceFolder) {
         return undefined;
@@ -626,7 +627,7 @@ async function showPinMismatchNotification(
 }
 
 /**
- * Checks if pinnedExtensions in metadata.json match the running versions.
+ * Checks if pinnedExtensions match the running versions.
  * If mismatched, shows a blocking modal prompting the user to reload.
  * Returns true if sync can proceed, false if blocked.
  *
@@ -636,23 +637,62 @@ async function showPinMismatchNotification(
 export async function checkPinnedExtensionsForSync(
     context: vscode.ExtensionContext,
     isManualSync: boolean,
-    pins?: PinnedExtensions
+    remotePins?: PinnedExtensions,
+    options?: { ignoreRemotePins?: boolean }
 ): Promise<{ canSync: boolean; pinnedIds: Set<string> }> {
-    const resolvedPins = pins ?? (await readLocalPinnedExtensions());
-    if (!resolvedPins || Object.keys(resolvedPins).length === 0) {
+    // 1. Check Admin Intent (Absolute Precedence)
+    // If the admin explicitly set an intent (e.g. they just applied a pin change),
+    // we bypass the remote check to allow the push.
+    const adminIntent = context.workspaceState.get<PinnedExtensions>("adminPinnedExtensions");
+    if (adminIntent && Object.keys(adminIntent).length > 0) {
+        debug("[PinVersionChecker] Admin intent active. Bypassing version checks for push.");
+        return { canSync: true, pinnedIds: new Set(Object.keys(adminIntent)) };
+    }
+
+    // 2. Check Remote Pins (Authoritative for Users)
+    if (!options?.ignoreRemotePins && remotePins && Object.keys(remotePins).length > 0) {
+        const mismatches = findPinMismatches(remotePins);
+        const pinnedIds = new Set(Object.keys(remotePins));
+
+        if (mismatches.length === 0) {
+            return { canSync: true, pinnedIds };
+        }
+
+        debug(
+            `[PinVersionChecker] Remote pin mismatch: ${mismatches
+                .map(
+                    (m) =>
+                        `${m.extensionId} running=${m.runningVersion} pinned=${m.pinnedVersion}`
+                )
+                .join(", ")}`
+        );
+
+        if (shouldShowVersionModal(context, isManualSync)) {
+            const canSync = await showPinMismatchNotification(mismatches);
+            return { canSync, pinnedIds };
+        }
+        return { canSync: false, pinnedIds };
+    }
+
+    // 3. Fall back to local pins from metadata.json
+    const localPins = await readLocalPinnedExtensions();
+    if (!localPins || Object.keys(localPins).length === 0) {
         return { canSync: true, pinnedIds: new Set() };
     }
 
-    const pinnedIds = new Set(Object.keys(resolvedPins));
-    const mismatches = findPinMismatches(resolvedPins);
+    const pinnedIds = new Set(Object.keys(localPins));
+    const mismatches = findPinMismatches(localPins);
 
     if (mismatches.length === 0) {
         return { canSync: true, pinnedIds };
     }
 
     debug(
-        `[PinVersionChecker] Pin mismatch: ${mismatches
-            .map((m) => `${m.extensionId} running=${m.runningVersion} pinned=${m.pinnedVersion}`)
+        `[PinVersionChecker] Local pin mismatch: ${mismatches
+            .map(
+                (m) =>
+                    `${m.extensionId} running=${m.runningVersion} pinned=${m.pinnedVersion}`
+            )
             .join(", ")}`
     );
 
@@ -662,7 +702,9 @@ export async function checkPinnedExtensionsForSync(
         return { canSync, pinnedIds };
     }
 
-    debug("[PinVersionChecker] Auto-sync blocked due to pin mismatch (in cooldown period)");
+    debug(
+        "[PinVersionChecker] Auto-sync blocked due to pin mismatch (in cooldown period)"
+    );
     return { canSync: false, pinnedIds };
 }
 

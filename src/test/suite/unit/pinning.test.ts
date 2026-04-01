@@ -116,4 +116,41 @@ suite("Integration: Pinning Logic", () => {
         assert.strictEqual(result.canSync, false);
         assert.strictEqual(reloaded, false);
     });
+
+    test("checkPinnedExtensionsForSync blocks sync if mismatching remote pins even if matching local", async () => {
+        const localPins: PinnedExtensions = {
+            "project-accelerate.codex-editor-extension": { version: "0.24.0", url: "http://example.com/vsix-v1" }
+        };
+        const remotePins: PinnedExtensions = {
+            "project-accelerate.codex-editor-extension": { version: "0.24.1", url: "http://example.com/vsix-v2" }
+        };
+
+        // Running version matches localPins (0.24.0) but NOT remotePins (0.24.1)
+        const result = await checkPinnedExtensionsForSync({ workspaceState: { get: () => 0 } } as any, true, remotePins);
+
+        assert.strictEqual(result.canSync, false);
+        assert.ok(result.pinnedIds.has("project-accelerate.codex-editor-extension"));
+    });
+
+    test("checkPinnedExtensionsForSync allows sync if matching remote pins even if local differs", async () => {
+        const localPins: PinnedExtensions = {
+            "project-accelerate.codex-editor-extension": { version: "0.24.0", url: "http://example.com/vsix-v1" }
+        };
+        const remotePins: PinnedExtensions = {
+            "project-accelerate.codex-editor-extension": { version: "0.24.1", url: "http://example.com/vsix-v2" }
+        };
+
+        // Running version matches remotePins (0.24.1)
+        stubbedExtensions["project-accelerate.codex-editor-extension"].packageJSON.version = "0.24.1";
+
+        try {
+            const result = await checkPinnedExtensionsForSync({ workspaceState: { get: () => 0 } } as any, true, remotePins);
+
+            assert.strictEqual(result.canSync, true);
+            assert.ok(result.pinnedIds.has("project-accelerate.codex-editor-extension"));
+        } finally {
+            // Restore version
+            stubbedExtensions["project-accelerate.codex-editor-extension"].packageJSON.version = "0.24.0";
+        }
+    });
 });
