@@ -207,6 +207,12 @@ export class GitLabService {
         throw lastError ?? new Error("Unexpected retry loop exit");
     }
 
+    private async ensureInitialized(): Promise<void> {
+        if (!this.gitlabToken || !this.gitlabBaseUrl) {
+            await this.initializeWithRetry();
+        }
+    }
+
     async initialize(): Promise<void> {
         const sessions = await this.authProvider.getSessions();
         const session = sessions[0];
@@ -262,6 +268,7 @@ export class GitLabService {
     }
 
     async getCurrentUser(): Promise<GitLabUser> {
+        await this.ensureInitialized();
         const response = await this.fetchWithRetry(`${this.gitlabBaseUrl}/api/v4/user`);
 
         if (!response.ok) {
@@ -273,6 +280,7 @@ export class GitLabService {
 
     async getProject(name: string, groupId?: string): Promise<{ id: string; url: string } | null> {
         try {
+            await this.ensureInitialized();
             const endpoint = groupId
                 ? `${this.gitlabBaseUrl}/api/v4/groups/${groupId}/projects?search=${encodeURIComponent(name)}`
                 : `${this.gitlabBaseUrl}/api/v4/users/${(await this.getCurrentUser()).id}/projects?search=${encodeURIComponent(name)}`;
@@ -305,6 +313,7 @@ export class GitLabService {
             return existingProject;
         }
 
+        await this.ensureInitialized();
         const name =
             options.name.replace(/ /g, "-").replace(/\./g, "-") || vscode.workspace.name;
         const description = options.description || "";
@@ -368,6 +377,7 @@ export class GitLabService {
     }
 
     async listGroups(): Promise<Array<{ id: number; name: string; path: string }>> {
+        await this.ensureInitialized();
         const allGroups: Array<{ id: number; name: string; path: string }> = [];
         let currentPage = 1;
         let hasNextPage = true;
@@ -418,6 +428,7 @@ export class GitLabService {
             sort?: "asc" | "desc";
         } = {},
     ): Promise<GitLabProject[]> {
+        await this.ensureInitialized();
         const allProjects: GitLabProject[] = [];
         let currentPage = 1;
         let hasNextPage = true;
@@ -491,6 +502,7 @@ export class GitLabService {
         filePath: string,
         ref: string = "main",
     ): Promise<string> {
+        await this.ensureInitialized();
         const encodedFilePath = encodeURIComponent(filePath);
         const encodedProjectId = encodeURIComponent(projectId);
         const endpoint = `${this.gitlabBaseUrl}/api/v4/projects/${encodedProjectId}/repository/files/${encodedFilePath}/raw?ref=${encodeURIComponent(ref)}`;
@@ -526,6 +538,7 @@ export class GitLabService {
         const perPage = 100;
 
         try {
+            await this.ensureInitialized();
             const encodedProjectId = encodeURIComponent(projectId);
 
             while (true) {
@@ -578,6 +591,7 @@ export class GitLabService {
     async getProjectContributors(
         projectId: string,
     ): Promise<Array<{ username: string; name: string; email: string; commits: number }>> {
+        await this.ensureInitialized();
         const encodedProjectId = encodeURIComponent(projectId);
         const endpoint = `${this.gitlabBaseUrl}/api/v4/projects/${encodedProjectId}/repository/contributors`;
 
@@ -611,6 +625,7 @@ export class GitLabService {
             roleName: string;
         }>
     > {
+        await this.ensureInitialized();
         const encodedProjectId = encodeURIComponent(projectId);
         const allMembers: any[] = [];
         let page = 1;
