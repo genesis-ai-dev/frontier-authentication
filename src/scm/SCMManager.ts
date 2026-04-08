@@ -15,7 +15,7 @@ import {
     getInstalledExtensionVersions,
     handleOutdatedExtensionsForSync,
     ExtensionVersionInfo,
-    checkPinnedExtensionsForSync,
+    checkEffectivePinsAfterFetch,
     readLocalPinnedExtensions,
 } from "../utils/extensionVersionChecker";
 
@@ -468,17 +468,16 @@ export class SCMManager {
 
     private async handleRemotePinValidation(
         remotePins: Record<string, { version: string; url: string }> | undefined,
-        isManualSync: boolean,
-        options?: { ignoreRemotePins?: boolean }
+        isManualSync: boolean
     ): Promise<{ canSync: boolean; pinnedIds: Set<string> }> {
         // Write remote pins to workspaceState so the Codex Conductor
         // (workbench contribution) can pick them up via IStorageService,
         // even if sync aborts before merge lands metadata.json on disk.
         await this.context.workspaceState.update("remotePinnedExtensions", remotePins);
 
-        // Use the shared utility to check for mismatches, respect cooldowns, and show notifications.
-        // This ensures remote pin detection behaves exactly like the local sync-gate.
-        return await checkPinnedExtensionsForSync(this.context, isManualSync, remotePins, options);
+        // Now ask the Conductor for effective pins — it sees the just-written
+        // remote pins via IStorageService and resolves them with correct priority.
+        return await checkEffectivePinsAfterFetch(this.context, isManualSync);
     }
 
     async syncChanges(
@@ -596,11 +595,11 @@ export class SCMManager {
                                 };
                             };
 
-                            // Write remote pins to workspaceState and check for mismatches.
-                            // Pins override requiredExtensions version checks.
+                            // Write remote pins to workspaceState, then ask the Conductor
+                            // for effective pins (which now include the just-fetched remote pins).
                             const remotePins = remoteMetadata.meta?.pinnedExtensions;
                             const { canSync: canSyncPins, pinnedIds } =
-                                await this.handleRemotePinValidation(remotePins, isManualSync, options);
+                                await this.handleRemotePinValidation(remotePins, isManualSync);
                             if (!canSyncPins) {
                                 return { hasConflicts: false };
                             }

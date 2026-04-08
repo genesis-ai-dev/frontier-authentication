@@ -476,8 +476,29 @@ export async function checkMetadataVersionsForSync(
     isManualSync: boolean = false,
     options?: { ignoreRemotePins?: boolean }
 ): Promise<boolean> {
-    // Check pinned extensions first — pins override requiredExtensions
-    const pinResult = await checkPinnedExtensionsForSync(context, isManualSync, undefined, options);
+    // Use Conductor's effective pin resolution (reads IStorageService directly —
+    // no dependency on frontier's workspaceState or stale disk metadata)
+    const effectivePins: PinnedExtensions | undefined =
+        await vscode.commands.executeCommand("codex.conductor.getEffectivePinnedExtensions");
+    const pinResult = (() => {
+        if (!effectivePins || Object.keys(effectivePins).length === 0) {
+            return { canSync: true, pinnedIds: new Set<string>() };
+        }
+        const pinnedIds = new Set(Object.keys(effectivePins));
+        const mismatches = findPinMismatches(effectivePins);
+        if (mismatches.length === 0) {
+            return { canSync: true, pinnedIds };
+        }
+        debug(
+            `[PinVersionChecker] Conductor pin mismatch: ${mismatches
+                .map((m) => `${m.extensionId} running=${m.runningVersion} pinned=${m.pinnedVersion}`)
+                .join(", ")}`
+        );
+        if (shouldShowVersionModal(context, isManualSync)) {
+            showPinMismatchNotification(mismatches);
+        }
+        return { canSync: false, pinnedIds };
+    })();
     if (!pinResult.canSync) {
         return false;
     }
@@ -624,6 +645,39 @@ async function showPinMismatchNotification(
     }
 
     return false;
+}
+
+/**
+ * Post-fetch pin check: after writing fresh remote pins to workspaceState,
+ * asks the Conductor for the effective pins (which now include the just-written
+ * remote pins) and validates them against running extension versions.
+ *
+ * This catches newly discovered remote pins that weren't visible to the
+ * pre-fetch check in checkMetadataVersionsForSync.
+ */
+export async function checkEffectivePinsAfterFetch(
+    context: vscode.ExtensionContext,
+    isManualSync: boolean
+): Promise<{ canSync: boolean; pinnedIds: Set<string> }> {
+    const effectivePins: PinnedExtensions | undefined =
+        await vscode.commands.executeCommand("codex.conductor.getEffectivePinnedExtensions");
+    if (!effectivePins || Object.keys(effectivePins).length === 0) {
+        return { canSync: true, pinnedIds: new Set() };
+    }
+    const pinnedIds = new Set(Object.keys(effectivePins));
+    const mismatches = findPinMismatches(effectivePins);
+    if (mismatches.length === 0) {
+        return { canSync: true, pinnedIds };
+    }
+    debug(
+        `[PinVersionChecker] Post-fetch conductor pin mismatch: ${mismatches
+            .map((m) => `${m.extensionId} running=${m.runningVersion} pinned=${m.pinnedVersion}`)
+            .join(", ")}`
+    );
+    if (shouldShowVersionModal(context, isManualSync)) {
+        showPinMismatchNotification(mismatches);
+    }
+    return { canSync: false, pinnedIds };
 }
 
 /**
