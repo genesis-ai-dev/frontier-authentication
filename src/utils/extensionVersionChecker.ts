@@ -510,7 +510,12 @@ export async function checkMetadataVersionsForSync(
     }
 
     if (result.needsUserAction && result.outdatedExtensions) {
-        // Filter out extensions that are covered by a pin
+        // Filter out extensions that are covered by a pin.
+        // TODO: If the remote just removed pinnedExtensions AND bumped requiredExtensions
+        // in the same commit, the conductor may still return stale local pins here
+        // (it falls back to local metadata.json when remote pins are empty). This would
+        // incorrectly suppress the requiredExtensions check for one sync cycle. The merge
+        // updates local metadata.json, so the next sync self-corrects.
         const nonPinnedOutdated = result.outdatedExtensions.filter(
             (ext) => !pinResult.pinnedIds.has(ext.extensionId)
         );
