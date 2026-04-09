@@ -11,10 +11,12 @@ import { ResolvedFile } from "../extension";
 import { MediaFilesStrategy } from "../types/state";
 import { checkMetadataVersionsForSync } from "../utils/extensionVersionChecker";
 import {
-    compareVersions,
+    checkRequiredVersion,
     getInstalledExtensionVersions,
     handleOutdatedExtensionsForSync,
     ExtensionVersionInfo,
+    checkEffectivePinsAfterFetch,
+    readLocalPinnedExtensions,
 } from "../utils/extensionVersionChecker";
 
 export class SCMManager {
@@ -99,7 +101,7 @@ export class SCMManager {
             const settingsPath = path.join(workspacePath, ".project", "localProjectSettings.json");
             const content = await fs.promises.readFile(settingsPath, "utf8");
             const settings = JSON.parse(content);
-            if (!settings.lfsSourceRemoteUrl) return;
+            if (!settings.lfsSourceRemoteUrl) { return; }
             delete settings.lfsSourceRemoteUrl;
             await fs.promises.writeFile(settingsPath, JSON.stringify(settings, null, 4));
         } catch {
@@ -116,9 +118,58 @@ export class SCMManager {
             )
         );
 
+        // Push pin update command (admin-only) - bypasses remote pin checks
+        this.context.subscriptions.push(
+            vscode.commands.registerCommand(
+                "frontier.pushPinUpdate",
+                (options?: { commitMessage?: string }) =>
+                    this.syncChanges(
+                        { ...options, ignoreRemotePins: true },
+                        true
+                    )
+            )
+        );
+
         // Toggle auto-sync command
         this.context.subscriptions.push(
             vscode.commands.registerCommand("frontier.toggleAutoSync", () => this.toggleAutoSync())
+        );
+
+        // Set admin pin intent - used by the Codex Conductor when an admin applies a pin change locally
+        this.context.subscriptions.push(
+            vscode.commands.registerCommand(
+                "frontier.setAdminPinIntent",
+                (pins: Record<string, { version: string; url: string }>) =>
+                    this.context.workspaceState.update("adminPinnedExtensions", pins)
+            )
+        );
+
+        // Clear admin pin intent - used to manually clear the intent override
+        this.context.subscriptions.push(
+            vscode.commands.registerCommand("frontier.clearAdminPinIntent", () =>
+                this.context.workspaceState.update("adminPinnedExtensions", undefined)
+            )
+        );
+
+        // Get remote pinned extensions
+        this.context.subscriptions.push(
+            vscode.commands.registerCommand("frontier.getRemotePinnedExtensions", () =>
+                this.context.workspaceState.get<Record<string, { version: string; url: string }>>(
+                    "remotePinnedExtensions"
+                )
+            )
+        );
+
+        // Get full remote pinned extensions state (including admin intent)
+        this.context.subscriptions.push(
+            vscode.commands.registerCommand("frontier.getRemotePinnedExtensionsState", () => ({
+                remotePinnedExtensions: this.context.workspaceState.get<
+                    Record<string, { version: string; url: string }>
+                >("remotePinnedExtensions"),
+                adminPinnedExtensions: this.context.workspaceState.get<
+                    Record<string, { version: string; url: string }>
+                >("adminPinnedExtensions"),
+            }))
         );
 
         // Commit changes command (used by SCM input box)
@@ -415,8 +466,22 @@ export class SCMManager {
         });
     }
 
+    private async handleRemotePinValidation(
+        remotePins: Record<string, { version: string; url: string }> | undefined,
+        isManualSync: boolean
+    ): Promise<{ canSync: boolean; pinnedIds: Set<string> }> {
+        // Write remote pins to workspaceState so the Codex Conductor
+        // (workbench contribution) can pick them up via IStorageService,
+        // even if sync aborts before merge lands metadata.json on disk.
+        await this.context.workspaceState.update("remotePinnedExtensions", remotePins);
+
+        // Now ask the Conductor for effective pins — it sees the just-written
+        // remote pins via IStorageService and resolves them with correct priority.
+        return await checkEffectivePinsAfterFetch(this.context, isManualSync);
+    }
+
     async syncChanges(
-        options?: { commitMessage?: string },
+        options?: { commitMessage?: string; ignoreRemotePins?: boolean },
         isManualSync: boolean = false
     ): Promise<{
         hasConflicts: boolean;
@@ -428,7 +493,7 @@ export class SCMManager {
         remoteChangedFilePaths?: string[];
     }> {
         // Check extension version compatibility with project metadata before syncing
-        const canSync = await checkMetadataVersionsForSync(this.context, isManualSync);
+        const canSync = await checkMetadataVersionsForSync(this.context, isManualSync, options);
         if (!canSync) {
             return { hasConflicts: false };
         }
@@ -526,8 +591,18 @@ export class SCMManager {
                                         codexEditor?: string;
                                         frontierAuthentication?: string;
                                     };
+                                    pinnedExtensions?: Record<string, { version: string; url: string }>;
                                 };
                             };
+
+                            // Write remote pins to workspaceState, then ask the Conductor
+                            // for effective pins (which now include the just-fetched remote pins).
+                            const remotePins = remoteMetadata.meta?.pinnedExtensions;
+                            const { canSync: canSyncPins, pinnedIds } =
+                                await this.handleRemotePinValidation(remotePins, isManualSync);
+                            if (!canSyncPins) {
+                                return { hasConflicts: false };
+                            }
 
                             const required = remoteMetadata.meta?.requiredExtensions;
                             if (required) {
@@ -537,12 +612,22 @@ export class SCMManager {
 
                                 if (
                                     required.codexEditor &&
-                                    codexEditorVersion &&
-                                    compareVersions(codexEditorVersion, required.codexEditor) < 0
+                                    !pinnedIds.has("project-accelerate.codex-editor-extension") &&
+                                    (() => {
+                                        const codexCheck = checkRequiredVersion(
+                                            codexEditorVersion,
+                                            required.codexEditor,
+                                            "Codex Editor"
+                                        );
+                                        return (
+                                            codexCheck.kind === "unknown_current" ||
+                                            (codexCheck.kind === "ok" && codexCheck.comparison < 0)
+                                        );
+                                    })()
                                 ) {
                                     outdated.push({
                                         extensionId: "project-accelerate.codex-editor-extension",
-                                        currentVersion: codexEditorVersion,
+                                        currentVersion: codexEditorVersion ?? "unknown",
                                         latestVersion: required.codexEditor,
                                         isOutdated: true,
                                         downloadUrl: "",
@@ -552,15 +637,22 @@ export class SCMManager {
 
                                 if (
                                     required.frontierAuthentication &&
-                                    frontierAuthVersion &&
-                                    compareVersions(
-                                        frontierAuthVersion,
-                                        required.frontierAuthentication
-                                    ) < 0
+                                    !pinnedIds.has("frontier-rnd.frontier-authentication") &&
+                                    (() => {
+                                        const frontierCheck = checkRequiredVersion(
+                                            frontierAuthVersion,
+                                            required.frontierAuthentication,
+                                            "Frontier Authentication"
+                                        );
+                                        return (
+                                            frontierCheck.kind === "unknown_current" ||
+                                            (frontierCheck.kind === "ok" && frontierCheck.comparison < 0)
+                                        );
+                                    })()
                                 ) {
                                     outdated.push({
                                         extensionId: "frontier-rnd.frontier-authentication",
-                                        currentVersion: frontierAuthVersion,
+                                        currentVersion: frontierAuthVersion ?? "unknown",
                                         latestVersion: required.frontierAuthentication,
                                         isOutdated: true,
                                         downloadUrl: "",
@@ -666,6 +758,20 @@ export class SCMManager {
                     status: "completed",
                     message: "Synchronization complete",
                 });
+                
+                // After a successful sync (fetch -> merge -> push), the local and remote
+                // states are converged. We refresh remotePinnedExtensions storage to match
+                // what we just pushed, ensuring the Conductor sees the latest pins on next reload.
+                try {
+                    const convergedPins = await readLocalPinnedExtensions();
+                    await this.context.workspaceState.update("remotePinnedExtensions", convergedPins);
+                } catch (e) {
+                    console.error("[SCMManager] Failed to refresh remote pins after sync:", e);
+                }
+
+                // Clear the admin intent (override) since the change is now authoritative on the remote.
+                await this.context.workspaceState.update("adminPinnedExtensions", undefined);
+                await this.context.workspaceState.update('syncCompletedAt', Date.now());
             }
         }
     }

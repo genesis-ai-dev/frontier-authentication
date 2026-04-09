@@ -6,6 +6,7 @@ import {
     handleOutdatedExtensionsForSync,
     buildOutdatedExtensionsMessage,
     ExtensionVersionInfo,
+    checkRequiredVersion,
 } from "../../../utils/extensionVersionChecker";
 
 suite("Integration: extensionVersionChecker", () => {
@@ -44,7 +45,7 @@ suite("Integration: extensionVersionChecker", () => {
             return "Update Extensions"; // simulate user clicking
         };
         (vscode.commands.executeCommand as any) = async (cmd: string) => {
-            if (cmd === "workbench.view.extensions") openedExtensions = true;
+            if (cmd === "workbench.view.extensions") { openedExtensions = true; }
             return undefined;
         };
 
@@ -85,6 +86,31 @@ suite("Integration: extensionVersionChecker", () => {
         const expected = buildOutdatedExtensionsMessage(outdated);
         assert.strictEqual(shownMessage, expected);
     });
+
+    test("malformed required version fails open without showing a toast", () => {
+        let shownMessage: string | undefined;
+        (vscode.window.showWarningMessage as any) = async (msg: string) => {
+            shownMessage = msg;
+            return undefined;
+        };
+
+        const result = checkRequiredVersion(
+            "0.24.1-pr123",
+            "not-a-version",
+            "Codex Editor"
+        );
+
+        assert.deepStrictEqual(result, { kind: "invalid_required" });
+        assert.strictEqual(shownMessage, undefined);
+    });
+
+    test("valid required version with missing installed version fails closed", () => {
+        const result = checkRequiredVersion(
+            null,
+            "0.24.1",
+            "Codex Editor"
+        );
+
+        assert.deepStrictEqual(result, { kind: "unknown_current" });
+    });
 });
-
-
