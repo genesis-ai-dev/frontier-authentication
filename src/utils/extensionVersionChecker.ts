@@ -26,9 +26,43 @@ export function compareVersions(a: string, b: string): number {
     return 0;
 }
 
-/**
- * Parses out the x.y.z core of a version string.
- */
+const DEBUG_MODE = false;
+const debug = (message: string) => {
+    if (DEBUG_MODE) {
+        console.log(`[ExtensionVersionChecker] ${message}`);
+    }
+};
+
+export interface ExtensionVersionInfo {
+    extensionId: string;
+    currentVersion: string;
+    latestVersion: string;
+    isOutdated: boolean;
+    downloadUrl: string;
+    displayName: string;
+}
+
+const VERSION_MODAL_COOLDOWN_KEY = "codex-editor.versionModalLastShown";
+const VERSION_MODAL_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+function getCurrentExtensionVersion(extensionId: string): string | null {
+    const extension = vscode.extensions.getExtension(extensionId);
+    return (extension?.packageJSON as { version: string } | undefined)?.version || null;
+}
+
+function extractCoreVersionParts(version: string): [number, number, number] | null {
+    const match = version.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/i);
+    if (!match) {
+        return null;
+    }
+
+    return [
+        parseInt(match[1], 10),
+        parseInt(match[2], 10),
+        parseInt(match[3], 10),
+    ];
+}
+
 /**
  * Compare a running extension version against a required version from metadata.json's
  * `requiredExtensions`. Both are reduced to their x.y.z numeric core — affixes like
@@ -84,43 +118,6 @@ export function checkRequiredVersion(
     }
 
     return { kind: "ok", comparison: 0 };
-}
-
-function extractCoreVersionParts(version: string): [number, number, number] | null {
-    const match = version.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/i);
-    if (!match) {
-        return null;
-    }
-
-    return [
-        parseInt(match[1], 10),
-        parseInt(match[2], 10),
-        parseInt(match[3], 10),
-    ];
-}
-
-const DEBUG_MODE = false;
-const debug = (message: string) => {
-    if (DEBUG_MODE) {
-        console.log(`[ExtensionVersionChecker] ${message}`);
-    }
-};
-
-export interface ExtensionVersionInfo {
-    extensionId: string;
-    currentVersion: string;
-    latestVersion: string;
-    isOutdated: boolean;
-    downloadUrl: string;
-    displayName: string;
-}
-
-const VERSION_MODAL_COOLDOWN_KEY = "codex-editor.versionModalLastShown";
-const VERSION_MODAL_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
-
-function getCurrentExtensionVersion(extensionId: string): string | null {
-    const extension = vscode.extensions.getExtension(extensionId);
-    return (extension as any)?.packageJSON?.version || null;
 }
 
 export function getInstalledExtensionVersions(): {
@@ -432,66 +429,7 @@ export function buildOutdatedExtensionsMessage(outdatedExtensions: ExtensionVers
     return `To sync, update:\n${bullets}`;
 }
 
-// ── Pinned extension sync gate ──────────────────────────────────────────────
-
-export interface PinnedExtensionEntry {
-    version: string;
-    url: string;
-}
-
-export type PinnedExtensions = Record<string, PinnedExtensionEntry>;
-
-/** Type guard to validate the PinnedExtensions structure. */
-export function isPinnedExtensions(obj: unknown): obj is PinnedExtensions {
-    if (!obj || typeof obj !== "object") {
-        return false;
-    }
-    for (const [key, value] of Object.entries(obj)) {
-        if (typeof key !== "string") {
-            return false;
-        }
-        const entry = value as Partial<PinnedExtensionEntry>;
-        if (typeof entry?.version !== "string" || typeof entry?.url !== "string") {
-            return false;
-        }
-    }
-    return true;
-}
-
-/**
- * Reads pinnedExtensions from the local metadata.json.
- * Returns the map if present, or undefined if absent/unreadable.
- */
-export async function readLocalPinnedExtensions(): Promise<PinnedExtensions | undefined> {
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-    if (!workspaceFolder) {
-        return undefined;
-    }
-    try {
-        const metadataUri = vscode.Uri.joinPath(workspaceFolder.uri, "metadata.json");
-        const content = await vscode.workspace.fs.readFile(metadataUri);
-        const metadata = JSON.parse(new TextDecoder().decode(content));
-        const pins = metadata?.meta?.pinnedExtensions;
-        return isPinnedExtensions(pins) ? pins : undefined;
-    } catch {
-        return undefined;
-    }
-}
-
-/** Strip publisher prefix and -extension suffix, title-case the rest. */
-function extensionDisplayName(extensionId: string): string {
-    const name = extensionId.includes(".")
-        ? extensionId.slice(extensionId.indexOf(".") + 1)
-        : extensionId;
-    return name
-        .replace(/-extension$/, "")
-        .split("-")
-        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-        .join(" ");
-}
-
-export function registerVersionCheckCommands(context: vscode.ExtensionContext): void {
-
+async function showMetadataVersionMismatchNotification(
     context: vscode.ExtensionContext,
     outdatedExtensions: ExtensionVersionInfo[]
 ): Promise<boolean> {
@@ -615,6 +553,64 @@ export async function checkMetadataVersionsForSync(
 
     console.warn("[MetadataVersionChecker] Sync not allowed:", result.reason);
     return false;
+}
+
+// ── Pinned extension sync gate ──────────────────────────────────────────────
+
+export interface PinnedExtensionEntry {
+    version: string;
+    url: string;
+}
+
+export type PinnedExtensions = Record<string, PinnedExtensionEntry>;
+
+/** Type guard to validate the PinnedExtensions structure. */
+export function isPinnedExtensions(obj: unknown): obj is PinnedExtensions {
+    if (!obj || typeof obj !== "object") {
+        return false;
+    }
+    for (const [key, value] of Object.entries(obj)) {
+        if (typeof key !== "string") {
+            return false;
+        }
+        const entry = value as Partial<PinnedExtensionEntry>;
+        if (typeof entry?.version !== "string" || typeof entry?.url !== "string") {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Reads pinnedExtensions from the local metadata.json.
+ * Returns the map if present, or undefined if absent/unreadable.
+ */
+export async function readLocalPinnedExtensions(): Promise<PinnedExtensions | undefined> {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+        return undefined;
+    }
+    try {
+        const metadataUri = vscode.Uri.joinPath(workspaceFolder.uri, "metadata.json");
+        const content = await vscode.workspace.fs.readFile(metadataUri);
+        const metadata = JSON.parse(new TextDecoder().decode(content));
+        const pins = metadata?.meta?.pinnedExtensions;
+        return isPinnedExtensions(pins) ? pins : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Strip publisher prefix and -extension suffix, title-case the rest. */
+function extensionDisplayName(extensionId: string): string {
+    const name = extensionId.includes(".")
+        ? extensionId.slice(extensionId.indexOf(".") + 1)
+        : extensionId;
+    return name
+        .replace(/-extension$/, "")
+        .split("-")
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ");
 }
 
 export function registerVersionCheckCommands(context: vscode.ExtensionContext): void {
