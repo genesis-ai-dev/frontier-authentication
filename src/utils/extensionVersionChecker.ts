@@ -8,20 +8,38 @@ import * as vscode from "vscode";
  * conflicts and the issues that were causing metadata.json to be deleted.
  */
 
-// Lightweight version comparator to avoid external semver dependency
+// Compare only the numeric x.y.z core. Affixes like -pr123 or -pr123-shorthash are ignored.
 export function compareVersions(a: string, b: string): number {
-    const normalize = (v: string) => v.trim().replace(/^v/i, "");
-    const parse = (v: string) => normalize(v).split(".").map((x) => parseInt(x, 10));
-    const pa = parse(a);
-    const pb = parse(b);
-    const len = Math.max(pa.length, pb.length);
-    for (let i = 0; i < len; i++) {
-        const ai = pa[i] ?? 0;
-        const bi = pb[i] ?? 0;
-        if (ai > bi) return 1;
-        if (ai < bi) return -1;
+    const pa = extractCoreVersionParts(a);
+    const pb = extractCoreVersionParts(b);
+
+    if (!pa || !pb) {
+        throw new Error(`Invalid version core: a=${a}, b=${b}`);
+    }
+
+    for (let i = 0; i < 3; i++) {
+        const ai = pa[i];
+        const bi = pb[i];
+        if (ai > bi) { return 1; }
+        if (ai < bi) { return -1; }
     }
     return 0;
+}
+
+/**
+ * Parses out the x.y.z core of a version string.
+ */
+function extractCoreVersionParts(version: string): [number, number, number] | null {
+    const match = version.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/i);
+    if (!match) {
+        return null;
+    }
+
+    return [
+        parseInt(match[1], 10),
+        parseInt(match[2], 10),
+        parseInt(match[3], 10),
+    ];
 }
 
 const DEBUG_MODE = false;
