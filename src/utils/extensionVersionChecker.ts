@@ -11,18 +11,20 @@ import * as path from "path";
  * Reads, however, can safely go directly to disk.
  */
 
-// Lightweight version comparator to avoid external semver dependency
+// Compare only the numeric x.y.z core. Affixes like -pr123 or -pr123-shorthash are ignored.
 export function compareVersions(a: string, b: string): number {
-    const normalize = (v: string) => v.trim().replace(/^v/i, "");
-    const parse = (v: string) => normalize(v).split(".").map((x) => parseInt(x, 10));
-    const pa = parse(a);
-    const pb = parse(b);
-    const len = Math.max(pa.length, pb.length);
-    for (let i = 0; i < len; i++) {
-        const ai = pa[i] ?? 0;
-        const bi = pb[i] ?? 0;
-        if (ai > bi) return 1;
-        if (ai < bi) return -1;
+    const pa = extractCoreVersionParts(a);
+    const pb = extractCoreVersionParts(b);
+
+    if (!pa || !pb) {
+        throw new Error(`Invalid version core: a=${a}, b=${b}`);
+    }
+
+    for (let i = 0; i < 3; i++) {
+        const ai = pa[i];
+        const bi = pb[i];
+        if (ai > bi) { return 1; }
+        if (ai < bi) { return -1; }
     }
     return 0;
 }
@@ -48,7 +50,77 @@ const VERSION_MODAL_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 function getCurrentExtensionVersion(extensionId: string): string | null {
     const extension = vscode.extensions.getExtension(extensionId);
-    return (extension as any)?.packageJSON?.version || null;
+    return (extension?.packageJSON as { version: string } | undefined)?.version || null;
+}
+
+function extractCoreVersionParts(version: string): [number, number, number] | null {
+    const match = version.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/i);
+    if (!match) {
+        return null;
+    }
+
+    return [
+        parseInt(match[1], 10),
+        parseInt(match[2], 10),
+        parseInt(match[3], 10),
+    ];
+}
+
+/**
+ * Compare a running extension version against a required version from metadata.json's
+ * `requiredExtensions`. Both are reduced to their x.y.z numeric core — affixes like
+ * `-pr123` or `-pr123-shorthash` are stripped — so `0.24.1-pr123` == `0.24.1`.
+ *
+ * Returns a discriminated union:
+ *
+ *   "ok"               — both parsed; `comparison` is -1 / 0 / 1 (current vs required).
+ *                        -1 means outdated → block sync.
+ *
+ *   "invalid_required" — requiredVersion couldn't be parsed as x.y.z; fail-open
+ *                        (allow sync, log warning, no toast). Scenario 10.
+ *
+ *   "unknown_current"  — requiredVersion is valid but currentVersion is null or
+ *                        unparseable; fail-closed (block sync). Scenario 11.
+ */
+export type RequiredVersionCheckResult =
+    | { kind: "ok"; comparison: -1 | 0 | 1 }
+    | { kind: "invalid_required" }
+    | { kind: "unknown_current" };
+
+export function checkRequiredVersion(
+    currentVersion: string | null,
+    requiredVersion: string,
+    extensionName: string
+): RequiredVersionCheckResult {
+    const requiredCore = extractCoreVersionParts(requiredVersion);
+    if (!requiredCore) {
+        console.warn(
+            `[MetadataVersionChecker] Invalid required version for ${extensionName}: ${requiredVersion}. Expected x.y.z. Allowing sync.`
+        );
+        return { kind: "invalid_required" };
+    }
+
+    if (!currentVersion) {
+        console.error(
+            `[MetadataVersionChecker] Missing installed version for ${extensionName} while required version ${requiredVersion} is set. Blocking sync.`
+        );
+        return { kind: "unknown_current" };
+    }
+
+    const currentCore = extractCoreVersionParts(currentVersion);
+    if (!currentCore) {
+        console.error(
+            `[MetadataVersionChecker] Unparseable installed version for ${extensionName}: ${currentVersion}. Blocking sync.`
+        );
+        return { kind: "unknown_current" };
+    }
+
+    for (let i = 0; i < 3; i++) {
+        if (currentCore[i] > requiredCore[i]) { return { kind: "ok", comparison: 1 }; }
+        if (currentCore[i] < requiredCore[i]) { return { kind: "ok", comparison: -1 }; }
+    }
+
+    return { kind: "ok", comparison: 0 };
 }
 
 export function getInstalledExtensionVersions(): {
@@ -208,32 +280,67 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
         // Missing versions in metadata are fine: codex-editor writes them on activation.
         const outdatedExtensions: ExtensionVersionInfo[] = [];
 
-        if (metadataCodexVersion && compareVersions(codexEditorVersion, metadataCodexVersion) < 0) {
-            console.warn(
-                `[MetadataVersionChecker] Codex Editor outdated: ${codexEditorVersion} < ${metadataCodexVersion}`
+        if (metadataCodexVersion) {
+            const codexCheck = checkRequiredVersion(
+                codexEditorVersion,
+                metadataCodexVersion,
+                "Codex Editor"
             );
-            outdatedExtensions.push({
-                extensionId: "project-accelerate.codex-editor-extension",
-                currentVersion: codexEditorVersion,
-                latestVersion: metadataCodexVersion,
-                isOutdated: true,
-                downloadUrl: "",
-                displayName: "Codex Editor",
-            });
+            if (codexCheck.kind === "unknown_current") {
+                return {
+                    canSync: false,
+                    metadataUpdated: false,
+                    reason: `Could not determine installed version for Codex Editor`,
+                    needsUserAction: true,
+                };
+            }
+
+            if (codexCheck.kind === "ok" && codexCheck.comparison < 0) {
+                console.warn(
+                    `[MetadataVersionChecker] Codex Editor outdated: ${codexEditorVersion} < ${metadataCodexVersion}`
+                );
+                outdatedExtensions.push({
+                    extensionId: "project-accelerate.codex-editor-extension",
+                    currentVersion: codexEditorVersion,
+                    latestVersion: metadataCodexVersion,
+                    isOutdated: true,
+                    downloadUrl: "",
+                    displayName: "Codex Editor",
+                });
+            }
+            // kind === "invalid_required": logged inside helper; fall through (fail-open).
+            // kind === "ok" && comparison >= 0: codex-editor owns writes via
+            // MetadataManager.ensureExtensionVersionsRecorded on project open.
         }
 
-        if (metadataFrontierVersion && compareVersions(frontierAuthVersion, metadataFrontierVersion) < 0) {
-            console.warn(
-                `[MetadataVersionChecker] Frontier Authentication outdated: ${frontierAuthVersion} < ${metadataFrontierVersion}`
+        if (metadataFrontierVersion) {
+            const frontierCheck = checkRequiredVersion(
+                frontierAuthVersion,
+                metadataFrontierVersion,
+                "Frontier Authentication"
             );
-            outdatedExtensions.push({
-                extensionId: "frontier-rnd.frontier-authentication",
-                currentVersion: frontierAuthVersion,
-                latestVersion: metadataFrontierVersion,
-                isOutdated: true,
-                downloadUrl: "",
-                displayName: "Frontier Authentication",
-            });
+            if (frontierCheck.kind === "unknown_current") {
+                return {
+                    canSync: false,
+                    metadataUpdated: false,
+                    reason: `Could not determine installed version for Frontier Authentication`,
+                    needsUserAction: true,
+                };
+            }
+
+            if (frontierCheck.kind === "ok" && frontierCheck.comparison < 0) {
+                console.warn(
+                    `[MetadataVersionChecker] Frontier Authentication outdated: ${frontierAuthVersion} < ${metadataFrontierVersion}`
+                );
+                outdatedExtensions.push({
+                    extensionId: "frontier-rnd.frontier-authentication",
+                    currentVersion: frontierAuthVersion,
+                    latestVersion: metadataFrontierVersion,
+                    isOutdated: true,
+                    downloadUrl: "",
+                    displayName: "Frontier Authentication",
+                });
+            }
         }
 
         if (outdatedExtensions.length > 0) {
@@ -304,12 +411,12 @@ export function buildOutdatedExtensionsMessage(outdatedExtensions: ExtensionVers
     const names = outdatedExtensions.map((e) => e.displayName);
 
     const formatNames = (arr: string[]): string => {
-        if (arr.length <= 1) return arr[0] || "";
-        if (arr.length === 2) return `${arr[0]} and ${arr[1]}`;
+        if (arr.length <= 1) { return arr[0] || ""; }
+        if (arr.length === 2) { return `${arr[0]} and ${arr[1]}`; }
         return `${arr.slice(0, -1).join(", ")}, and ${arr[arr.length - 1]}`;
     };
 
-    if (names.length === 0) return "To sync, update:"; // safety fallback
+    if (names.length === 0) { return "To sync, update:"; } // safety fallback
     const bullets = names.map((n) => `- ${n}`).join("\n");
     return `To sync, update:\n${bullets}`;
 }
@@ -376,6 +483,47 @@ export async function checkMetadataVersionsForSync(
     context: vscode.ExtensionContext,
     isManualSync: boolean = false
 ): Promise<boolean> {
+    // 1. Pin gate — delegate entirely to the Codex Conductor.
+    //    If the Conductor is available (current Codex build), it owns the pin check.
+    //    - Mismatches → notify and block.
+    //    - No mismatches but pins exist → return true (pins satisfied; skip requiredExtensions
+    //      entirely, since the pin takes precedence over any requiredExtensions constraint).
+    //    - No pins → fall through to the requiredExtensions check below.
+    //    If the Conductor is unavailable (older build) → fall through and rely on
+    //    requiredExtensions alone.
+    try {
+        const mismatches = await vscode.commands.executeCommand<{
+            extensionId: string;
+            pinnedVersion: string;
+            runningVersion: string | null;
+        }[]>("codex.conductor.getPinMismatches");
+
+        if (mismatches && mismatches.length > 0) {
+            const summary = mismatches.map((m) => `${m.extensionId} running=${m.runningVersion} pinned=${m.pinnedVersion}`).join(", ");
+            debug(`[PinVersionChecker] Conductor pin mismatch: ${summary}`);
+            if (shouldShowVersionModal(context, isManualSync)) {
+                const bullets = mismatches
+                    .map((m) => `- ${extensionDisplayName(m.extensionId)} (pinned to v${m.pinnedVersion})`)
+                    .join("\n");
+                const message = `Extension version pin detected — sync paused.\n${bullets}`;
+                vscode.window.showInformationMessage(message);
+            }
+            return false;
+        }
+
+        const effectivePins = await vscode.commands.executeCommand<Record<string, unknown>>(
+            "codex.conductor.getEffectivePinnedExtensions"
+        );
+        if (effectivePins && Object.keys(effectivePins).length > 0) {
+            // Pins are active and satisfied — requiredExtensions is not authoritative.
+            return true;
+        }
+    } catch {
+        // Conductor not available (older build) — fall through to requiredExtensions check.
+        debug("[PinVersionChecker] Conductor unavailable, falling back to requiredExtensions");
+    }
+
+    // 2. requiredExtensions check (no active pins).
     const result = await checkAndUpdateMetadataVersions();
 
     if (result.canSync) {
@@ -397,6 +545,64 @@ export async function checkMetadataVersionsForSync(
 
     console.warn("[MetadataVersionChecker] Sync not allowed:", result.reason);
     return false;
+}
+
+// ── Pinned extension sync gate ──────────────────────────────────────────────
+
+export interface PinnedExtensionEntry {
+    version: string;
+    url: string;
+}
+
+export type PinnedExtensions = Record<string, PinnedExtensionEntry>;
+
+/** Type guard to validate the PinnedExtensions structure. */
+export function isPinnedExtensions(obj: unknown): obj is PinnedExtensions {
+    if (!obj || typeof obj !== "object") {
+        return false;
+    }
+    for (const [key, value] of Object.entries(obj)) {
+        if (typeof key !== "string") {
+            return false;
+        }
+        const entry = value as Partial<PinnedExtensionEntry>;
+        if (typeof entry?.version !== "string" || typeof entry?.url !== "string") {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Reads pinnedExtensions from the local metadata.json.
+ * Returns the map if present, or undefined if absent/unreadable.
+ */
+export async function readLocalPinnedExtensions(): Promise<PinnedExtensions | undefined> {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+        return undefined;
+    }
+    try {
+        const metadataUri = vscode.Uri.joinPath(workspaceFolder.uri, "metadata.json");
+        const content = await vscode.workspace.fs.readFile(metadataUri);
+        const metadata = JSON.parse(new TextDecoder().decode(content));
+        const pins = metadata?.meta?.pinnedExtensions;
+        return isPinnedExtensions(pins) ? pins : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Strip publisher prefix and -extension suffix, title-case the rest. */
+function extensionDisplayName(extensionId: string): string {
+    const name = extensionId.includes(".")
+        ? extensionId.slice(extensionId.indexOf(".") + 1)
+        : extensionId;
+    return name
+        .replace(/-extension$/, "")
+        .split("-")
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ");
 }
 
 export function registerVersionCheckCommands(context: vscode.ExtensionContext): void {

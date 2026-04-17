@@ -10,10 +10,11 @@ import { ResolvedFile } from "../extension";
 import { MediaFilesStrategy } from "../types/state";
 import { checkMetadataVersionsForSync } from "../utils/extensionVersionChecker";
 import {
-    compareVersions,
+    checkRequiredVersion,
     getInstalledExtensionVersions,
     handleOutdatedExtensionsForSync,
     ExtensionVersionInfo,
+    readLocalPinnedExtensions,
 } from "../utils/extensionVersionChecker";
 
 export class SCMManager {
@@ -112,6 +113,16 @@ export class SCMManager {
         this.context.subscriptions.push(
             vscode.commands.registerCommand(
                 "frontier.syncChanges",
+                (options?: { commitMessage?: string }) => this.syncChanges(options, true)
+            )
+        );
+
+        // Push pin update command (admin-only). The Conductor's admin intent
+        // (adminPinnedExtensions) ensures getPinMismatches() returns empty when
+        // the running version matches the admin's intended pin, so sync proceeds.
+        this.context.subscriptions.push(
+            vscode.commands.registerCommand(
+                "frontier.pushPinUpdate",
                 (options?: { commitMessage?: string }) => this.syncChanges(options, true)
             )
         );
@@ -414,6 +425,39 @@ export class SCMManager {
         });
     }
 
+    private async handleRemotePinValidation(
+        remotePins: Record<string, { version: string; url: string }> | undefined,
+        isManualSync: boolean
+    ): Promise<{ canSync: boolean; pinnedIds: Set<string> }> {
+        // Delegate to the Conductor (handles Admin Intent > Remote > Local priority).
+        // setRemotePins fires before aborting so the Conductor can start downloading.
+        try {
+            await vscode.commands.executeCommand("codex.conductor.setRemotePins", remotePins);
+
+            // Ask the Conductor for mismatches.
+            const mismatches = await vscode.commands.executeCommand<{
+                extensionId: string;
+                pinnedVersion: string;
+                runningVersion: string | null;
+            }[]>("codex.conductor.getPinMismatches");
+
+            if (mismatches && mismatches.length > 0) {
+                // Return canSync: false to block the fetch loop.
+                // checkMetadataVersionsForSync will handle showing the notification
+                // on the next iteration (or if we're in the pre-sync check).
+                return { canSync: false, pinnedIds: new Set() };
+            }
+
+            // Also get effective pinned IDs so we can bypass requiredExtensions checks
+            const effectivePins = await vscode.commands.executeCommand<Record<string, any>>(
+                "codex.conductor.getEffectivePinnedExtensions"
+            );
+            return { canSync: true, pinnedIds: new Set(Object.keys(effectivePins || {})) };
+        } catch {
+            return { canSync: true, pinnedIds: new Set() };
+        }
+    }
+
     async syncChanges(
         options?: { commitMessage?: string },
         isManualSync: boolean = false
@@ -542,8 +586,18 @@ export class SCMManager {
                                         codexEditor?: string;
                                         frontierAuthentication?: string;
                                     };
+                                    pinnedExtensions?: Record<string, { version: string; url: string }>;
                                 };
                             };
+
+                            // Write remote pins to workspaceState, then ask the Conductor
+                            // for effective pins (which now include the just-fetched remote pins).
+                            const remotePins = remoteMetadata.meta?.pinnedExtensions;
+                            const { canSync: canSyncPins, pinnedIds } =
+                                await this.handleRemotePinValidation(remotePins, isManualSync);
+                            if (!canSyncPins) {
+                                return { hasConflicts: false };
+                            }
 
                             const required = remoteMetadata.meta?.requiredExtensions;
                             if (required) {
@@ -551,14 +605,16 @@ export class SCMManager {
                                     getInstalledExtensionVersions();
                                 const outdated: ExtensionVersionInfo[] = [];
 
-                                if (
-                                    required.codexEditor &&
-                                    codexEditorVersion &&
-                                    compareVersions(codexEditorVersion, required.codexEditor) < 0
-                                ) {
+                                const isOutdatedOrUnknown = (check: ReturnType<typeof checkRequiredVersion>): boolean =>
+                                    check.kind === "unknown_current" || (check.kind === "ok" && check.comparison < 0);
+
+                                const codexCheck = checkRequiredVersion(codexEditorVersion, required.codexEditor ?? "", "Codex Editor");
+                                const frontierCheck = checkRequiredVersion(frontierAuthVersion, required.frontierAuthentication ?? "", "Frontier Authentication");
+
+                                if (required.codexEditor && !pinnedIds.has("project-accelerate.codex-editor-extension") && isOutdatedOrUnknown(codexCheck)) {
                                     outdated.push({
                                         extensionId: "project-accelerate.codex-editor-extension",
-                                        currentVersion: codexEditorVersion,
+                                        currentVersion: codexEditorVersion ?? "unknown",
                                         latestVersion: required.codexEditor,
                                         isOutdated: true,
                                         downloadUrl: "",
@@ -566,17 +622,10 @@ export class SCMManager {
                                     });
                                 }
 
-                                if (
-                                    required.frontierAuthentication &&
-                                    frontierAuthVersion &&
-                                    compareVersions(
-                                        frontierAuthVersion,
-                                        required.frontierAuthentication
-                                    ) < 0
-                                ) {
+                                if (required.frontierAuthentication && !pinnedIds.has("frontier-rnd.frontier-authentication") && isOutdatedOrUnknown(frontierCheck)) {
                                     outdated.push({
                                         extensionId: "frontier-rnd.frontier-authentication",
-                                        currentVersion: frontierAuthVersion,
+                                        currentVersion: frontierAuthVersion ?? "unknown",
                                         latestVersion: required.frontierAuthentication,
                                         isOutdated: true,
                                         downloadUrl: "",
@@ -699,6 +748,22 @@ export class SCMManager {
                     status: "completed",
                     message: "Synchronization complete",
                 });
+
+                // After a successful sync (fetch -> merge -> push), the local and remote
+                // states are converged. We refresh remotePinnedExtensions storage to match
+                // what we just pushed, ensuring the Conductor sees the latest pins on next reload.
+                try {
+                    const convergedPins = await readLocalPinnedExtensions();
+                    await vscode.commands.executeCommand("codex.conductor.setRemotePins", convergedPins);
+                } catch (e) {
+                    console.error("[SCMManager] Failed to refresh remote pins after sync:", e);
+                }
+
+                // Clear the admin intent (override) since the change is now authoritative on the remote.
+                try {
+                    await vscode.commands.executeCommand("codex.conductor.clearAdminPinIntent");
+                    await vscode.commands.executeCommand("codex.conductor.setSyncCompletedAt", Date.now());
+                } catch {}
             }
         }
     }
