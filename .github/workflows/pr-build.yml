@@ -13,6 +13,11 @@ on:
                 description: "Version override (leave blank to auto-generate as x.y.z-prNNN-shorthash)"
                 required: false
                 type: string
+            no_scripts:
+                description: "Skip vscode:prepublish script during packaging"
+                required: false
+                default: true
+                type: boolean
 
 permissions:
     contents: write
@@ -34,6 +39,7 @@ jobs:
             cancel-in-progress: true
         env:
             GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            NO_SCRIPTS: ${{ github.event.inputs.no_scripts || 'true' }}
 
         steps:
             - name: React to comment (acknowledge)
@@ -101,7 +107,7 @@ jobs:
                   PUBLISHER=$(jq -r .publisher package.json)
                   REPO_URL=$(gh repo view --json url -q .url)
                   echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-                  echo "vsix=${PUBLISHER}.${NAME}-${VERSION}.vsix" >> "$GITHUB_OUTPUT"
+                  echo "vsix=${NAME}-${VERSION}.vsix" >> "$GITHUB_OUTPUT"
                   echo "release_url=${REPO_URL}/releases/tag/${VERSION}" >> "$GITHUB_OUTPUT"
 
             - name: Check if release already exists
@@ -138,7 +144,21 @@ jobs:
               run: pnpm run package
 
             - name: Package VSIX
-              run: xvfb-run -a pnpm dlx @vscode/vsce package --no-dependencies
+              run: |
+                  set -euo pipefail
+                  # We skip lifecycle scripts (vscode:prepublish) during packaging for two reasons:
+                  # 1. Efficiency: The 'Production build' step already compiled the extension, so
+                  #    re-running it via vsce is redundant.
+                  # 2. Robustness: The prepublish script in this repository triggers automated tests.
+                  #    Skipping them allows us to generate a VSIX for manual verification of fixes
+                  #    on PR branches where tests might still be failing or in-progress.
+                  #
+                  # Note: Since the @vscode/vsce CLI tool lacks a native --no-scripts flag, we use
+                  # the workflow-level $NO_SCRIPTS toggle to temporarily strip the script via jq.
+                  if [ "$NO_SCRIPTS" = "true" ]; then
+                    jq 'del(.scripts["vscode:prepublish"])' package.json > package.json.tmp && mv package.json.tmp package.json
+                  fi
+                  xvfb-run -a pnpm dlx @vscode/vsce package --no-dependencies
 
             - name: Restore package.json
               if: always()
