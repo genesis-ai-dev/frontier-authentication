@@ -584,6 +584,12 @@ export async function activate(context: vscode.ExtensionContext) {
 
         retryGitBinaryDownload: async (): Promise<boolean> => {
             try {
+                // Clear any previous failure counter so this retry isn't blocked by
+                // a past exhausted-retries state. The user explicitly asked for a
+                // fresh attempt by invoking this API (e.g. via the "Download and
+                // Install" button in the Tools Status panel), so the prior
+                // auto-retry bookkeeping should not gate the request.
+                await gitBinaryManager.resetGitRetryCount(context);
                 gitBinaryManager.resetResolvedPaths();
                 const gitPaths = await gitBinaryManager.ensureGitBinary(context);
                 if (!gitPaths) {
