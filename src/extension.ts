@@ -148,6 +148,12 @@ export interface FrontierAPI {
     isGitBinaryAvailable: () => boolean;
     /** Returns true when git operations can succeed (native binary OR isomorphic-git fallback). */
     isGitAvailable: () => boolean;
+    /**
+     * Returns true when the current OS/arch has a prebuilt dugite-native
+     * asset in the release we pin to. When false, any "Download and install"
+     * UI should be hidden — the download can never succeed on this platform.
+     */
+    isGitBinaryNativelySupported: () => boolean;
     retryGitBinaryDownload: () => Promise<boolean>;
     /** Delete the downloaded git binary directory so it is re-downloaded on next reload. */
     deleteGitBinary: () => Promise<boolean>;
@@ -582,14 +588,10 @@ export async function activate(context: vscode.ExtensionContext) {
             return true;
         },
 
+        isGitBinaryNativelySupported: () => gitBinaryManager.isGitBinaryNativelySupported(),
+
         retryGitBinaryDownload: async (): Promise<boolean> => {
             try {
-                // Clear any previous failure counter so this retry isn't blocked by
-                // a past exhausted-retries state. The user explicitly asked for a
-                // fresh attempt by invoking this API (e.g. via the "Download and
-                // Install" button in the Tools Status panel), so the prior
-                // auto-retry bookkeeping should not gate the request.
-                await gitBinaryManager.resetGitRetryCount(context);
                 gitBinaryManager.resetResolvedPaths();
                 const gitPaths = await gitBinaryManager.ensureGitBinary(context);
                 if (!gitPaths) {
@@ -619,7 +621,6 @@ export async function activate(context: vscode.ExtensionContext) {
                 const fsModule = await import("fs");
                 const gitDir = path.join(context.globalStorageUri.fsPath, "git");
                 await fsModule.promises.rm(gitDir, { recursive: true, force: true });
-                await gitBinaryManager.resetGitRetryCount(context);
                 console.log("[Frontier] Git binary directory deleted:", gitDir);
                 return true;
             } catch (error) {

@@ -27,9 +27,6 @@ const execFileAsync = promisify(execFileCb);
 // ---------------------------------------------------------------------------
 
 const HASH_MARKER = "sha256.txt";
-const MAX_BINARY_RETRIES = 3;
-const RETRY_KEY = "binaryRetryCount.git";
-
 const computeGitBinaryHash = (filePath: string): Promise<string> =>
     new Promise((resolve, reject) => {
         const hash = crypto.createHash("sha256");
@@ -50,22 +47,6 @@ const readGitHashMarker = (dir: string): string | null => {
         return null;
     }
 };
-
-const getGitRetryCount = (ctx: vscode.ExtensionContext): number =>
-    ctx.globalState.get<number>(RETRY_KEY) ?? 0;
-
-const incrementGitRetryCount = async (ctx: vscode.ExtensionContext): Promise<number> => {
-    const count = getGitRetryCount(ctx) + 1;
-    await ctx.globalState.update(RETRY_KEY, count);
-    return count;
-};
-
-export const resetGitRetryCount = async (ctx: vscode.ExtensionContext): Promise<void> => {
-    await ctx.globalState.update(RETRY_KEY, 0);
-};
-
-const hasExceededGitRetries = (ctx: vscode.ExtensionContext): boolean =>
-    getGitRetryCount(ctx) >= MAX_BINARY_RETRIES;
 
 // ---------------------------------------------------------------------------
 // Configuration — pin to a specific dugite-native release
@@ -118,6 +99,17 @@ export function getResolvedPath(): GitBinaryPaths | undefined {
     return resolvedPaths;
 }
 
+/**
+ * Returns true when the current OS/arch has a prebuilt dugite-native
+ * asset published in the release we pin to. Callers use this to decide
+ * whether to offer a "Download and install" button at all — on
+ * unsupported platforms, downloading is impossible and the UI should
+ * surface that fact instead of showing a no-op action.
+ */
+export function isGitBinaryNativelySupported(): boolean {
+    return PLATFORM_MAP[`${os.platform()}-${os.arch()}`] !== undefined;
+}
+
 /** Reset cached paths so the next ensureGitBinary call retries from scratch. */
 export function resetResolvedPaths(): void {
     resolvedPaths = undefined;
@@ -166,6 +158,18 @@ async function doEnsureGitBinary(
         return undefined;
     }
 
+    // Unsupported platforms must NOT enter the retry loop or bump the retry
+    // counter — the fallback (isomorphic-git) is used and re-evaluated next
+    // startup. "Unsupported" is a permanent condition for this machine, not
+    // a transient failure worth retrying with backoff.
+    const platformKey = `${os.platform()}-${os.arch()}`;
+    if (!PLATFORM_MAP[platformKey]) {
+        console.warn(
+            `[GitBinaryManager] Platform ${platformKey} not supported — falling back to builtin sync`,
+        );
+        return undefined;
+    }
+
     const storageDir = context.globalStorageUri.fsPath;
     await fs.promises.mkdir(storageDir, { recursive: true });
 
@@ -196,7 +200,6 @@ async function doEnsureGitBinary(
             // Run an execution test to confirm the binary works
             try {
                 await verifyGitRuns(gitRootDir);
-                await resetGitRetryCount(context);
                 resolvedPaths = buildPaths(gitRootDir);
                 console.log("[GitBinaryManager] Using existing git binary at:", gitRootDir);
                 return resolvedPaths;
@@ -205,41 +208,37 @@ async function doEnsureGitBinary(
             }
         }
 
-        // Integrity or execution test failed — attempt re-download
-        if (hasExceededGitRetries(context)) {
-            console.warn("[GitBinaryManager] Retry limit reached — falling back to builtin sync");
-            return undefined;
-        }
-        await incrementGitRetryCount(context);
+        // Integrity or execution test failed — delete the corrupt installation and re-download
         console.warn("[GitBinaryManager] Deleting cached installation for re-download");
         await fs.promises.rm(gitRootDir, { recursive: true, force: true }).catch(() => { });
     }
 
-    // Bail out if retry counter exceeded before attempting download
-    if (hasExceededGitRetries(context)) {
-        console.warn("[GitBinaryManager] Retry limit reached — falling back to builtin sync");
-        return undefined;
-    }
-
     // Fast-fail when offline: no point retrying downloads that cannot succeed.
+    // Any HTTP response (even 4xx/5xx) means we have network connectivity — only
+    // a network-level failure (DNS, connection refused, timeout) means offline.
+    // Checking api.github.com directly is avoided because rate-limit responses
+    // (HTTP 403/429) would incorrectly look like "offline" with a resp.ok check.
     try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 3000);
-        const resp = await fetch("https://api.github.com", {
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        await fetch("https://github.com", {
             method: "HEAD",
             signal: controller.signal,
         });
         clearTimeout(timeout);
-        if (!resp.ok) {
-            throw new Error("GitHub API unreachable");
-        }
     } catch {
         console.warn("[GitBinaryManager] Offline — native git unavailable, falling back to builtin sync");
         return undefined;
     }
 
     // Download with progress UI, retrying the entire flow up to MAX_FULL_RETRIES times
-    const MAX_FULL_RETRIES = 3;
+    const MAX_FULL_RETRIES = 2;
+
+    // Track whether the download succeeded inside the withProgress callback.
+    // Using a flag + return-undefined pattern keeps this consistent with
+    // SQLite/FFmpeg which return null on failure rather than throwing, so
+    // callers don't need try/catch to handle "download failed" vs "offline".
+    let downloadSucceeded = false;
 
     await vscode.window.withProgress(
         {
@@ -315,9 +314,9 @@ async function doEnsureGitBinary(
                         console.warn("[GitBinaryManager] Could not write SHA-256 marker:", hashErr);
                     }
 
-                    await resetGitRetryCount(context);
+                    downloadSucceeded = true;
                     console.log("[GitBinaryManager] Git binary installed at:", gitRootDir);
-                    return; // Success
+                    return; // exit the withProgress callback
                 } catch (error) {
                     lastError = error instanceof Error ? error : new Error(String(error));
                     await fs.promises.rm(gitRootDir, { recursive: true, force: true }).catch(() => { });
@@ -336,10 +335,18 @@ async function doEnsureGitBinary(
                 }
             }
 
-            await incrementGitRetryCount(context);
-            throw lastError ?? new Error("Git binary download failed after all retries");
+            console.error(
+                `[GitBinaryManager] All ${MAX_FULL_RETRIES} download attempts failed:`,
+                lastError?.message ?? "unknown error",
+            );
+            // Do NOT throw — callers treat undefined return as "unavailable",
+            // consistent with SQLite/FFmpeg returning null on failure.
         },
     );
+
+    if (!downloadSucceeded) {
+        return undefined;
+    }
 
     resolvedPaths = buildPaths(gitRootDir);
     return resolvedPaths;
@@ -421,10 +428,11 @@ async function findPlatformAsset(): Promise<PlatformAssetInfo> {
         );
     }
 
-    const maxRetries = 3;
+    // Cap at 2 attempts — if GitHub is still failing on the second try, more retries burn rate limits.
+    const MAX_API_ATTEMPTS = 2;
     let lastError: Error | undefined;
 
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    for (let attempt = 0; attempt < MAX_API_ATTEMPTS; attempt++) {
         try {
             const response = await fetch(GITHUB_API_RELEASE_URL, {
                 headers: {
@@ -478,10 +486,10 @@ async function findPlatformAsset(): Promise<PlatformAssetInfo> {
             return { asset, expectedSha256 };
         } catch (error) {
             lastError = error instanceof Error ? error : new Error(String(error));
-            if (attempt < maxRetries) {
+            if (attempt < MAX_API_ATTEMPTS - 1) {
                 const delay = 1000 * Math.pow(2, attempt);
                 console.warn(
-                    `[GitBinaryManager] Asset lookup attempt ${attempt + 1} failed, retrying in ${delay}ms:`,
+                    `[GitBinaryManager] Asset lookup attempt ${attempt + 1}/${MAX_API_ATTEMPTS} failed, retrying in ${delay}ms:`,
                     lastError.message,
                 );
                 await new Promise((resolve) => setTimeout(resolve, delay));
@@ -507,10 +515,10 @@ async function downloadFile(
     destPath: string,
     onProgress?: (percent: number) => void,
 ): Promise<string> {
-    const maxRetries = 3;
+    const MAX_DOWNLOAD_ATTEMPTS = 2;
     let lastError: Error | undefined;
 
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    for (let attempt = 0; attempt < MAX_DOWNLOAD_ATTEMPTS; attempt++) {
         try {
             const response = await fetch(url, {
                 headers: { "User-Agent": "frontier-authentication-vscode" },
@@ -565,10 +573,10 @@ async function downloadFile(
             return hash.digest("hex");
         } catch (error) {
             lastError = error instanceof Error ? error : new Error(String(error));
-            if (attempt < maxRetries) {
+            if (attempt < MAX_DOWNLOAD_ATTEMPTS - 1) {
                 const delay = 1000 * Math.pow(2, attempt);
                 console.warn(
-                    `[GitBinaryManager] Download attempt ${attempt + 1} failed, retrying in ${delay}ms:`,
+                    `[GitBinaryManager] Download attempt ${attempt + 1}/${MAX_DOWNLOAD_ATTEMPTS} failed, retrying in ${delay}ms:`,
                     lastError.message,
                 );
                 await new Promise((resolve) => setTimeout(resolve, delay));
