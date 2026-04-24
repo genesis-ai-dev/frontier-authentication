@@ -299,7 +299,7 @@ export function registerSCMCommands(
                     return true;
                 } catch (error) {
                     vscode.window.showErrorMessage(
-                        `Failed to clone repository: ${error instanceof Error ? error.message : "Unknown error"}`
+                        `Failed to download project: ${error instanceof Error ? error.message : "Unknown error"}`
                     );
                     return false;
                 }

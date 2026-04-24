@@ -1,6 +1,5 @@
-import * as git from "isomorphic-git";
-import http from "isomorphic-git/http/node";
-import lfs from "@fetsorn/isogit-lfs";
+import * as dugiteGit from "./dugiteGit";
+import { formatPointerInfo, buildPointerInfo } from "./lfsPointerUtils";
 import * as fs from "fs";
 import * as vscode from "vscode";
 import * as path from "path";
@@ -20,6 +19,37 @@ const LFS_RETRY_BASE_DELAY_MS = 1000;
 const LFS_UPLOAD_BATCH_SIZE = 50;
 /** Max simultaneous PUT uploads within a single batch */
 const LFS_UPLOAD_CONCURRENCY = 10;
+
+/** Default timeout for LFS API requests (60 s) */
+const LFS_FETCH_TIMEOUT_MS = 60_000;
+/** Timeout for lightweight health-check requests (10 s) */
+const HEALTH_CHECK_TIMEOUT_MS = 10_000;
+
+/**
+ * Wrapper around `fetch` that aborts after `timeoutMs`.
+ * If a caller-provided `signal` is already aborted, throws immediately.
+ */
+function fetchWithTimeout(
+    input: string | URL | Request,
+    init?: RequestInit & { timeoutMs?: number },
+): Promise<Response> {
+    const { timeoutMs = LFS_FETCH_TIMEOUT_MS, ...rest } = init ?? {};
+    const controller = new AbortController();
+    const externalSignal = rest.signal;
+
+    if (externalSignal?.aborted) {
+        return Promise.reject(externalSignal.reason ?? new DOMException("Aborted", "AbortError"));
+    }
+
+    const onExternalAbort = () => controller.abort(externalSignal!.reason);
+    externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
+
+    const timer = setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
+    return fetch(input, { ...rest, signal: controller.signal }).finally(() => {
+        clearTimeout(timer);
+        externalSignal?.removeEventListener("abort", onExternalAbort);
+    });
+}
 
 /**
  * Determine whether an error is retryable (server-side / transient network errors).
@@ -53,9 +83,13 @@ async function retryWithBackoff<T>(
     label: string,
     maxRetries: number = LFS_MAX_RETRIES,
     baseDelayMs: number = LFS_RETRY_BASE_DELAY_MS,
+    signal?: AbortSignal,
 ): Promise<T> {
     let hadFailure = false;
     for (let attempt = 0; ; attempt++) {
+        if (signal?.aborted) {
+            throw signal.reason ?? new DOMException("Aborted", "AbortError");
+        }
         try {
             const result = await fn();
             if (hadFailure) {
@@ -66,6 +100,9 @@ async function retryWithBackoff<T>(
             return result;
         } catch (error) {
             hadFailure = true;
+            if (signal?.aborted) {
+                throw signal.reason ?? new DOMException("Aborted", "AbortError");
+            }
             if (attempt >= maxRetries || !isRetryableError(error)) {
                 throw error;
             }
@@ -211,13 +248,22 @@ function isValidLFSInfoResponseData(val: unknown): val is LFSBatchResponse {
         debugLog("[LFS Patch] Response validation passed");
         return true;
     } catch (error) {
-        console.error("[LFS Patch] Error validating response:", error);
-        return false;
+        // Re-throw rather than returning false — callers must distinguish
+        // "structurally invalid response" (false) from "validation code itself crashed".
+        throw new Error(
+            `LFS response validation error: ${error instanceof Error ? error.message : String(error)}`
+        );
     }
 }
 /**
  * replace @fetsorn/isogit-lfs uploadBlobs function with corrected validation
  */
+type LfsFileStatus = {
+    index: number;
+    size: number;
+    alreadyOnServer: boolean;
+};
+
 async function uploadBlobsToLFSBucket(
     {
         headers = {},
@@ -225,7 +271,8 @@ async function uploadBlobsToLFSBucket(
         auth,
         recovery,
     }: UploadBlobsOptions & { recovery?: { dir: string; filepaths: string[]; }; },
-    contents: Uint8Array[]
+    contents: Uint8Array[],
+    onFileStatus?: (status: LfsFileStatus) => void,
 ): Promise<LfsPointerInfo[]> {
     debugLog("[LFS Patch] Using patched uploadBlobs function");
     debugLog("[LFS Patch] URL:", url);
@@ -382,19 +429,14 @@ async function uploadBlobsToLFSBucket(
                 }
             } catch (e) {
                 console.warn(`[LFS Patch] Error during empty-pointer recovery for ${filepath}:`, e);
+                skipIndices.add(i);
                 recovered.push(buf);
             }
         }
         contents = recovered;
     }
 
-    // Use the original library's buildPointerInfo function
-    const buildPointerInfo = (lfs as any).buildPointerInfo;
-    const getAuthHeader = (lfs as any).getAuthHeader || (() => ({}));
-
-    if (!buildPointerInfo) {
-        throw new Error("Unable to access buildPointerInfo from LFS library");
-    }
+    const getAuthHeader = (_auth?: unknown): Record<string, string> => ({});
 
     // Filter out skipped indices before building pointer infos
     const effectiveContents: Uint8Array[] = contents.filter((_, i) => !skipIndices.has(i));
@@ -443,7 +485,7 @@ async function uploadBlobsToLFSBucket(
     debugLog("[LFS Patch] Auth headers:", Object.keys(authHeaders));
 
     const lfsInfoResponseData = await retryWithBackoff(async () => {
-        const lfsInfoRes = await fetch(`${url}/info/lfs/objects/batch`, {
+        const lfsInfoRes = await fetchWithTimeout(`${url}/info/lfs/objects/batch`, {
             method: "POST",
             headers: {
                 ...headers,
@@ -456,11 +498,16 @@ async function uploadBlobsToLFSBucket(
 
         if (!lfsInfoRes.ok) {
             const errorText = await lfsInfoRes.text();
+            const safeHeaders = Object.fromEntries(
+                Object.entries({ ...headers, ...authHeaders }).map(([k, v]) =>
+                    [k, /^authorization$/i.test(k) ? "[REDACTED]" : v]
+                )
+            );
             console.error("[LFS Patch] Request failed:");
             console.error("Status:", lfsInfoRes.status, lfsInfoRes.statusText);
             console.error("Response:", errorText);
             console.error("Request URL:", `${url}/info/lfs/objects/batch`);
-            console.error("Request headers:", { ...headers, ...authHeaders });
+            console.error("Request headers:", safeHeaders);
             const err = new Error(
                 `LFS request failed with status ${lfsInfoRes.status}: ${lfsInfoRes.statusText}\nResponse: ${errorText}`
             );
@@ -499,9 +546,12 @@ async function uploadBlobsToLFSBucket(
     // Upload each object (with per-file retry, concurrency-limited)
     const responseData = lfsInfoResponseData as LFSBatchResponse;
     const uploadTasks = responseData.objects.map((object, index: number) => async () => {
+            const fileSize = effectiveContents[index]?.length ?? 0;
+
             // Server already has file
             if (!object.actions) {
                 debugLog(`[LFS Patch] Server already has ${fileLabel(index)}`);
+                onFileStatus?.({ index, size: fileSize, alreadyOnServer: true });
                 return;
             }
 
@@ -509,6 +559,7 @@ async function uploadBlobsToLFSBucket(
             const upload = actions.upload;
             if (!upload?.href) {
                 debugLog(`[LFS Patch] No upload action provided for ${fileLabel(index)}`);
+                onFileStatus?.({ index, size: fileSize, alreadyOnServer: true });
                 return;
             }
 
@@ -532,19 +583,14 @@ async function uploadBlobsToLFSBucket(
 
             // Upload with retry on transient/server errors
             await retryWithBackoff(async () => {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 min timeout
-
                 try {
-                    const resp = await fetch(upload.href, {
+                    const resp = await fetchWithTimeout(upload.href, {
                         method: "PUT",
                         headers: uploadHeaders,
                         body: Buffer.from(fileBytes),
-                        signal: controller.signal,
                         keepalive: false,
+                        timeoutMs: 600_000,
                     });
-
-                    clearTimeout(timeoutId);
 
                     if (!resp.ok) {
                         const errorText = await resp.text();
@@ -559,8 +605,8 @@ async function uploadBlobsToLFSBucket(
                     }
 
                     debugLog(`[LFS Patch] ${fileLabel(index)} uploaded successfully`);
+                    onFileStatus?.({ index, size: fileSize, alreadyOnServer: false });
                 } catch (fetchError: any) {
-                    clearTimeout(timeoutId);
                     console.error(`[LFS Patch] Network error uploading ${fileLabel(index)}:`, fetchError);
                     console.error(`[LFS Patch] Error details:`, {
                         message: fetchError.message,
@@ -612,7 +658,7 @@ async function uploadBlobsToLFSBucket(
             if (actions.verify) {
                 debugLog(`[LFS Patch] Verifying ${fileLabel(index)}`);
                 await retryWithBackoff(async () => {
-                    const verificationResp = await fetch(actions.verify!.href, {
+                    const verificationResp = await fetchWithTimeout(actions.verify!.href, {
                         method: "POST",
                         headers: {
                             ...(actions.verify!.header ?? {}),
@@ -623,9 +669,11 @@ async function uploadBlobsToLFSBucket(
                             oid: String((infos[index] as any).oid ?? ""),
                             size: Number((infos[index] as any).size ?? 0),
                         }),
+                        timeoutMs: 30_000,
                     });
 
                     if (!verificationResp.ok) {
+                        await verificationResp.text().catch(() => {});
                         const err = new Error(
                             `Verification failed for ${fileLabel(index)}, HTTP ${verificationResp.status}: ${verificationResp.statusText}`
                         );
@@ -682,7 +730,7 @@ export async function downloadLFSObject(
         ],
     };
 
-    const batchResp = await fetch(`${url}/info/lfs/objects/batch`, {
+    const batchResp = await fetchWithTimeout(`${url}/info/lfs/objects/batch`, {
         method: "POST",
         headers: {
             ...headers,
@@ -718,15 +766,12 @@ export async function downloadLFSObject(
         ...(download.header ?? {}),
     };
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 minute timeout
-    const fileResp = await fetch(download.href, {
+    const fileResp = await fetchWithTimeout(download.href, {
         method: "GET",
         headers: dlHeaders,
-        signal: controller.signal,
         keepalive: false,
+        timeoutMs: 600_000,
     });
-    clearTimeout(timeoutId);
 
     if (!fileResp.ok) {
         const errorText = await fileResp.text();
@@ -800,31 +845,62 @@ export class GitService {
     /**
      * Update sync progress for heartbeat and UI
      */
+    private static readonly USER_FRIENDLY_PHASE: Record<string, string> = {
+        pushing: "Uploading changes",
+        fetching: "Downloading changes",
+    };
+
+    private static formatBytes(bytes: number): string {
+        if (bytes < 1024) {
+            return `${bytes} B`;
+        }
+        if (bytes < 1024 * 1024) {
+            return `${(bytes / 1024).toFixed(1)} KB`;
+        }
+        if (bytes < 1024 * 1024 * 1024) {
+            return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+        }
+        return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+    }
+
     private updateSyncProgress(
         phase: string,
-        event: { loaded?: number; total?: number; phase?: string; }
+        event: {
+            loaded?: number;
+            total?: number;
+            phase?: string;
+            transferInfo?: string;
+        },
     ): void {
         const now = Date.now();
         const current = event.loaded || 0;
         const total = event.total || 0;
 
-        // Build description: use event.phase if provided, otherwise use our phase with counts
-        // If event.phase exists (e.g., from git), append the counts to it
+        // When event.phase comes from raw git stderr (e.g. "writing objects",
+        // "receiving objects") replace it with a user-friendly label derived
+        // from the high-level phase so end-users never see git internals.
+        const friendly = GitService.USER_FRIENDLY_PHASE[phase];
         let description: string;
-        if (event.phase) {
-            // Git provides descriptive phase like "Receiving objects" - add counts if available
-            if (total > 0) {
-                description = `${event.phase}: ${current}/${total}`;
+        if (event.phase && friendly) {
+            const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+            // When all objects have been sent, the server is still processing;
+            // show a distinct message so the UI doesn't appear stuck at 100%.
+            if (pct >= 100 && phase === "pushing") {
+                description = "Finishing upload...";
             } else {
-                description = event.phase;
+                const sizePart = this.extractTransferSize(event.transferInfo);
+                const details = [
+                    total > 0 ? `${pct}%` : undefined,
+                    sizePart,
+                ].filter(Boolean).join(" — ");
+                description = details ? `${friendly} (${details})` : friendly;
             }
+        } else if (event.phase) {
+            description = total > 0 ? `${event.phase}: ${current}/${total}` : event.phase;
+        } else if (total > 0) {
+            description = `${phase}: ${current}/${total}`;
         } else {
-            // Use our custom phase with counts if available
-            if (total > 0) {
-                description = `${phase}: ${current}/${total}`;
-            } else {
-                description = phase;
-            }
+            description = phase;
         }
 
         // Track real progress
@@ -858,6 +934,43 @@ export class GitService {
                 this.debugLog(`[GitService] Failed to call progress callback: ${error}`);
             }
         }
+    }
+
+    /**
+     * Pull the cumulative transfer size from git's progress suffix and
+     * normalise it to a human-readable string.
+     *
+     * Input examples: "1.20 MiB | 500.00 KiB/s", "1003 bytes", "256 bytes"
+     * Output examples: "1.20 MiB", "1.0 KB", "256 B"
+     */
+    private extractTransferSize(transferInfo?: string): string | undefined {
+        if (!transferInfo) {
+            return undefined;
+        }
+        const sizePart = transferInfo.split("|")[0].trim();
+        if (!sizePart) {
+            return undefined;
+        }
+
+        const match = sizePart.match(/^([\d.]+)\s*(bytes?|[KMGT]i?B)$/i);
+        if (!match) {
+            return sizePart;
+        }
+
+        const value = parseFloat(match[1]);
+        const unit = match[2].toLowerCase();
+
+        if (unit === "byte" || unit === "bytes") {
+            if (value < 1024) {
+                return `${Math.round(value)} B`;
+            }
+            if (value < 1024 * 1024) {
+                return `${(value / 1024).toFixed(1)} KB`;
+            }
+            return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+        }
+
+        return sizePart;
     }
 
     /**
@@ -912,10 +1025,12 @@ export class GitService {
                             "[GitService] Stream-and-save mode: will skip bulk downloads; will still convert local blobs to pointers"
                         );
                     }
-                } catch { }
+                } catch (strategyErr) {
+                    console.warn("[GitService] Failed to read repo strategy, defaulting to auto-download:", strategyErr);
+                }
 
-                const status = await git.statusMatrix({ fs, dir });
-                const headOid = await git.resolveRef({ fs, dir, ref: "HEAD" });
+                const status = await dugiteGit.statusMatrix(dir);
+                const headOid = await dugiteGit.resolveRef(dir, "HEAD");
                 this.debugLog("[GitService] Repository status", {
                     statusEntries: status.length,
                     headOid: headOid.substring(0, 8),
@@ -934,6 +1049,8 @@ export class GitService {
                     string,
                     { filesAbs: string; filepath: string; size: number; }[]
                 >();
+                const readFailures: string[] = [];
+                const conversionFailures: string[] = [];
 
                 for (let i = 0; i < totalFiles; i++) {
                     const [filepath] = pointerPaths[i];
@@ -949,7 +1066,8 @@ export class GitService {
                             contentLength: content.length,
                         });
                     } catch (error) {
-                        this.debugLog("[GitService] Failed to read file", { filepath, error });
+                        console.warn("[GitService] Failed to read pointer file", { filepath, error });
+                        readFailures.push(filepath);
                         continue;
                     }
 
@@ -975,17 +1093,24 @@ export class GitService {
                                 },
                                 [bytes]
                             );
+
+                            if (!infos || infos.length === 0) {
+                                throw new Error(
+                                    `LFS upload for ${filepath} returned no pointer info — the file may not have been uploaded`,
+                                );
+                            }
+
                             this.debugLog("[GitService] Uploaded blob to LFS", {
                                 filepath,
                                 oid: infos[0].oid,
                             });
 
-                            const pointerBlob = lfs.formatPointerInfo(infos[0]);
+                            const pointerBlob = formatPointerInfo(infos[0]);
                             await fs.promises.writeFile(
                                 absolutePathToFill,
                                 Buffer.from(pointerBlob)
                             );
-                            await git.add({ fs, dir, filepath });
+                            await dugiteGit.add(dir, filepath);
                             this.debugLog("[GitService] Wrote pointer and staged", { filepath });
 
                             const filesAbs = this.getFilesPathForPointer(dir, filepath);
@@ -1009,10 +1134,7 @@ export class GitService {
                                 `[GitService] Failed to convert blob in pointers dir for ${filepath}:`,
                                 e
                             );
-                            this.debugLog("[GitService] Failed to convert blob to pointer", {
-                                filepath,
-                                error: e,
-                            });
+                            conversionFailures.push(filepath);
                         }
                         continue;
                     }
@@ -1035,6 +1157,27 @@ export class GitService {
                         targets.push({ filesAbs, filepath, size: pointer.size });
                         oidToTargets.set(pointer.oid, targets);
                     }
+                }
+
+                // Surface any analysis-phase failures
+                if (readFailures.length > 0 || conversionFailures.length > 0) {
+                    const parts: string[] = [];
+                    if (readFailures.length > 0) {
+                        parts.push(
+                            `${readFailures.length} pointer file(s) could not be read: ${readFailures.slice(0, 5).join(", ")}` +
+                            (readFailures.length > 5 ? ` (+${readFailures.length - 5} more)` : "")
+                        );
+                    }
+                    if (conversionFailures.length > 0) {
+                        parts.push(
+                            `${conversionFailures.length} blob-to-pointer conversion(s) failed: ${conversionFailures.slice(0, 5).join(", ")}` +
+                            (conversionFailures.length > 5 ? ` (+${conversionFailures.length - 5} more)` : "")
+                        );
+                    }
+                    console.warn(`[GitService] reconcilePointersFilesystem analysis issues: ${parts.join("; ")}`);
+                    vscode.window.showWarningMessage(
+                        `Some media files could not be processed and may be unavailable. Try syncing again.`
+                    );
                 }
 
                 const oidsToDownload = enableDownloads ? Array.from(oidToTargets.keys()) : [];
@@ -1067,7 +1210,7 @@ export class GitService {
                     })),
                 };
 
-                const batchResp = await fetch(`${lfsBaseUrl}/info/lfs/objects/batch`, {
+                const batchResp = await fetchWithTimeout(`${lfsBaseUrl}/info/lfs/objects/batch`, {
                     method: "POST",
                     headers: {
                         ...authHeaders,
@@ -1169,7 +1312,7 @@ export class GitService {
                                 size: oidToTargets.get(oid)?.[0]?.size ?? 0,
                             })),
                         };
-                        const retryResp = await fetch(`${lfsBaseUrl}/info/lfs/objects/batch`, {
+                        const retryResp = await fetchWithTimeout(`${lfsBaseUrl}/info/lfs/objects/batch`, {
                             method: "POST",
                             headers: {
                                 ...authHeaders,
@@ -1188,7 +1331,12 @@ export class GitService {
                             }
                         }
                     } catch (e) {
-                        console.warn("[GitService] Retry batch after healing failed:", e);
+                        const detail = e instanceof Error ? e.message : String(e);
+                        console.error(
+                            `[GitService] Retry LFS batch request after healing failed: ${detail}. ` +
+                            `${missingOids.length} OID(s) will remain unavailable for download.`,
+                            e
+                        );
                     }
                 }
 
@@ -1202,12 +1350,14 @@ export class GitService {
                     const sampleText =
                         sampleTargets.length > 0 ? ` e.g. ${sampleTargets.join(", ")}` : "";
                     vscode.window.showWarningMessage(
-                        `Some LFS objects are missing on the server and could not be healed automatically (${stillMissing.length} file(s))${sampleText}. Ask the original author to re-upload to heal pointers.`
+                        `${stillMissing.length} media file(s) are missing on the server and couldn't be recovered${sampleText}. The original author may need to re-upload them.`
                     );
                 }
 
                 // Phase 3: concurrent downloads with progress and connection reuse by origin
                 let completed = 0;
+                let downloadFailureCount = 0;
+                const downloadFailedOids: string[] = [];
                 const concurrency = vscode.workspace
                     .getConfiguration("frontier")
                     .get<number>("lfsDownloadConcurrency", 12);
@@ -1242,15 +1392,12 @@ export class GitService {
 
                         try {
                             const dlHeaders: Record<string, string> = { ...(action.header ?? {}) };
-                            const controller = new AbortController();
-                            const timeoutId = setTimeout(() => controller.abort(), 10 * 60 * 1000);
-                            const fileResp = await fetch(action.href, {
+                            const fileResp = await fetchWithTimeout(action.href, {
                                 method: "GET",
                                 headers: dlHeaders,
-                                signal: controller.signal,
                                 keepalive: false,
+                                timeoutMs: 600_000,
                             });
-                            clearTimeout(timeoutId);
                             if (!fileResp.ok) {
                                 const errorText = await fileResp.text();
                                 throw new Error(
@@ -1273,7 +1420,14 @@ export class GitService {
                                 targetCount: (oidToTargets.get(oid) ?? []).length,
                             });
                         } catch (e) {
-                            this.debugLog(`[GitService] Failed downloading oid ${oid}:`, e);
+                            console.warn(`[GitService] Failed downloading oid ${oid}:`, e);
+                            downloadFailureCount++;
+                            if (downloadFailedOids.length < 10) {
+                                const targets = oidToTargets.get(oid) ?? [];
+                                downloadFailedOids.push(
+                                    ...targets.map((t) => t.filepath)
+                                );
+                            }
                         } finally {
                             completed += 1;
                             const progressMessage =
@@ -1290,7 +1444,18 @@ export class GitService {
                 const workers = Array.from({ length: Math.max(1, concurrency) }, () => runWorker());
                 await Promise.all(workers);
 
-                progress.report({ message: "📎 File download complete" });
+                if (downloadFailureCount > 0) {
+                    const fileList = downloadFailedOids.slice(0, 5).join(", ");
+                    const msg =
+                        `${downloadFailureCount} media file(s) could not be downloaded: ${fileList}` +
+                        (downloadFailedOids.length > 5 ? ` (+${downloadFailedOids.length - 5} more)` : "") +
+                        `. Try syncing again to retry.`;
+                    console.warn(`[GitService] ${msg}`);
+                    vscode.window.showWarningMessage(msg);
+                    progress.report({ message: `📎 Download complete with ${downloadFailureCount} failure(s)` });
+                } else {
+                    progress.report({ message: "📎 File download complete" });
+                }
                 this.debugLog("[GitService] Completed reconcilePointersFilesystem");
             }
         );
@@ -1310,18 +1475,27 @@ export class GitService {
     }
 
     /**
-     * Wraps git operations with a timeout to prevent hanging indefinitely
+     * Wraps git operations with a timeout to prevent hanging indefinitely.
+     *
+     * When an AbortController is provided, its signal is fired on timeout so
+     * that dugite wrapper functions (fetch/push/clone) can SIGTERM the child
+     * git process instead of leaving it running in the background.
      */
     private async withTimeout<T>(
         operation: Promise<T>,
         timeoutMs: number = 10 * 60 * 1000, // 10 minutes
-        operationName: string = "Git operation"
+        operationName: string = "Git operation",
+        remoteUrl?: string,
+        abortController?: AbortController,
     ): Promise<T> {
         const startTime = Date.now();
         this.debugLog(`[GitService] Starting ${operationName} with ${timeoutMs}ms timeout`);
 
+        let timer: ReturnType<typeof setTimeout> | undefined;
+
         const timeout = new Promise<never>((_, reject) => {
-            setTimeout(() => {
+            timer = setTimeout(() => {
+                abortController?.abort();
                 reject(new Error(`${operationName} timed out after ${timeoutMs}ms`));
             }, timeoutMs);
         });
@@ -1343,25 +1517,24 @@ export class GitService {
                     timeoutMs,
                     actualDuration: duration,
                     timestamp: new Date().toISOString(),
+                    platform: process.platform,
                     possibleCauses: [
                         "Network connectivity issues",
                         "Remote server unresponsive",
                         "Firewall/proxy blocking connection",
                         "Large repository data transfer",
-                        "Authentication server delays",
+                        "GIT_ASKPASS credential helper not responding",
                     ],
                 });
 
-                // Add network connectivity check
-                this.logNetworkDiagnostics();
+                this.logNetworkDiagnostics(remoteUrl);
 
                 throw new Error(
                     `${operationName} failed: Network timeout after ${duration}ms. Please check your connection and try again.`
                 );
             }
 
-            // Log other errors with more context
-            console.error(`[GitService] ${operationName} failed after ${duration}ms:`, {
+            console.warn(`[GitService] ${operationName} failed after ${duration}ms:`, {
                 error: error instanceof Error ? error.message : String(error),
                 stack: error instanceof Error ? error.stack : undefined,
                 operation: operationName,
@@ -1370,31 +1543,47 @@ export class GitService {
             });
 
             throw error;
+        } finally {
+            if (timer !== undefined) {
+                clearTimeout(timer);
+            }
         }
     }
 
     /**
-     * Logs network diagnostic information to help debug connectivity issues
+     * Logs network diagnostic information to help debug connectivity issues.
+     * @param remoteUrl Optional git remote URL — its host will be tested alongside standard endpoints.
      */
-    private async logNetworkDiagnostics(): Promise<void> {
+    private async logNetworkDiagnostics(remoteUrl?: string): Promise<void> {
         this.debugLog(`[GitService] Running network diagnostics...`);
 
         const diagnostics = {
             timestamp: new Date().toISOString(),
-            userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "N/A",
-            onlineStatus: typeof navigator !== "undefined" ? (navigator as any).onLine : "Unknown",
+            platform: process.platform,
+            arch: process.arch,
             connectionTests: {} as Record<
                 string,
                 { status: string; responseTime?: number; httpStatus?: number; error?: string; }
             >,
         };
 
-        // Test basic connectivity
         const testEndpoints = [
             { name: "GitLab", url: "https://gitlab.com", timeout: 5000 },
             { name: "Frontier API", url: "https://api.frontierrnd.com", timeout: 5000 },
-            { name: "Google DNS", url: "https://8.8.8.8", timeout: 3000 },
+            { name: "Cloudflare", url: "https://1.1.1.1", timeout: 3000 },
+            { name: "Google DNS", url: "https://dns.google", timeout: 3000 },
+            { name: "Cloudflare.com", url: "https://cloudflare.com", timeout: 3000 },
         ];
+
+        if (remoteUrl) {
+            try {
+                const parsed = new URL(remoteUrl);
+                const origin = parsed.origin;
+                testEndpoints.unshift({ name: `Git Remote (${parsed.hostname})`, url: origin, timeout: 5000 });
+            } catch {
+                // URL parsing failed — skip
+            }
+        }
 
         for (const endpoint of testEndpoints) {
             try {
@@ -1424,7 +1613,47 @@ export class GitService {
     }
 
     /**
-     * Safe push operation with timeout and retry logic
+     * Extract the HTTP status code from an isomorphic-git HttpError or
+     * a dugite error message.  Returns `undefined` when not identifiable.
+     */
+    private static extractHttpStatus(error: unknown): number | undefined {
+        if (error && typeof error === "object" && (error as any).code === "HttpError") {
+            return (error as any).data?.statusCode as number | undefined;
+        }
+        const msg = error instanceof Error ? error.message : String(error);
+        const match = msg.match(/\b(4\d{2}|5\d{2})\b/);
+        return match ? parseInt(match[1], 10) : undefined;
+    }
+
+    /**
+     * Detect whether a push error is a non-fast-forward rejection that can
+     * be recovered by re-fetching and fast-forwarding before retrying.
+     *
+     * Native dugite surfaces this in stderr text; isomorphic-git throws a
+     * PushRejectedError with `.code === "PushRejectedError"` and
+     * `.data.reason === "not-fast-forward"`.  The `originalError` parameter
+     * lets us check the structured code directly, surviving minification.
+     */
+    private static isNonFastForwardError(msg: string, originalError?: unknown): boolean {
+        if (
+            originalError &&
+            typeof originalError === "object" &&
+            (originalError as any).code === "PushRejectedError"
+        ) {
+            const reason = (originalError as any).data?.reason;
+            return reason === "not-fast-forward" || reason === undefined;
+        }
+        return (
+            msg.includes("non-fast-forward") ||
+            msg.includes("rejected") ||
+            msg.includes("One or more branches were not updated") ||
+            msg.includes("failed to update ref")
+        );
+    }
+
+    /**
+     * Safe push operation with timeout, abort-on-timeout, and automatic
+     * retry on non-fast-forward rejection (fetch + fast-forward + push).
      */
     private async safePush(
         dir: string,
@@ -1432,6 +1661,7 @@ export class GitService {
         options?: { ref?: string; timeoutMs?: number; }
     ): Promise<void> {
         const { ref, timeoutMs = 10 * 60 * 1000 } = options || {};
+        const MAX_PUSH_RETRIES = 2;
 
         this.debugLog(`[GitService] Starting push operation:`, {
             directory: dir,
@@ -1440,19 +1670,13 @@ export class GitService {
             timestamp: new Date().toISOString(),
         });
 
-        // Get some context before pushing
+        let remoteUrl: string | undefined;
         try {
-            const currentBranch = await git.currentBranch({ fs, dir });
-            const remoteUrl = await this.getRemoteUrl(dir);
-            const status = await git.statusMatrix({ fs, dir });
-            const changedFiles = status.filter(
-                (entry) => entry[1] !== entry[2] || entry[2] !== entry[3]
-            ).length;
-
+            const branch = await dugiteGit.currentBranch(dir);
+            remoteUrl = await this.getRemoteUrl(dir);
             this.debugLog(`[GitService] Push context:`, {
-                currentBranch,
+                currentBranch: branch,
                 remoteUrl,
-                changedFiles,
                 hasAuth: !!auth.username,
             });
         } catch (contextError) {
@@ -1464,71 +1688,94 @@ export class GitService {
             this.progressCallback("pushing", 0, 0, "Uploading changes");
         }
 
-        const pushOperation = git.push({
-            fs,
-            http,
-            dir,
-            remote: "origin",
-            ...(ref && { ref }),
-            onProgress: (event) => {
-                console.log(
-                    `[GitService] ⬆️  Push progress: ${event.phase || "uploading"} ${event.loaded || 0}/${event.total || 0}`
-                );
-                this.updateSyncProgress("pushing", event);
-            },
-            onAuth: () => {
-                this.debugLog(`[GitService] Authentication requested for push operation`);
-                return auth;
-            },
-        });
-
-        try {
-            await this.withTimeout(pushOperation, timeoutMs, "Push operation");
-            console.log("[GitService] ✓ Push completed successfully");
-            this.debugLog(`[GitService] Push completed successfully`);
-            if (this.progressCallback) {
-                this.progressCallback("pushing", 1, 1, "Upload complete");
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            console.error(`[GitService] Push operation failed:`, {
-                error: errorMessage,
-                directory: dir,
-                ref: ref || "HEAD",
-                timestamp: new Date().toISOString(),
+        for (let attempt = 0; attempt <= MAX_PUSH_RETRIES; attempt++) {
+            const pushController = new AbortController();
+            const pushOperation = dugiteGit.push(dir, auth, {
+                ...(ref && { ref }),
+                signal: pushController.signal,
+                onProgress: (phase, loaded, total) => {
+                    console.log(
+                        `[GitService] ⬆️  Push progress: ${phase || "uploading"} ${loaded || 0}/${total || 0}`
+                    );
+                    this.updateSyncProgress("pushing", { phase, loaded, total });
+                },
             });
 
-            // Provide more helpful error message
-            let userFriendlyMessage = "push failed";
-            if (errorMessage.includes("ENOTFOUND") || errorMessage.includes("getaddrinfo")) {
-                userFriendlyMessage =
-                    "push failed: Cannot reach server (check internet connection)";
-            } else if (errorMessage.includes("401") || errorMessage.includes("authentication")) {
-                userFriendlyMessage =
-                    "push failed: Authentication failed (try logging out and back in)";
-            } else if (errorMessage.includes("403") || errorMessage.includes("forbidden")) {
-                userFriendlyMessage = "push failed: Access denied (check repository permissions)";
-            } else if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
-                userFriendlyMessage = "push failed: Connection timeout (server not responding)";
-            } else if (
-                errorMessage.includes("One or more branches were not updated") ||
-                errorMessage.includes("failed to update ref")
-            ) {
-                // Typical isomorphic-git GitPushError when the remote ref changed
-                // between our last fetch and push (non-fast-forward update).
-                userFriendlyMessage =
-                    "push failed: Remote branch changed since last sync. Please sync again to merge the latest remote changes.";
-            } else if (
-                errorMessage.includes("rejected") ||
-                errorMessage.includes("non-fast-forward")
-            ) {
-                userFriendlyMessage =
-                    "push failed: Remote has changes. Please sync first to merge remote changes.";
-            }
+            try {
+                await this.withTimeout(pushOperation, timeoutMs, "Push operation", remoteUrl, pushController);
+                console.log("[GitService] ✓ Push completed successfully");
+                this.debugLog(`[GitService] Push completed successfully`);
+                if (this.progressCallback) {
+                    this.progressCallback("pushing", 1, 1, "Upload complete");
+                }
+                return;
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                const gitStderr = (error as any)?.originalError?.gitStderr ?? (error as any)?.gitStderr ?? "";
+                const fullMsg = `${errorMessage} ${gitStderr}`;
 
-            const enhancedError = new Error(userFriendlyMessage);
-            (enhancedError as any).originalError = error;
-            throw enhancedError;
+                // On non-fast-forward, fetch + fast-forward and retry the push
+                if (GitService.isNonFastForwardError(fullMsg, error) && attempt < MAX_PUSH_RETRIES) {
+                    const currentBranch = ref || (await dugiteGit.currentBranch(dir)) || "main";
+                    console.warn(
+                        `[GitService] Push rejected (non-fast-forward), attempt ${attempt + 1}/${MAX_PUSH_RETRIES + 1} — fetching and fast-forwarding before retry`,
+                    );
+                    try {
+                        const retryFetchCtrl = new AbortController();
+                        await this.withTimeout(
+                            dugiteGit.fetchOrigin(dir, auth, undefined, retryFetchCtrl.signal),
+                            2 * 60 * 1000,
+                            "Push-retry fetch",
+                            remoteUrl,
+                            retryFetchCtrl,
+                        );
+                        const ffCtrl = new AbortController();
+                        await this.withTimeout(
+                            dugiteGit.fastForward(dir, currentBranch, auth, ffCtrl.signal),
+                            2 * 60 * 1000,
+                            "Push-retry fast-forward",
+                            remoteUrl,
+                            ffCtrl,
+                        );
+                        continue;
+                    } catch (ffErr) {
+                        this.debugLog("[GitService] Fast-forward during push retry failed — giving up:", {
+                            error: ffErr instanceof Error ? ffErr.message : String(ffErr),
+                        });
+                    }
+                }
+
+                console.error(`[GitService] Push operation failed:`, {
+                    error: errorMessage,
+                    directory: dir,
+                    ref: ref || "HEAD",
+                    attempt: attempt + 1,
+                    timestamp: new Date().toISOString(),
+                });
+
+                let userFriendlyMessage = "push failed";
+                const httpStatus = GitService.extractHttpStatus(error);
+                if (errorMessage.includes("ENOTFOUND") || errorMessage.includes("getaddrinfo")) {
+                    userFriendlyMessage =
+                        "push failed: Cannot reach server (check internet connection)";
+                } else if (httpStatus === 401 || errorMessage.includes("401") || errorMessage.includes("authentication")) {
+                    userFriendlyMessage =
+                        "push failed: Authentication failed (try logging out and back in)";
+                } else if (httpStatus === 403 || errorMessage.includes("403") || errorMessage.includes("forbidden")) {
+                    userFriendlyMessage = "push failed: Access denied (check your project permissions)";
+                } else if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
+                    userFriendlyMessage = "push failed: Connection timeout (server not responding)";
+                } else if (GitService.isNonFastForwardError(fullMsg, error)) {
+                    userFriendlyMessage =
+                        "push failed: Remote has newer changes that could not be merged automatically. Please sync again.";
+                } else if (httpStatus && httpStatus >= 500) {
+                    userFriendlyMessage = `push failed: Server error (HTTP ${httpStatus})`;
+                }
+
+                const enhancedError = new Error(userFriendlyMessage);
+                (enhancedError as any).originalError = error;
+                throw enhancedError;
+            }
         }
     }
 
@@ -1602,7 +1849,7 @@ export class GitService {
         let uploadedLfsFiles: string[] = [];
 
         try {
-            const currentBranch = await git.currentBranch({ fs, dir });
+            const currentBranch = await dugiteGit.currentBranch(dir);
             if (!currentBranch) {
                 throw new Error("Not on any branch");
             }
@@ -1659,32 +1906,25 @@ export class GitService {
 
             // 3. Fetch remote changes to get latest state
             this.progressTracker.currentPhase = "fetching";
+            const remoteUrl = await this.getRemoteUrl(dir);
             console.log("[GitService] ⬇️  Fetching remote changes from origin");
-            this.debugLog("[GitService] Fetching remote changes");
+            this.debugLog("[GitService] Fetching remote changes", { remoteUrl });
             if (this.progressCallback) {
                 this.progressCallback("fetching", 0, 0, "Checking for remote changes");
             }
             try {
+                const fetchController = new AbortController();
                 await this.withTimeout(
-                    git.fetch({
-                        fs,
-                        http,
-                        dir,
-                        onProgress: (event) => {
-                            console.log(
-                                `[GitService] ⬇️  Fetch progress: ${event.phase || "downloading"} ${event.loaded || 0}/${event.total || 0}`
-                            );
-                            this.updateSyncProgress("fetching", event);
-                        },
-                        onAuth: () => {
-                            this.debugLog(
-                                "[GitService] Authentication requested for fetch operation"
-                            );
-                            return auth;
-                        },
-                    }),
+                    dugiteGit.fetchOrigin(dir, auth, (phase, loaded, total, transferInfo) => {
+                        console.log(
+                            `[GitService] ⬇️  Fetch progress: ${phase || "downloading"} ${loaded || 0}/${total || 0}`
+                        );
+                        this.updateSyncProgress("fetching", { phase, loaded, total, transferInfo });
+                    }, fetchController.signal),
                     2 * 60 * 1000,
-                    "Fetch operation"
+                    "Fetch operation",
+                    remoteUrl,
+                    fetchController,
                 );
                 console.log("[GitService] ✓ Fetch completed successfully");
                 this.debugLog("[GitService] Fetch completed successfully");
@@ -1694,57 +1934,82 @@ export class GitService {
             } catch (fetchError) {
                 const errorMessage =
                     fetchError instanceof Error ? fetchError.message : String(fetchError);
+                const gitStderr = (fetchError as any)?.gitStderr;
                 console.error("[GitService] Fetch operation failed:", {
                     error: errorMessage,
+                    gitStderr: gitStderr || "(not available — likely JS-level timeout)",
                     directory: dir,
+                    remoteUrl,
                     hasAuth: !!auth.username,
+                    platform: process.platform,
                     timestamp: new Date().toISOString(),
                 });
 
-                // Provide more helpful error message based on error type
                 let userFriendlyMessage = "fetch failed";
+                const fetchHttpStatus = GitService.extractHttpStatus(fetchError);
                 if (errorMessage.includes("ENOTFOUND") || errorMessage.includes("getaddrinfo")) {
                     userFriendlyMessage =
                         "fetch failed: Cannot reach server (check internet connection)";
                 } else if (
+                    fetchHttpStatus === 401 ||
                     errorMessage.includes("401") ||
                     errorMessage.includes("authentication")
                 ) {
                     userFriendlyMessage =
                         "fetch failed: Authentication failed (try logging out and back in)";
-                } else if (errorMessage.includes("403") || errorMessage.includes("forbidden")) {
+                } else if (fetchHttpStatus === 403 || errorMessage.includes("403") || errorMessage.includes("forbidden")) {
                     userFriendlyMessage =
-                        "fetch failed: Access denied (check repository permissions)";
+                        "fetch failed: Access denied (check your project permissions)";
+                } else if (
+                    errorMessage.includes("could not read Username") ||
+                    errorMessage.includes("could not read Password") ||
+                    errorMessage.includes("terminal prompts disabled")
+                ) {
+                    userFriendlyMessage =
+                        "fetch failed: Credential helper error (try logging out and back in)";
                 } else if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
                     userFriendlyMessage =
                         "fetch failed: Connection timeout (server not responding)";
                 } else if (errorMessage.includes("ECONNREFUSED")) {
                     userFriendlyMessage = "fetch failed: Connection refused (server may be down)";
+                } else if (errorMessage.includes("SSL") || errorMessage.includes("certificate")) {
+                    userFriendlyMessage =
+                        "fetch failed: SSL/certificate error (check system certificates)";
+                } else if (fetchHttpStatus && fetchHttpStatus >= 500) {
+                    userFriendlyMessage = `fetch failed: Server error (HTTP ${fetchHttpStatus})`;
                 }
 
-                // Create enhanced error with user-friendly message
                 const enhancedError = new Error(userFriendlyMessage);
                 (enhancedError as any).originalError = fetchError;
                 throw enhancedError;
             }
 
             // 4. Get references to current state
-            let localHead = await git.resolveRef({ fs, dir, ref: "HEAD" });
+            let localHead = await dugiteGit.resolveRef(dir, "HEAD");
             let remoteHead;
             const remoteRef = `refs/remotes/origin/${currentBranch}`;
 
-            // 5. Check if remote branch exists
+            // 5. Check if remote branch exists.
+            // Native dugite signals a missing ref with exit code 128 ("bad revision").
+            // The isomorphic-git fallback throws a NotFoundError instead.
+            // Other failures (repo corruption, permission errors) must propagate
+            // so they aren't silently hidden behind a blind push.
             try {
-                remoteHead = await git.resolveRef({ fs, dir, ref: remoteRef });
+                remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
             } catch (err) {
-                // Remote branch doesn't exist, just push our changes
-                this.debugLog("Remote branch doesn't exist, pushing our changes");
-                await this.safePush(dir, auth);
-                return { hadConflicts: false, uploadedLfsFiles };
+                const isRefNotFound =
+                    (err instanceof dugiteGit.GitOperationError && err.exitCode === 128) ||
+                    (err instanceof Error && (err as any).code === "NotFoundError");
+                if (isRefNotFound) {
+                    this.debugLog("Remote branch doesn't exist, pushing our changes");
+                    await this.safePush(dir, auth);
+                    return { hadConflicts: false, uploadedLfsFiles };
+                }
+                throw err;
             }
 
             // Get files changed in local HEAD (this doesn't need updating after refetch)
-            const localStatusMatrix = await git.statusMatrix({ fs, dir });
+            const localStatusMatrix = await dugiteGit.statusMatrix(dir);
 
             this.debugLog("workingCopyStatusBeforeCommit:", workingCopyStatusBeforeCommit);
             this.debugLog("localStatusMatrix:", localStatusMatrix);
@@ -1783,19 +2048,13 @@ export class GitService {
                     this.progressCallback("merging", 0, 1, "Merging remote changes");
                 }
 
+                const ffController = new AbortController();
                 await this.withTimeout(
-                    git.fastForward({
-                        fs,
-                        http,
-                        dir,
-                        ref: currentBranch,
-                        onAuth: () => {
-                            this.debugLog("[GitService] Authentication requested for fast-forward");
-                            return auth;
-                        },
-                    }),
+                    dugiteGit.fastForward(dir, currentBranch, auth, ffController.signal),
                     2 * 60 * 1000,
-                    "Fast-forward operation"
+                    "Fast-forward operation",
+                    undefined,
+                    ffController,
                 );
 
                 console.log("[GitService] ✓ Fast-forward merge completed successfully");
@@ -1837,7 +2096,7 @@ export class GitService {
             // Re-read local HEAD in case fast-forward succeeded but push failed.
             // Without this, the merge base calculation would use the stale pre-fast-forward
             // localHead, causing incorrect conflict detection and potentially losing data.
-            const currentLocalHead = await git.resolveRef({ fs, dir, ref: "HEAD" });
+            const currentLocalHead = await dugiteGit.resolveRef(dir, "HEAD");
             if (currentLocalHead !== localHead) {
                 this.debugLog("[GitService] Local HEAD moved (fast-forward succeeded, push failed):", {
                     before: localHead.substring(0, 8),
@@ -1850,20 +2109,13 @@ export class GitService {
             // Refetch to ensure we have the absolute latest remote state before analyzing conflicts
             this.debugLog("[GitService] Refetching remote changes before conflict analysis");
             try {
+                const refetchController = new AbortController();
                 await this.withTimeout(
-                    git.fetch({
-                        fs,
-                        http,
-                        dir,
-                        onAuth: () => {
-                            this.debugLog(
-                                "[GitService] Authentication requested for pre-conflict-analysis fetch"
-                            );
-                            return auth;
-                        },
-                    }),
+                    dugiteGit.fetchOrigin(dir, auth, undefined, refetchController.signal),
                     2 * 60 * 1000,
-                    "Pre-conflict-analysis fetch"
+                    "Pre-conflict-analysis fetch",
+                    remoteUrl,
+                    refetchController,
                 );
                 this.debugLog("[GitService] Pre-conflict-analysis fetch completed successfully");
 
@@ -1875,46 +2127,34 @@ export class GitService {
                 }
 
                 // Update remoteHead reference after the new fetch
-                remoteHead = await git.resolveRef({ fs, dir, ref: remoteRef });
+                remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
                 this.debugLog(
                     "[GitService] Updated remote HEAD after refetch:",
                     remoteHead.substring(0, 8)
                 );
             } catch (fetchError) {
+                const detail = fetchError instanceof Error ? fetchError.message : String(fetchError);
                 console.error("[GitService] Pre-conflict-analysis fetch failed:", {
-                    error: fetchError instanceof Error ? fetchError.message : String(fetchError),
+                    error: detail,
                     directory: dir,
                     hasAuth: !!auth.username,
                     timestamp: new Date().toISOString(),
                 });
-                // Continue with conflict analysis using the potentially stale remote state
-                console.warn(
-                    "[GitService] Continuing with conflict analysis using potentially stale remote state"
+                throw new Error(
+                    `Cannot proceed with conflict analysis — failed to fetch latest remote state: ${detail}`
                 );
             }
 
             // Recalculate merge base after potential refetch
-            const updatedMergeBaseCommits = await git.findMergeBase({
-                fs,
-                dir,
-                oids: [localHead, remoteHead],
-            });
+            const updatedMergeBaseCommits = await dugiteGit.findMergeBase(dir, localHead, remoteHead);
 
             this.debugLog("Updated merge base commits after refetch:", updatedMergeBaseCommits);
 
             // Update status matrices with potentially new remote state
-            const updatedRemoteStatusMatrix = await git.statusMatrix({
-                fs,
-                dir,
-                ref: remoteRef,
-            });
+            const updatedRemoteStatusMatrix = await dugiteGit.statusMatrixAtRef(dir, remoteRef);
             const updatedMergeBaseStatusMatrix =
                 updatedMergeBaseCommits.length > 0
-                    ? await git.statusMatrix({
-                        fs,
-                        dir,
-                        ref: updatedMergeBaseCommits[0],
-                    })
+                    ? await dugiteGit.statusMatrixAtRef(dir, updatedMergeBaseCommits[0])
                     : [];
 
             this.debugLog("updatedRemoteStatusMatrix:", updatedRemoteStatusMatrix);
@@ -1922,7 +2162,17 @@ export class GitService {
 
             // Re-read local status matrix now. The original was captured before the fast-forward
             // attempt (step 7) and may be stale if fast-forward succeeded but push was rejected.
-            const updatedLocalStatusMatrix = await git.statusMatrix({ fs, dir }).catch(() => localStatusMatrix);
+            let updatedLocalStatusMatrix: dugiteGit.StatusMatrixEntry[];
+            try {
+                updatedLocalStatusMatrix = await dugiteGit.statusMatrix(dir);
+            } catch (statusErr) {
+                console.warn(
+                    "[GitService] statusMatrix failed during conflict analysis — using pre-fast-forward snapshot. " +
+                    "Conflict detection may be slightly stale.",
+                    statusErr,
+                );
+                updatedLocalStatusMatrix = localStatusMatrix;
+            }
 
             // Convert status matrices to maps for easier lookup
             const localStatusMap = new Map(
@@ -2062,7 +2312,7 @@ export class GitService {
             ];
 
             // 9. Get all files changed in either branch with enhanced conflict detection
-            const conflicts = await Promise.all(
+            const conflictResults = await Promise.allSettled(
                 allChangedFilePaths.map(async (filepath) => {
                     let localContent = "";
                     let remoteContent = "";
@@ -2096,12 +2346,7 @@ export class GitService {
                     // Try to read local content if it exists in local HEAD
                     try {
                         if (!isDeletedLocally && !isAddedLocally) {
-                            const { blob: lBlob } = await git.readBlob({
-                                fs,
-                                dir,
-                                oid: localHead,
-                                filepath,
-                            });
+                            const lBlob = await dugiteGit.readBlobAtRef(dir, localHead, filepath);
                             localContent = new TextDecoder().decode(lBlob);
                         } else if (isAddedLocally) {
                             // For locally added files, read from working directory
@@ -2122,21 +2367,11 @@ export class GitService {
                     // Try to read remote content if it exists in remote HEAD
                     try {
                         if (!isDeletedRemotely && !isAddedRemotely) {
-                            const { blob: rBlob } = await git.readBlob({
-                                fs,
-                                dir,
-                                oid: remoteHead,
-                                filepath,
-                            });
+                            const rBlob = await dugiteGit.readBlobAtRef(dir, remoteHead, filepath);
                             remoteContent = new TextDecoder().decode(rBlob);
                         } else if (isAddedRemotely) {
                             try {
-                                const { blob: rBlob } = await git.readBlob({
-                                    fs,
-                                    dir,
-                                    oid: remoteHead,
-                                    filepath,
-                                });
+                                const rBlob = await dugiteGit.readBlobAtRef(dir, remoteHead, filepath);
                                 remoteContent = new TextDecoder().decode(rBlob);
                             } catch (e) {
                                 this.debugLog(`Error reading remotely added file ${filepath}:`, e);
@@ -2149,12 +2384,7 @@ export class GitService {
                     // Try to read base content if available
                     try {
                         if (updatedMergeBaseCommits.length > 0) {
-                            const { blob: bBlob } = await git.readBlob({
-                                fs,
-                                dir,
-                                oid: updatedMergeBaseCommits[0],
-                                filepath,
-                            });
+                            const bBlob = await dugiteGit.readBlobAtRef(dir, updatedMergeBaseCommits[0], filepath);
                             baseContent = new TextDecoder().decode(bBlob);
                         }
                     } catch (err) {
@@ -2208,20 +2438,38 @@ export class GitService {
                     }
                     return null;
                 })
-            ).then((results) =>
-                results.filter(
-                    (
-                        result
-                    ): result is {
+            );
+            const conflictSettledFailures = conflictResults.filter(
+                (r): r is PromiseRejectedResult => r.status === "rejected"
+            );
+            if (conflictSettledFailures.length > 0) {
+                console.warn(
+                    `[GitService] ${conflictSettledFailures.length} file(s) could not be analysed for conflicts:`,
+                    conflictSettledFailures.map((f) => f.reason instanceof Error ? f.reason.message : String(f.reason))
+                );
+            }
+            const conflicts = conflictResults
+                .filter(
+                    (r): r is PromiseFulfilledResult<{
                         filepath: string;
                         ours: string;
                         theirs: string;
                         base: string;
                         isNew: boolean;
                         isDeleted: boolean;
-                    } => result !== null
+                    } | null> => r.status === "fulfilled"
                 )
-            );
+                .map((r) => r.value)
+                .filter(
+                    (v): v is {
+                        filepath: string;
+                        ours: string;
+                        theirs: string;
+                        base: string;
+                        isNew: boolean;
+                        isDeleted: boolean;
+                    } => v !== null
+                );
 
             this.debugLog(`Found ${conflicts.length} conflicts that need resolution`);
             return {
@@ -2243,9 +2491,9 @@ export class GitService {
 
             // Log additional context that might help with debugging
             try {
-                const currentBranch = await git.currentBranch({ fs, dir });
+                const currentBranch = await dugiteGit.currentBranch(dir);
                 const remoteUrl = await this.getRemoteUrl(dir);
-                const status = await git.statusMatrix({ fs, dir });
+                const status = await dugiteGit.statusMatrix(dir);
 
                 console.error(`[GitService] Sync failure context:`, {
                     currentBranch,
@@ -2310,12 +2558,12 @@ export class GitService {
      * Check if the working copy has any changes
      */
     async getWorkingCopyState(dir: string): Promise<{ isDirty: boolean; status: any[]; }> {
-        const status = await git.statusMatrix({ fs, dir });
+        const status = await dugiteGit.statusMatrix(dir);
         this.debugLog(
             "Status before committing local changes:",
             JSON.stringify(
                 status.filter(
-                    (entry) => entry.includes(0) || entry.includes(2) || entry.includes(3)
+                    (entry) => (entry as (string | number)[]).includes(0) || (entry as (string | number)[]).includes(2) || (entry as (string | number)[]).includes(3)
                 )
             )
         );
@@ -2354,12 +2602,16 @@ export class GitService {
             );
             this.debugLog(`Resolved files: ${resolvedFiles.map((f) => f.filepath).join(", ")}`);
 
-            const currentBranch = await git.currentBranch({ fs, dir });
+            const currentBranch = await dugiteGit.currentBranch(dir);
             if (!currentBranch) {
                 throw new Error("Not on any branch");
             }
 
-            // Stage the resolved files based on their resolution type (LFS-aware)
+            // Stage the resolved files based on their resolution type (LFS-aware).
+            // Every resolved file MUST be staged successfully — if any fail, the
+            // merge commit would be missing those resolutions, producing a commit
+            // that silently reverts the user's conflict choices.
+            const stagingFailures: Array<{ filepath: string; error: string }> = [];
             for (const { filepath, resolution } of resolvedFiles) {
                 this.debugLog(
                     `Processing resolved file: ${filepath} with resolution: ${resolution}`
@@ -2368,17 +2620,41 @@ export class GitService {
                 try {
                     if (resolution === "deleted") {
                         this.debugLog(`Removing file from git: ${filepath}`);
-                        await git.remove({ fs, dir, filepath });
+                        // Ensure the file is also removed from the working tree
+                        // (the resolver should have done this already, but be safe).
+                        const absPath = path.join(dir, filepath);
+                        try {
+                            await fs.promises.unlink(absPath);
+                        } catch {
+                            // Already gone — expected for orphaned / remote-only files
+                        }
+                        // --ignore-unmatch in dugiteGit.remove means this is a safe
+                        // no-op when the file was never in the local index (e.g.
+                        // orphaned files that only exist on the remote).
+                        await dugiteGit.remove(dir, filepath);
                     } else {
                         this.debugLog(`Adding file to git (LFS-aware): ${filepath}`);
                         await this.stageResolvedFileWithLFS(dir, filepath, auth);
                     }
                 } catch (stageErr) {
-                    console.warn(
-                        `[GitService] Non-blocking staging error for ${filepath}; continuing merge:`,
-                        stageErr
+                    const detail = stageErr instanceof Error ? stageErr.message : String(stageErr);
+                    console.error(
+                        `[GitService] Failed to stage resolved file ${filepath}:`,
+                        stageErr,
                     );
+                    stagingFailures.push({ filepath, error: detail });
                 }
+            }
+
+            if (stagingFailures.length > 0) {
+                const fileList = stagingFailures
+                    .map(({ filepath, error }) => `  • ${filepath}: ${error}`)
+                    .join("\n");
+                throw new Error(
+                    `Merge aborted: ${stagingFailures.length} resolved file(s) could not be staged.\n` +
+                    `${fileList}\n` +
+                    `No merge commit was created — the conflict resolutions are still on disk and can be retried.`,
+                );
             }
 
             // Fetch latest changes to ensure we have the most recent remote state
@@ -2386,60 +2662,60 @@ export class GitService {
             // creating a merge commit against a stale remote head, which would cause
             // the subsequent push to be rejected as a non-fast-forward update.
             this.debugLog("[GitService] Fetching latest changes before merge completion");
+            const mergeRemoteUrl = await this.getRemoteUrl(dir);
+            const mergeFetchController = new AbortController();
             await this.withTimeout(
-                git.fetch({
-                    fs,
-                    http,
-                    dir,
-                    onAuth: () => {
-                        this.debugLog("[GitService] Authentication requested for pre-merge fetch");
-                        return auth;
-                    },
-                }),
+                dugiteGit.fetchOrigin(dir, auth, undefined, mergeFetchController.signal),
                 2 * 60 * 1000,
-                "Pre-merge fetch operation"
+                "Pre-merge fetch operation",
+                mergeRemoteUrl,
+                mergeFetchController,
             );
 
             // Get the current state AFTER fetch so our merge commit reflects the latest
             // remote tip. This guarantees that the resulting merge commit will be a
             // fast-forward of the remote (barring a race where someone pushes again
             // between this fetch and our push).
-            const localHead = await git.resolveRef({ fs, dir, ref: currentBranch });
+            let localHead: string;
+            let remoteHead: string;
+            try {
+                localHead = await dugiteGit.resolveRef(dir, currentBranch);
+            } catch (refErr) {
+                throw new Error(
+                    `Cannot resolve local branch '${currentBranch}': ${refErr instanceof Error ? refErr.message : String(refErr)}. ` +
+                    `The merge was not completed — no changes have been pushed.`
+                );
+            }
             const remoteRef = this.getRemoteRef(currentBranch);
-            const remoteHead = await git.resolveRef({ fs, dir, ref: remoteRef });
+            try {
+                remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
+            } catch (refErr) {
+                throw new Error(
+                    `Cannot resolve remote ref '${remoteRef}': the remote branch may have been deleted. ` +
+                    `${refErr instanceof Error ? refErr.message : String(refErr)}. ` +
+                    `The merge was not completed — no changes have been pushed.`
+                );
+            }
             const commitMessage = `Merge branch 'origin/${currentBranch}'`;
             this.debugLog(`Creating merge commit with message: ${commitMessage}`);
 
             try {
-                // Create a merge commit with the two parents
-                await git.commit({
-                    fs,
-                    dir,
-                    message: commitMessage,
-                    author: {
-                        name: author.name,
-                        email: author.email,
-                        timestamp: Math.floor(Date.now() / 1000),
-                        timezoneOffset: new Date().getTimezoneOffset(),
-                    },
-                    parent: [localHead, remoteHead],
-                });
+                await dugiteGit.mergeCommit(dir, commitMessage, { name: author.name, email: author.email }, [localHead, remoteHead]);
             } catch (commitError) {
-                console.error("Error creating merge commit:", commitError);
-
-                // Create a regular commit instead
-                this.debugLog("Attempting to create a regular commit with the resolved changes");
-                await git.commit({
-                    fs,
-                    dir,
-                    message: `Resolved conflicts with ${this.getShortRemoteRef(currentBranch)}`,
-                    author: {
-                        name: author.name,
-                        email: author.email,
-                        timestamp: Math.floor(Date.now() / 1000),
-                        timezoneOffset: new Date().getTimezoneOffset(),
-                    },
-                });
+                // A single-parent fallback would silently drop the remote parent
+                // from the merge history, making it look like those changes never
+                // existed. Instead, surface the real error so the sync layer can
+                // retry or the user can investigate.
+                const detail = commitError instanceof Error ? commitError.message : String(commitError);
+                console.error(
+                    `[GitService] mergeCommit failed (local=${localHead.substring(0, 8)}, remote=${remoteHead.substring(0, 8)}):`,
+                    commitError,
+                );
+                throw new Error(
+                    `Failed to create merge commit: ${detail}. ` +
+                    `Local HEAD: ${localHead.substring(0, 8)}, Remote HEAD: ${remoteHead.substring(0, 8)}. ` +
+                    `The merge was not completed — no changes have been pushed.`,
+                );
             }
 
             // Push the merge commit with a more robust approach
@@ -2475,16 +2751,14 @@ export class GitService {
      * Stage all changes in the working directory
      */
     async addAll(dir: string): Promise<void> {
-        const status = await git.statusMatrix({ fs, dir });
+        const status = await dugiteGit.statusMatrix(dir);
 
         // Handle deletions
         const deletedFiles = status
             .filter((entry) => this.fileStatus.isDeleted(entry))
             .map(([filepath]) => filepath);
 
-        for (const filepath of deletedFiles) {
-            await git.remove({ fs, dir, filepath });
-        }
+        await dugiteGit.removeMany(dir, deletedFiles);
 
         // Handle modifications and additions
         const modifiedFiles = status
@@ -2495,9 +2769,7 @@ export class GitService {
             )
             .map(([filepath]) => filepath);
 
-        for (const filepath of modifiedFiles) {
-            await git.add({ fs, dir, filepath });
-        }
+        await dugiteGit.addMany(dir, modifiedFiles);
     }
 
     /**
@@ -2508,7 +2780,7 @@ export class GitService {
         dir: string,
         auth: { username: string; password: string; }
     ): Promise<string[]> {
-        const status = await git.statusMatrix({ fs, dir });
+        const status = await dugiteGit.statusMatrix(dir);
         const uploadedLfsFiles: string[] = [];
 
         // Handle deletions
@@ -2516,9 +2788,7 @@ export class GitService {
             .filter((entry) => this.fileStatus.isDeleted(entry))
             .map(([filepath]) => filepath);
 
-        for (const filepath of deletedFiles) {
-            await git.remove({ fs, dir, filepath });
-        }
+        await dugiteGit.removeMany(dir, deletedFiles);
 
         // Handle modifications and additions
         const modifiedFiles = status
@@ -2544,11 +2814,13 @@ export class GitService {
         const rawBytesFiles: { filepath: string; bytes: Buffer }[] = [];
         // Existing pointers whose backing bytes need uploading to the new repo
         const existingPointerUploads: { filepath: string; bytes: Buffer }[] = [];
+        // Non-LFS files collected for batch staging
+        const nonLfsFilesToAdd: string[] = [];
 
         for (const filepath of modifiedFiles) {
-            // Non-LFS → regular add
+            // Non-LFS → collect for batch add
             if (!(await this.isLfsTracked(dir, filepath))) {
-                await git.add({ fs, dir, filepath });
+                nonLfsFilesToAdd.push(filepath);
                 continue;
             }
 
@@ -2557,17 +2829,23 @@ export class GitService {
                 continue;
             }
 
-            // No remote / auth → fall back to regular add
+            // No remote / auth → cannot upload LFS content; staging as a regular blob
+            // would permanently embed the binary in Git history, so we must abort.
             if (!remoteUrl || !lfsBaseUrl || !effectiveAuth) {
-                console.warn(`[GitService] No remote URL/auth; adding ${filepath} without LFS`);
-                await git.add({ fs, dir, filepath });
-                continue;
+                throw new Error(
+                    `Cannot stage LFS-tracked file "${filepath}" — no remote URL or credentials available. ` +
+                    `Staging it as a regular Git blob would permanently bloat the repository. ` +
+                    `Ensure the project has a configured remote and valid authentication before committing LFS files.`
+                );
             }
 
             const absolutePath = path.join(dir, filepath);
             const buf = await fs.promises.readFile(absolutePath);
 
             // ── Already an LFS pointer? ──
+            // Only catch parsing errors — if the file IS a pointer but handling
+            // fails, that error must propagate (not fall through to raw upload).
+            let existingPointer: ReturnType<typeof this.parseLfsPointer> | undefined;
             try {
                 const asText = buf.toString("utf8");
                 if (asText.length === 0) {
@@ -2575,18 +2853,21 @@ export class GitService {
                         `[GitService] ${filepath} is empty; delegating recovery to upload helper`
                     );
                 }
-                const existingPointer = this.parseLfsPointer(asText);
-                if (existingPointer) {
+                existingPointer = this.parseLfsPointer(asText);
+            } catch {
+                existingPointer = undefined;
+            }
+            if (existingPointer) {
                     this.debugLog(
                         `[GitService] ${filepath} is already an LFS pointer; staging without upload`
                     );
                     // Normalize and stage the pointer
-                    const canonicalPointer = lfs.formatPointerInfo({
+                    const canonicalPointer = formatPointerInfo({
                         oid: existingPointer.oid,
                         size: existingPointer.size,
                     } as any);
                     await fs.promises.writeFile(absolutePath, Buffer.from(canonicalPointer));
-                    await git.add({ fs, dir, filepath });
+                    await dugiteGit.add(dir, filepath);
 
                     if (this.isPointerPath(filepath)) {
                         // Check if files/ dir has real bytes we should upload to the new repo
@@ -2601,7 +2882,7 @@ export class GitService {
                         if (blobBytes && blobBytes.length > 0) {
                             const maybePointer = this.parseLfsPointer(blobBytes.toString("utf8"));
                             if (!maybePointer) {
-                                const buildPointerInfo = (lfs as any).buildPointerInfo;
+                                // buildPointerInfo is now imported from lfsPointerUtils
                                 const info = buildPointerInfo
                                     ? await buildPointerInfo(blobBytes)
                                     : null;
@@ -2650,9 +2931,8 @@ export class GitService {
                             }
                         }
                     }
-                    continue; // pointer already staged — nothing more to do
-                }
-            } catch { /* not a pointer — fall through to raw upload */ }
+                continue; // pointer already staged — nothing more to do
+            }
 
             // Raw bytes — needs upload + pointer creation.
             // If the file is empty and sits in the pointers path, try to recover
@@ -2674,14 +2954,35 @@ export class GitService {
             rawBytesFiles.push({ filepath, bytes: uploadBytes });
         }
 
+        // ── Phase 1b: Batch-stage all non-LFS files in one call ──────────
+        if (nonLfsFilesToAdd.length > 0) {
+            this.debugLog(
+                `[GitService] Batch-staging ${nonLfsFilesToAdd.length} non-LFS file(s)`
+            );
+            await dugiteGit.addMany(dir, nonLfsFilesToAdd);
+        }
+
         // ── Phase 2: Batch-upload raw-bytes files ────────────────────────
         if (rawBytesFiles.length > 0 && lfsBaseUrl && effectiveAuth) {
             const totalBatches = Math.ceil(rawBytesFiles.length / LFS_UPLOAD_BATCH_SIZE);
+            const totalLfsBytes = rawBytesFiles.reduce((sum, f) => sum + f.bytes.length, 0);
             this.debugLog(
                 `[GitService] Batch-uploading ${rawBytesFiles.length} raw LFS files in ${totalBatches} batch(es) of up to ${LFS_UPLOAD_BATCH_SIZE}`
             );
 
-            const buildPointerInfo = (lfs as any).buildPointerInfo;
+            if (this.progressCallback) {
+                this.progressCallback(
+                    "uploading_lfs",
+                    0,
+                    totalLfsBytes,
+                    `Uploading media (${GitService.formatBytes(totalLfsBytes)})`,
+                );
+            }
+
+            let processedBytes = 0;
+            let skippedBytes = 0;
+            let skippedCount = 0;
+            const skippedLfsFiles: string[] = [];
 
             for (let i = 0; i < rawBytesFiles.length; i += LFS_UPLOAD_BATCH_SIZE) {
                 const batch = rawBytesFiles.slice(i, i + LFS_UPLOAD_BATCH_SIZE);
@@ -2697,7 +2998,28 @@ export class GitService {
                         auth: effectiveAuth,
                         recovery: { dir, filepaths: batch.map((f) => f.filepath) },
                     },
-                    batch.map((f) => f.bytes)
+                    batch.map((f) => f.bytes),
+                    (status) => {
+                        processedBytes += status.size;
+                        if (status.alreadyOnServer) {
+                            skippedBytes += status.size;
+                            skippedCount++;
+                        }
+                        if (this.progressCallback) {
+                            const pct = totalLfsBytes > 0
+                                ? Math.round((processedBytes / totalLfsBytes) * 100)
+                                : 100;
+                            const skippedPart = skippedBytes > 0
+                                ? ` — ${GitService.formatBytes(skippedBytes)} already synced`
+                                : "";
+                            this.progressCallback(
+                                "uploading_lfs",
+                                processedBytes,
+                                totalLfsBytes,
+                                `Uploading media (${pct}% — ${GitService.formatBytes(processedBytes)} of ${GitService.formatBytes(totalLfsBytes)}${skippedPart})`,
+                            );
+                        }
+                    },
                 );
 
                 // uploadBlobsToLFSBucket may skip corrupted/empty files, so the
@@ -2722,17 +3044,19 @@ export class GitService {
                         : undefined;
 
                     if (!matchedInfo) {
-                        this.debugLog(
-                            `[GitService] Upload skipped or no pointer for ${filepath} (empty/corrupted)`
+                        console.warn(
+                            `[GitService] LFS upload skipped for "${filepath}" — file may be empty or corrupted. ` +
+                            `It will NOT be included in this commit.`
                         );
+                        skippedLfsFiles.push(filepath);
                         continue;
                     }
 
                     // Write pointer file and stage
-                    const pointerBlob = lfs.formatPointerInfo(matchedInfo);
+                    const pointerBlob = formatPointerInfo(matchedInfo);
                     const absolutePath = path.join(dir, filepath);
                     await fs.promises.writeFile(absolutePath, Buffer.from(pointerBlob));
-                    await git.add({ fs, dir, filepath });
+                    await dugiteGit.add(dir, filepath);
 
                     // Ensure files/ dir has the raw bytes
                     if (this.isPointerPath(filepath)) {
@@ -2750,6 +3074,20 @@ export class GitService {
 
                     uploadedLfsFiles.push(filepath);
                 }
+            }
+
+            if (skippedCount > 0) {
+                this.debugLog(
+                    `[GitService] ${skippedCount} LFS file(s) already on server (${GitService.formatBytes(skippedBytes)} skipped)`
+                );
+            }
+
+            if (skippedLfsFiles.length > 0) {
+                console.warn(
+                    `[GitService] ${skippedLfsFiles.length} LFS file(s) could not be uploaded (empty or corrupted) ` +
+                    `and were excluded from the commit: ${skippedLfsFiles.join(", ")}. ` +
+                    `Check these files and try again.`,
+                );
             }
         }
 
@@ -2777,9 +3115,12 @@ export class GitService {
                         `[GitService] Uploaded batch of ${batch.length} existing pointer byte(s)`
                     );
                 } catch (e) {
-                    console.warn(
-                        `[GitService] Failed to upload existing pointer bytes batch:`,
-                        e
+                    const detail = e instanceof Error ? e.message : String(e);
+                    throw new Error(
+                        `Failed to upload existing LFS pointer bytes (batch starting at index ${i}, ` +
+                        `${batch.length} file(s): ${batch.map((f) => f.filepath).join(", ")}). ` +
+                        `These pointers would reference objects missing from the server. ` +
+                        `Error: ${detail}`
                     );
                 }
             }
@@ -2906,17 +3247,7 @@ export class GitService {
         message: string,
         author: { name: string; email: string; }
     ): Promise<string> {
-        return git.commit({
-            fs,
-            dir,
-            message,
-            author: {
-                name: author.name,
-                email: author.email,
-                timestamp: Math.floor(Date.now() / 1000),
-                timezoneOffset: new Date().getTimezoneOffset(),
-            },
-        });
+        return dugiteGit.commit(dir, message, { name: author.name, email: author.email });
     }
 
     // ========== UTILITY METHODS ==========
@@ -2930,7 +3261,7 @@ export class GitService {
         await vscode.window.withProgress(
             {
                 location: vscode.ProgressLocation.Notification,
-                title: "Cloning repository...",
+                title: "Downloading project...",
                 cancellable: false,
             },
             async (progress) => {
@@ -2939,80 +3270,66 @@ export class GitService {
                     const dirUri = vscode.Uri.file(dir);
                     await vscode.workspace.fs.createDirectory(dirUri);
 
-                    await git.clone({
-                        fs,
-                        http,
-                        dir,
-                        url,
-                        onProgress: (event) => {
-                            if (event.phase === "Receiving objects") {
+                    const cloneCtrl = new AbortController();
+                    await this.withTimeout(
+                        dugiteGit.clone(url, dir, auth ?? undefined, (phase, loaded, total) => {
+                            if (phase === "receiving objects") {
+                                const percent = total ? Math.round(((loaded ?? 0) / total) * 100) : 0;
                                 progress.report({
-                                    message: `${event.phase}: ${event.loaded}/${event.total} objects`,
-                                    increment: (event.loaded / event.total) * 100,
+                                    message: `${percent}% complete`,
+                                    increment: ((loaded ?? 0) / (total || 1)) * 100,
                                 });
                             }
-                        },
-                        ...(auth && {
-                            onAuth: () => auth,
-                        }),
-                    });
+                        }, cloneCtrl.signal),
+                        15 * 60 * 1000,
+                        "Clone",
+                        url,
+                        cloneCtrl,
+                    );
                 } catch (error) {
                     console.error("Clone error:", error);
                     throw new Error(
-                        `Failed to clone repository: ${error instanceof Error ? error.message : "Unknown error"}`
+                        `Failed to download project: ${error instanceof Error ? error.message : "Unknown error"}`
                     );
                 }
             }
         );
 
         // Handle media files (LFS) based on strategy
-        try {
-            if (auth) {
-                const strategy = mediaStrategy || "auto-download"; // Default to auto-download for backward compatibility
+        if (auth) {
+            const strategy = mediaStrategy || "auto-download";
 
-                switch (strategy) {
-                    case "auto-download":
-                        // Start LFS reconciliation in background so opening the project isn't blocked
-                        this.reconcilePointersFilesystem(dir, auth).catch((e: unknown) => {
-                            console.warn("[GitService] Background media download failed:", e);
-                        });
-                        break;
-
-                    case "stream-and-save":
-                        // Stream media files and download in background
-                        // CRITICAL: Populate files folder with pointers for consistency
-                        this.debugLog(
-                            "[GitService] Media strategy set to stream-and-save - populating files folder with pointers"
+            switch (strategy) {
+                case "auto-download":
+                    // Background — don't block project open, but notify on failure
+                    this.reconcilePointersFilesystem(dir, auth).catch((e: unknown) => {
+                        const detail = e instanceof Error ? e.message : String(e);
+                        console.error("[GitService] Background media download failed:", e);
+                        vscode.window.showWarningMessage(
+                            `Some media files couldn't be downloaded. They may be unavailable until the next sync.`
                         );
-                        await this.populateFilesWithPointers(dir).catch((e) => {
-                            console.warn(
-                                "[GitService] Failed to populate files folder with pointers:",
-                                e
-                            );
-                        });
-                        break;
+                    });
+                    break;
 
-                    case "stream-only":
-                        // Don't download media files - they will be streamed on demand
-                        // CRITICAL: Populate files folder with pointers for consistency
-                        this.debugLog(
-                            "[GitService] Media strategy set to stream-only - populating files folder with pointers"
-                        );
-                        await this.populateFilesWithPointers(dir).catch((e) => {
-                            console.warn(
-                                "[GitService] Failed to populate files folder with pointers:",
-                                e
-                            );
-                        });
-                        break;
+                case "stream-and-save":
+                    // Populate is CRITICAL for consistency — let errors propagate
+                    this.debugLog(
+                        "[GitService] Media strategy set to stream-and-save - populating files folder with pointers"
+                    );
+                    await this.populateFilesWithPointers(dir);
+                    break;
 
-                    default:
-                        // Fallback to auto-download for unknown strategies
-                        await this.reconcilePointersFilesystem(dir, auth);
-                }
+                case "stream-only":
+                    // Populate is CRITICAL for consistency — let errors propagate
+                    this.debugLog(
+                        "[GitService] Media strategy set to stream-only - populating files folder with pointers"
+                    );
+                    await this.populateFilesWithPointers(dir);
+                    break;
+
+                default:
+                    await this.reconcilePointersFilesystem(dir, auth);
             }
-        } catch (e) {
-            console.warn("[GitService] Media files download after clone failed:", e);
         }
     }
 
@@ -3040,6 +3357,7 @@ export class GitService {
 
             // Copy each pointer file to files directory
             let copiedCount = 0;
+            const copyFailures: string[] = [];
             for (const pointerFilePath of pointerFiles) {
                 try {
                     // Get relative path from pointers directory
@@ -3056,16 +3374,24 @@ export class GitService {
                     await fs.promises.copyFile(pointerFilePath, targetPath);
                     copiedCount++;
                 } catch (error) {
-                    this.debugLog(
-                        `[populateFilesWithPointers] Failed to copy ${pointerFilePath}:`,
-                        error
-                    );
+                    const rel = path.relative(pointersDir, pointerFilePath);
+                    console.error(`[populateFilesWithPointers] Failed to copy ${rel}:`, error);
+                    copyFailures.push(rel);
                 }
             }
 
             this.debugLog(
                 `[populateFilesWithPointers] Copied ${copiedCount} pointer files to files folder`
             );
+
+            if (copyFailures.length > 0) {
+                throw new Error(
+                    `populateFilesWithPointers: ${copyFailures.length} of ${pointerFiles.length} ` +
+                    `pointer file(s) could not be copied to the files directory. ` +
+                    `Media references will be broken for: ${copyFailures.slice(0, 10).join(", ")}` +
+                    (copyFailures.length > 10 ? ` (and ${copyFailures.length - 10} more)` : "")
+                );
+            }
         } catch (error) {
             console.error("[populateFilesWithPointers] Error:", error);
             throw error;
@@ -3077,50 +3403,52 @@ export class GitService {
      * @param dir - Directory to search
      * @returns Array of file paths
      */
-    private async findAllFilesRecursively(dir: string): Promise<string[]> {
+    private async findAllFilesRecursively(dir: string, maxDepth: number = 50): Promise<string[]> {
         const files: string[] = [];
+        const stack: Array<{ dirPath: string; depth: number }> = [{ dirPath: dir, depth: 0 }];
 
-        try {
-            const entries = await fs.promises.readdir(dir, { withFileTypes: true });
-
-            for (const entry of entries) {
-                const fullPath = path.join(dir, entry.name);
-
-                if (entry.isDirectory()) {
-                    // Recurse into subdirectory
-                    const subFiles = await this.findAllFilesRecursively(fullPath);
-                    files.push(...subFiles);
-                } else if (entry.isFile()) {
-                    files.push(fullPath);
-                }
+        while (stack.length > 0) {
+            const { dirPath, depth } = stack.pop()!;
+            if (depth > maxDepth) {
+                this.debugLog(`[findAllFilesRecursively] Max depth exceeded at ${dirPath}`);
+                continue;
             }
-        } catch (error) {
-            // Directory doesn't exist or can't be read, return empty array
-            this.debugLog(`[findAllFilesRecursively] Error reading ${dir}:`, error);
+            try {
+                const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+                for (const entry of entries) {
+                    const fullPath = path.join(dirPath, entry.name);
+                    if (entry.isDirectory()) {
+                        stack.push({ dirPath: fullPath, depth: depth + 1 });
+                    } else if (entry.isFile()) {
+                        files.push(fullPath);
+                    }
+                }
+            } catch (error) {
+                this.debugLog(`[findAllFilesRecursively] Error reading ${dirPath}:`, error);
+            }
         }
 
         return files;
     }
 
     async add(dir: string, filepath: string): Promise<void> {
-        await git.add({ fs, dir, filepath });
+        await dugiteGit.add(dir, filepath);
     }
 
     async init(dir: string): Promise<void> {
         try {
-            await git.init({ fs, dir, defaultBranch: "main" });
-            await git.branch({ fs, dir, ref: "main", checkout: true });
+            await dugiteGit.init(dir);
         } catch (error) {
             console.error("Init error:", error);
             throw new Error(
-                `Failed to initialize repository: ${error instanceof Error ? error.message : "Unknown error"}`
+                `Failed to set up project: ${error instanceof Error ? error.message : "Unknown error"}`
             );
         }
     }
 
     async getRemoteUrl(dir: string): Promise<string | undefined> {
         try {
-            const remotes = await git.listRemotes({ fs, dir });
+            const remotes = await dugiteGit.listRemotes(dir);
             const origin = remotes.find((remote) => remote.remote === "origin");
             return origin?.url;
             // const sanitizedUrl = this.stripCredentialsFromUrl(origin?.url || "");
@@ -3132,17 +3460,32 @@ export class GitService {
     }
 
     async getRemotes(dir: string): Promise<Array<{ remote: string; url: string; }>> {
-        return git.listRemotes({ fs, dir });
+        return dugiteGit.listRemotes(dir);
     }
 
     async addRemote(dir: string, name: string, url: string): Promise<void> {
         try {
-            await git.addRemote({ fs, dir, remote: name, url });
+            await dugiteGit.addRemote(dir, name, url);
         } catch (error) {
-            // If remote already exists, update it
-            if (error instanceof Error && error.message.includes("already exists")) {
-                await git.deleteRemote({ fs, dir, remote: name });
-                await git.addRemote({ fs, dir, remote: name, url });
+            const isAlreadyExists =
+                (error instanceof Error && error.message.includes("already exists")) ||
+                (error && typeof error === "object" && (error as any).code === "AlreadyExistsError");
+            if (isAlreadyExists) {
+                const existingRemotes = await dugiteGit.listRemotes(dir);
+                const oldUrl = existingRemotes.find((r) => r.remote === name)?.url;
+                await dugiteGit.deleteRemote(dir, name);
+                try {
+                    await dugiteGit.addRemote(dir, name, url);
+                } catch (readdError) {
+                    if (oldUrl) {
+                        try {
+                            await dugiteGit.addRemote(dir, name, oldUrl);
+                        } catch {
+                            // Best-effort restore
+                        }
+                    }
+                    throw readdError;
+                }
             } else {
                 throw error;
             }
@@ -3151,7 +3494,7 @@ export class GitService {
 
     async hasGitRepository(dir: string): Promise<boolean> {
         try {
-            await git.resolveRef({ fs, dir, ref: "HEAD" });
+            await dugiteGit.resolveRef(dir, "HEAD");
             return true;
         } catch (error) {
             return false;
@@ -3164,7 +3507,7 @@ export class GitService {
     }
 
     async setConfig(dir: string, path: string, value: string): Promise<void> {
-        await git.setConfig({ fs, dir, path, value });
+        await dugiteGit.setConfig(dir, path, value);
     }
 
     async push(
@@ -3282,7 +3625,7 @@ export class GitService {
                                 return;
                             }
                             vscode.window.showWarningMessage(
-                                `Missing LFS content for ${filepath}. Ask the original author to re-upload the file to heal the pointer.`
+                                `Media file "${path.basename(filepath)}" is missing. The original author may need to re-upload it.`
                             );
                             this.stateManager.incrementMetric("lfsHealFailed");
                         } catch (healErr) {
@@ -3291,7 +3634,7 @@ export class GitService {
                                 healErr
                             );
                             vscode.window.showWarningMessage(
-                                `Could not heal missing LFS object for ${filepath}. Please re-upload the original file.`
+                                `Couldn't recover media file "${path.basename(filepath)}". Please re-upload the original file.`
                             );
                             this.stateManager.incrementMetric("lfsHealFailed");
                         }
@@ -3301,7 +3644,10 @@ export class GitService {
                 // Non-pointer path: do nothing (no smudging)
             }
         } catch (err) {
-            console.warn(`[GitService] Failed to download LFS object for ${filepath}:`, err);
+            console.warn(`[GitService] Failed to ensure LFS content for ${filepath}:`, err);
+            vscode.window.showWarningMessage(
+                `Media file "${path.basename(filepath)}" could not be loaded. It may become available after the next sync.`
+            );
         }
     }
 
@@ -3336,29 +3682,38 @@ export class GitService {
             return;
         }
 
-        // Fallback: regular add
-        await git.add({ fs, dir, filepath });
+        // Fallback: regular add — verify the file exists first so we get a
+        // clear error rather than a cryptic git exit-code if the resolver
+        // failed to write the file (or it was removed between resolution
+        // and staging).
+        const absPath = path.join(dir, filepath);
+        try {
+            await fs.promises.access(absPath);
+        } catch {
+            throw new Error(
+                `Cannot stage ${filepath}: file does not exist on disk. ` +
+                `It may have been removed between conflict resolution and staging.`
+            );
+        }
+        await dugiteGit.add(dir, filepath);
     }
 
     async isOnline(): Promise<boolean> {
         try {
             // Check internet connectivity by making HEAD requests and checking response codes
-            const userIsOnline = await fetch("https://gitlab.com", {
+            const userIsOnline = await fetchWithTimeout("https://gitlab.com", {
                 method: "HEAD",
-                cache: "no-store", // Prevent caching
+                cache: "no-store",
+                timeoutMs: HEALTH_CHECK_TIMEOUT_MS,
             })
-                .then((res) => (res as Response).status === 200)
+                .then(async (res) => { await res.text().catch(() => {}); return res.status === 200; })
                 .catch(() => false);
 
             const apiEndpoint = vscode.workspace.getConfiguration("frontier").get<string>("apiEndpoint") || "https://api.frontierrnd.com/api/v1";
-            // Get base URL for health check (remove /api/v1 if present)
             const baseUrl = apiEndpoint.replace(/\/api\/v1\/?$/, "");
 
-            const apiIsOnline = await fetch(baseUrl)
-                .then((res) => {
-                    this.debugLog("apiIsOnline", { res });
-                    return (res as Response).status === 200;
-                })
+            const apiIsOnline = await fetchWithTimeout(baseUrl, { timeoutMs: HEALTH_CHECK_TIMEOUT_MS })
+                .then(async (res) => { await res.text().catch(() => {}); return res.status === 200; })
                 .catch(() => false);
 
             if (!userIsOnline) {
@@ -3368,7 +3723,7 @@ export class GitService {
             }
             if (!apiIsOnline) {
                 vscode.window.showWarningMessage(
-                    "The API is offline. Please try again later. Your local changes are saved, and will sync to the cloud when the API is back online."
+                    "The server is currently unavailable. Please try again later. Your local changes are saved and will sync when the connection is restored."
                 );
             }
             return userIsOnline && apiIsOnline;
@@ -3525,7 +3880,7 @@ export class GitService {
         try {
             const absPath = path.join(dir, filepath);
             const bytes = await fs.promises.readFile(absPath);
-            const buildPointerInfo = (lfs as any).buildPointerInfo;
+            // buildPointerInfo is now imported from lfsPointerUtils
             if (!buildPointerInfo) {
                 return null;
             }
@@ -3547,8 +3902,8 @@ export class GitService {
         filepath: string
     ): Promise<{ oid: string; size: number; } | null> {
         try {
-            const headOid = await git.resolveRef({ fs, dir, ref: "HEAD" });
-            const { blob } = await git.readBlob({ fs, dir, oid: headOid, filepath });
+            const headOid = await dugiteGit.resolveRef(dir, "HEAD");
+            const blob = await dugiteGit.readBlobAtRef(dir, headOid, filepath);
             const text = new TextDecoder().decode(blob);
             return this.parseLfsPointer(text);
         } catch {
@@ -3633,15 +3988,27 @@ export class GitService {
         filepath: string,
         authFromCaller?: { username: string; password: string; }
     ): Promise<boolean> {
+        // Verify file exists before attempting to stage it.
+        // A missing file here usually means the resolver failed to write it or
+        // it was removed between conflict resolution and staging (TOCTOU).
+        const absolutePathToPointerFill = path.join(dir, filepath);
+        try {
+            await fs.promises.access(absolutePathToPointerFill);
+        } catch {
+            throw new Error(
+                `Cannot stage ${filepath}: file does not exist on disk. ` +
+                `It may have been removed between conflict resolution and staging.`
+            );
+        }
+
         // If not LFS-tracked, do normal add
         if (!(await this.isLfsTracked(dir, filepath))) {
             this.debugLog(`[GitService] ${filepath} is not LFS-tracked; adding as normal`);
-            await git.add({ fs, dir, filepath });
+            await dugiteGit.add(dir, filepath);
             return false;
         }
         this.debugLog(`[GitService] ${filepath} is LFS-tracked; adding as LFS`);
         // Read original bytes
-        const absolutePathToPointerFill = path.join(dir, filepath);
         let buf = await fs.promises.readFile(absolutePathToPointerFill);
 
         // Resolve remote URL
@@ -3649,7 +4016,7 @@ export class GitService {
         if (!remoteUrl) {
             // Fall back: just add as normal if we have no remote yet
             console.warn(`[GitService] No remote URL; adding ${filepath} without LFS`);
-            await git.add({ fs, dir, filepath });
+            await dugiteGit.add(dir, filepath);
             return false;
         }
         const { cleanUrl, auth } = GitService.parseGitUrl(remoteUrl);
@@ -3666,26 +4033,31 @@ export class GitService {
 
         if (!effectiveAuth) {
             console.warn(`[GitService] No auth; adding ${filepath} without LFS`);
-            await git.add({ fs, dir, filepath });
+            await dugiteGit.add(dir, filepath);
             return false;
         }
 
         // If the worktree file already contains an LFS pointer, avoid re-uploading.
+        // Only catch parsing errors — if the file IS a pointer but handling
+        // fails, that error must propagate (not fall through to raw upload).
+        let existingPointer: ReturnType<typeof this.parseLfsPointer> | undefined;
         try {
-            let asText = buf.toString("utf8");
+            const asText = buf.toString("utf8");
             if (asText.length === 0) {
-                // Defer empty-pointer handling to upload helper via recovery context
                 this.debugLog(
                     `[GitService] ${filepath} is empty; delegating recovery/corruption handling to upload helper`
                 );
             }
-            const existingPointer = this.parseLfsPointer(asText);
-            if (existingPointer) {
+            existingPointer = this.parseLfsPointer(asText);
+        } catch {
+            existingPointer = undefined;
+        }
+        if (existingPointer) {
                 this.debugLog(
                     `[GitService] ${filepath} is already an LFS pointer; staging without upload`
                 );
                 // Normalize pointer content and stage
-                const canonicalPointer = lfs.formatPointerInfo({
+                const canonicalPointer = formatPointerInfo({
                     oid: existingPointer.oid,
                     size: existingPointer.size,
                 } as any);
@@ -3693,7 +4065,7 @@ export class GitService {
                     absolutePathToPointerFill,
                     Buffer.from(canonicalPointer)
                 );
-                await git.add({ fs, dir, filepath });
+                await dugiteGit.add(dir, filepath);
 
                 if (this.isPointerPath(filepath)) {
                     // If files dir has real bytes, attempt to upload so the new repo has LFS objects
@@ -3711,7 +4083,7 @@ export class GitService {
                         if (!maybePointer) {
                             try {
                                 // Verify bytes match the pointer OID/size before uploading
-                                const buildPointerInfo = (lfs as any).buildPointerInfo;
+                                // buildPointerInfo is now imported from lfsPointerUtils
                                 const info = buildPointerInfo ? await buildPointerInfo(blobBytes) : null;
                                 const oid = String((info as any)?.oid ?? "");
                                 const size = Number((info as any)?.size ?? 0);
@@ -3775,9 +4147,8 @@ export class GitService {
                         }
                     }
                 }
-                return false; // exit early if the file is already an LFS pointer (no upload needed)
-            }
-        } catch { }
+            return false; // exit early if the file is already an LFS pointer (no upload needed)
+        }
         // Upload to LFS via our helper (handles batch, upload, verify and x-http-method)
         this.debugLog(`[GitService] Uploading ${filepath} to LFS`);
         const pointerInfos = await uploadBlobsToLFSBucket(
@@ -3795,11 +4166,11 @@ export class GitService {
             );
             return false;
         }
-        const pointerBlob = lfs.formatPointerInfo(pointerInfos[0]);
+        const pointerBlob = formatPointerInfo(pointerInfos[0]);
 
         // Write pointer and stage it
         await fs.promises.writeFile(absolutePathToPointerFill, Buffer.from(pointerBlob));
-        await git.add({ fs, dir, filepath });
+        await dugiteGit.add(dir, filepath);
         // If the pointer lives under pointers directory, ensure materialized bytes exist in files directory
         if (this.isPointerPath(filepath)) {
             const filesAbs = this.getFilesPathForPointer(dir, filepath);

@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { registerMockAuthProvider } from "../../helpers/mockAuthProvider";
 import { StateManager } from "../../../state";
 
@@ -11,6 +12,7 @@ suite("E2E: Error Recovery", () => {
     let workspaceDir: string;
 
     suiteSetup(async () => {
+        dugiteGit.useEmbeddedGitBinary();
         mockProvider = await registerMockAuthProvider();
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
         assert.ok(ext, "Extension not found");

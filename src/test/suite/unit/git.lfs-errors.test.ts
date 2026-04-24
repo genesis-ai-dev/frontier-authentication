@@ -2,7 +2,7 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import * as git from "isomorphic-git";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { GitService } from "../../../git/GitService";
 
 suite("GitService LFS Error Handling", () => {
@@ -18,9 +18,14 @@ suite("GitService LFS Error Handling", () => {
 
     const gitService = new GitService(stateStub);
 
+    suiteSetup(() => {
+        dugiteGit.useEmbeddedGitBinary();
+    });
+
     setup(async () => {
         repoDir = fs.mkdtempSync(path.join(tmpRoot, "repo-"));
         await gitService.init(repoDir);
+        await dugiteGit.disableLfsFilters(repoDir);
         await gitService.addRemote(repoDir, "origin", "https://example.com/repo.git");
         
         // Setup .gitattributes for LFS
@@ -433,4 +438,3 @@ suite("GitService LFS Error Handling", () => {
         });
     });
 });
-

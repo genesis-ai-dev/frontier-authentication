@@ -49,11 +49,169 @@ interface GitLabProject {
     };
 }
 
+const NETWORK_ERROR_DESCRIPTIONS: Record<string, string> = {
+    ENOTFOUND: "DNS lookup failed - hostname not found",
+    ECONNREFUSED: "Connection refused - server may be down",
+    ECONNRESET: "Connection reset by server",
+    ETIMEDOUT: "Connection timed out",
+    EPIPE: "Connection broken",
+    UND_ERR_CONNECT_TIMEOUT: "Connection timed out",
+    UND_ERR_SOCKET: "Socket error",
+    UNABLE_TO_VERIFY_LEAF_SIGNATURE: "SSL certificate verification failed",
+    DEPTH_ZERO_SELF_SIGNED_CERT: "Self-signed SSL certificate rejected",
+    CERT_HAS_EXPIRED: "SSL certificate has expired",
+    ERR_TLS_CERT_ALTNAME_INVALID: "SSL certificate hostname mismatch",
+};
+
+/** Per-request timeout for GitLab API calls (30 seconds) */
+const REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * Extract meaningful network error details from a fetch TypeError.
+ * Node.js undici wraps the real cause (ENOTFOUND, ECONNREFUSED, SSL errors, etc.)
+ * in error.cause, which is lost when only using error.message.
+ */
+const getNetworkErrorDetails = (error: unknown): string => {
+    if (!(error instanceof Error)) {
+        return String(error);
+    }
+
+    if (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) {
+        return `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s - connection may be unstable`;
+    }
+
+    const cause = (error as Error & { cause?: Error }).cause;
+    if (!cause) {
+        return error.message;
+    }
+
+    const causeCode = (cause as NodeJS.ErrnoException).code;
+    const causeMessage = cause.message;
+    const description = causeCode ? NETWORK_ERROR_DESCRIPTIONS[causeCode] : undefined;
+
+    const parts = [error.message];
+    if (description) {
+        parts.push(description);
+    }
+    if (causeMessage && causeMessage !== error.message) {
+        parts.push(causeMessage);
+    }
+    if (causeCode && !description) {
+        parts.push(`(${causeCode})`);
+    }
+
+    return parts.join(" - ");
+};
+
+const isRetryableNetworkError = (error: unknown): boolean => {
+    if (error instanceof TypeError && error.message === "fetch failed") return true;
+    if (error instanceof DOMException && error.name === "AbortError") return true;
+    if (error instanceof Error && error.name === "TimeoutError") return true;
+    return false;
+};
+
+const isRetryableStatusCode = (status: number): boolean =>
+    status >= 500 || status === 429;
+
+interface RetryConfig {
+    maxRetries: number;
+    initialDelayMs: number;
+}
+
+const DEFAULT_RETRY_CONFIG: RetryConfig = { maxRetries: 3, initialDelayMs: 1000 };
+
 export class GitLabService {
     private gitlabToken: string | undefined;
     private gitlabBaseUrl: string | undefined;
 
     constructor(private authProvider: FrontierAuthProvider) {}
+
+    /**
+     * Central fetch wrapper with automatic auth, retry with exponential backoff + jitter,
+     * and safe error reporting (never leaks tokens).
+     */
+    private async fetchWithRetry(
+        endpoint: string,
+        options: RequestInit = {},
+        retryConfig: RetryConfig = DEFAULT_RETRY_CONFIG,
+    ): Promise<Response> {
+        if (!this.gitlabToken || !this.gitlabBaseUrl) {
+            await this.initializeWithRetry();
+        }
+
+        const { maxRetries, initialDelayMs } = retryConfig;
+        const headers: Record<string, string> = {
+            Authorization: `Bearer ${this.gitlabToken}`,
+            "Content-Type": "application/json",
+            ...(options.headers as Record<string, string> | undefined),
+        };
+
+        let lastError: Error | undefined;
+
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            if (attempt > 0) {
+                const baseDelay = initialDelayMs * Math.pow(2, attempt - 1);
+                const jitter = baseDelay * (0.5 + Math.random() * 0.5);
+                const delay = Math.round(jitter);
+                console.log(
+                    `[GitLabService] Retry ${attempt}/${maxRetries} for ${options.method ?? "GET"} ${endpoint} after ${delay}ms`,
+                );
+                await new Promise((resolve) => setTimeout(resolve, delay));
+            }
+
+            const controller = new AbortController();
+            const timer = setTimeout(
+                () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
+                REQUEST_TIMEOUT_MS,
+            );
+
+            try {
+                const response = await fetch(endpoint, {
+                    ...options,
+                    headers,
+                    signal: controller.signal,
+                });
+
+                clearTimeout(timer);
+
+                if (isRetryableStatusCode(response.status) && attempt < maxRetries) {
+                    const body = await response.text().catch(() => "");
+                    lastError = new Error(
+                        `Server error (${response.status}): ${response.statusText}${body ? ` - ${body.slice(0, 200)}` : ""}`,
+                    );
+                    console.warn(
+                        `[GitLabService] Retryable ${response.status} from ${options.method ?? "GET"} ${endpoint}`,
+                    );
+                    continue;
+                }
+
+                return response;
+            } catch (error) {
+                clearTimeout(timer);
+
+                if (!isRetryableNetworkError(error) || attempt >= maxRetries) {
+                    const details = getNetworkErrorDetails(error);
+                    const totalAttempts = attempt + 1;
+                    throw new Error(
+                        `Network request to ${endpoint} failed after ${totalAttempts} attempt(s): ${details}`,
+                    );
+                }
+
+                lastError = error instanceof Error ? error : new Error(String(error));
+                console.warn(
+                    `[GitLabService] Network error on attempt ${attempt + 1} for ${endpoint}: ${getNetworkErrorDetails(error)}`,
+                );
+            }
+        }
+
+        throw lastError ?? new Error("Unexpected retry loop exit");
+    }
+
+    private async ensureInitialized(): Promise<void> {
+        if (!this.gitlabToken || !this.gitlabBaseUrl) {
+            await this.initializeWithRetry();
+        }
+    }
 
     async initialize(): Promise<void> {
         const sessions = await this.authProvider.getSessions();
@@ -110,48 +268,27 @@ export class GitLabService {
     }
 
     async getCurrentUser(): Promise<GitLabUser> {
-        if (!this.gitlabToken || !this.gitlabBaseUrl) {
-            throw new Error("GitLab not initialized");
-        }
-
-        const response = await fetch(`${this.gitlabBaseUrl}/api/v4/user`, {
-            headers: {
-                Authorization: `Bearer ${this.gitlabToken}`,
-                "Content-Type": "application/json",
-            },
-        });
+        await this.ensureInitialized();
+        const response = await this.fetchWithRetry(`${this.gitlabBaseUrl}/api/v4/user`);
 
         if (!response.ok) {
             throw new Error(`Failed to get user info: ${response.statusText}`);
         }
 
-        const user = (await response.json()) as GitLabUser;
-        // console.log("USER IN GITLAB", JSON.stringify(user, null, 2));
-        return user;
+        return (await response.json()) as GitLabUser;
     }
 
     async getProject(name: string, groupId?: string): Promise<{ id: string; url: string } | null> {
-        if (!this.gitlabToken || !this.gitlabBaseUrl) {
-            await this.initializeWithRetry();
-        }
-
         try {
-            let endpoint: string;
-            if (groupId) {
-                endpoint = `${this.gitlabBaseUrl}/api/v4/groups/${groupId}/projects?search=${encodeURIComponent(name)}`;
-            } else {
-                endpoint = `${this.gitlabBaseUrl}/api/v4/users/${(await this.getCurrentUser()).id}/projects?search=${encodeURIComponent(name)}`;
-            }
+            await this.ensureInitialized();
+            const endpoint = groupId
+                ? `${this.gitlabBaseUrl}/api/v4/groups/${groupId}/projects?search=${encodeURIComponent(name)}`
+                : `${this.gitlabBaseUrl}/api/v4/users/${(await this.getCurrentUser()).id}/projects?search=${encodeURIComponent(name)}`;
 
-            const response = await fetch(endpoint, {
-                headers: {
-                    Authorization: `Bearer ${this.gitlabToken}`,
-                    "Content-Type": "application/json",
-                },
-            });
+            const response = await this.fetchWithRetry(endpoint);
 
             if (!response.ok) {
-                throw new Error(`Failed to get project: ${response.statusText}`);
+                throw new Error(`Failed to get project (${response.status}): ${response.statusText}`);
             }
 
             const projects = await response.json();
@@ -164,168 +301,122 @@ export class GitLabService {
                   }
                 : null;
         } catch (error) {
-            console.error("Error getting project:", error);
-            return null;
+            console.error("[GitLabService] Error getting project:", error instanceof Error ? error.message : error);
+            throw error;
         }
     }
 
     async createProject(options: GitLabProjectOptions): Promise<{ id: string; url: string }> {
-        if (!this.gitlabToken || !this.gitlabBaseUrl) {
-            await this.initializeWithRetry();
+        // First check if project already exists
+        const existingProject = await this.getProject(options.name, options.groupId);
+        if (existingProject) {
+            return existingProject;
         }
 
-        try {
-            // First check if project already exists
-            const existingProject = await this.getProject(options.name, options.groupId);
-            if (existingProject) {
-                return existingProject;
-            }
+        await this.ensureInitialized();
+        const name =
+            options.name.replace(/ /g, "-").replace(/\./g, "-") || vscode.workspace.name;
+        const description = options.description || "";
+        const visibility = options.visibility || "private";
 
-            const name =
-                options.name.replace(/ /g, "-").replace(/\./g, "-") || vscode.workspace.name;
-            const description = options.description || "";
-            const visibility = options.visibility || "private";
+        const endpoint = `${this.gitlabBaseUrl}/api/v4/projects`;
 
-            const endpoint = `${this.gitlabBaseUrl}/api/v4/projects`;
+        const body: Record<string, string | number | boolean | undefined> = {
+            name,
+            description,
+            visibility,
+            // Truly empty repository so the client's initial publish/sync can create
+            // the first commit without diverging from a server-created README commit.
+            initialize_with_readme: false,
+            default_branch_protection: 0,
+        };
 
-            const body: Record<string, any> = {
-                name,
-                description,
-                visibility,
-                // Do NOT initialize with a README. We want a truly empty repository so that
-                // the client's initial publish/sync can create the first commit without
-                // immediately diverging from a server-created README commit.
-                initialize_with_readme: false,
-                default_branch_protection: 0,
-            };
-
-            if (options.groupId) {
-                body.namespace_id = options.groupId;
-            }
-
-            console.log(`Creating project with options:`, JSON.stringify(body, null, 2));
-            console.log(`Making request to: ${endpoint}`);
-            console.log(`Request headers:`, {
-                Authorization: `Bearer ${this.gitlabToken}`,
-                "Content-Type": "application/json",
-            });
-
-            const response = await fetch(endpoint, {
-                method: "POST",
-                headers: {
-                    Authorization: `Bearer ${this.gitlabToken}`,
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify(body),
-            });
-
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => null);
-                const errorMessage = errorData?.message || errorData?.error || response.statusText;
-                console.error("GitLab API error:", {
-                    status: response.status,
-                    statusText: response.statusText,
-                    errorData,
-                    requestBody: body,
-                    requestUrl: endpoint,
-                    requestHeaders: {
-                        Authorization: `Bearer ${this.gitlabToken}`,
-                        "Content-Type": "application/json",
-                    },
-                });
-                throw new Error(`Failed to create project (${response.status}): ${errorMessage}`);
-            }
-
-            const project = await response.json();
-
-            // Add detailed logging of the project response
-            console.log("Project creation response:", {
-                projectId: project.id,
-                projectName: project.name,
-                namespace: project.namespace,
-                fullResponse: project,
-            });
-
-            // Verify the project was created in the correct namespace
-            if (options.groupId && project.namespace?.id?.toString() !== options.groupId) {
-                throw new Error(
-                    `Project was created in incorrect namespace. Expected group ID ${options.groupId}, got ${project.namespace?.id}. Full namespace: ${JSON.stringify(project.namespace)}`
-                );
-            }
-
-            console.log("Project created successfully:", {
-                id: project.id,
-                name: project.name,
-                url: project.http_url_to_repo,
-                namespace: project.namespace,
-            });
-
-            return {
-                id: project.id,
-                url: project.http_url_to_repo,
-            };
-        } catch (error) {
-            console.error("Error in createProject:", error);
-            if (error instanceof Error) {
-                throw new Error(`Failed to create project: ${error.message}`);
-            }
-            throw error;
+        if (options.groupId) {
+            body.namespace_id = options.groupId;
         }
+
+        console.log(`[GitLabService] Creating project at: ${endpoint}`, JSON.stringify(body, null, 2));
+
+        const response = await this.fetchWithRetry(endpoint, {
+            method: "POST",
+            body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => null);
+            const errorMessage = errorData?.message || errorData?.error || response.statusText;
+            console.error("[GitLabService] API error creating project:", {
+                status: response.status,
+                statusText: response.statusText,
+                errorData,
+                requestUrl: endpoint,
+            });
+            throw new Error(`Failed to create project (${response.status}): ${errorMessage}`);
+        }
+
+        const project = await response.json();
+
+        // Verify the project was created in the correct namespace
+        if (options.groupId && project.namespace?.id?.toString() !== options.groupId) {
+            throw new Error(
+                `Project was created in incorrect namespace. Expected group ID ${options.groupId}, got ${project.namespace?.id}. Full namespace: ${JSON.stringify(project.namespace)}`,
+            );
+        }
+
+        console.log("[GitLabService] Project created:", {
+            id: project.id,
+            name: project.name,
+            url: project.http_url_to_repo,
+            namespace: project.namespace?.full_path,
+        });
+
+        return {
+            id: project.id,
+            url: project.http_url_to_repo,
+        };
     }
 
     async listGroups(): Promise<Array<{ id: number; name: string; path: string }>> {
-        if (!this.gitlabToken || !this.gitlabBaseUrl) {
-            await this.initializeWithRetry();
-        }
+        await this.ensureInitialized();
+        const allGroups: Array<{ id: number; name: string; path: string }> = [];
+        let currentPage = 1;
+        let hasNextPage = true;
 
-        try {
-            const allGroups: Array<{ id: number; name: string; path: string }> = [];
-            let currentPage = 1;
-            let hasNextPage = true;
+        while (hasNextPage) {
+            const params = new URLSearchParams({
+                min_access_level: "10",
+                page: currentPage.toString(),
+                per_page: "100",
+            }).toString();
 
-            while (hasNextPage) {
-                const params = new URLSearchParams({
-                    min_access_level: "10",
-                    page: currentPage.toString(),
-                    per_page: "100",
-                }).toString();
+            const response = await this.fetchWithRetry(
+                `${this.gitlabBaseUrl}/api/v4/groups?${params}`,
+            );
 
-                const response = await fetch(`${this.gitlabBaseUrl}/api/v4/groups?${params}`, {
-                    headers: {
-                        Authorization: `Bearer ${this.gitlabToken}`,
-                        "Content-Type": "application/json",
-                    },
-                });
-
-                if (!response.ok) {
-                    const errorText = await response.text();
-                    console.error(`GitLab API error (${response.status}):`, errorText);
-                    throw new Error(
-                        `Failed to list groups: ${response.statusText} (${response.status})`
-                    );
-                }
-
-                const groups = await response.json();
-                console.log(`Retrieved ${groups.length} groups from page ${currentPage}`);
-                allGroups.push(
-                    ...groups.map((group: any) => ({
-                        id: group.id,
-                        name: group.full_name,
-                        path: group.path,
-                    }))
+            if (!response.ok) {
+                const errorText = await response.text();
+                console.error(`[GitLabService] API error listing groups (${response.status}):`, errorText);
+                throw new Error(
+                    `Failed to list groups (${response.status}): ${response.statusText}`,
                 );
-
-                const nextPage = response.headers.get("X-Next-Page");
-                hasNextPage = !!nextPage;
-                currentPage++;
             }
 
-            console.log(`Total groups found: ${allGroups.length}`);
-            return allGroups;
-        } catch (error) {
-            console.error("Failed to list groups:", error);
-            throw error;
+            const groups = await response.json();
+            allGroups.push(
+                ...groups.map((group: any) => ({
+                    id: group.id,
+                    name: group.full_name,
+                    path: group.path,
+                })),
+            );
+
+            const nextPage = response.headers.get("X-Next-Page");
+            hasNextPage = !!nextPage;
+            currentPage++;
         }
+
+        console.log(`[GitLabService] Total groups found: ${allGroups.length}`);
+        return allGroups;
     }
 
     async listProjects(
@@ -335,59 +426,43 @@ export class GitLabService {
             search?: string;
             orderBy?: "id" | "name" | "path" | "created_at" | "updated_at" | "last_activity_at";
             sort?: "asc" | "desc";
-        } = {}
+        } = {},
     ): Promise<GitLabProject[]> {
-        if (!this.gitlabToken || !this.gitlabBaseUrl) {
-            await this.initializeWithRetry();
-        }
+        await this.ensureInitialized();
+        const allProjects: GitLabProject[] = [];
+        let currentPage = 1;
+        let hasNextPage = true;
 
-        try {
-            const allProjects: GitLabProject[] = [];
-            let currentPage = 1;
-            let hasNextPage = true;
+        while (hasNextPage) {
+            const queryParams = new URLSearchParams({
+                ...(options.owned !== undefined && { owned: options.owned.toString() }),
+                ...(options.membership !== undefined && {
+                    membership: options.membership.toString(),
+                }),
+                ...(options.search && { search: options.search }),
+                ...(options.orderBy && { order_by: options.orderBy }),
+                ...(options.sort && { sort: options.sort }),
+                page: currentPage.toString(),
+                per_page: "100",
+            });
 
-            while (hasNextPage) {
-                const queryParams = new URLSearchParams({
-                    ...(options.owned !== undefined && { owned: options.owned.toString() }),
-                    ...(options.membership !== undefined && {
-                        membership: options.membership.toString(),
-                    }),
-                    ...(options.search && { search: options.search }),
-                    ...(options.orderBy && { order_by: options.orderBy }),
-                    ...(options.sort && { sort: options.sort }),
-                    page: currentPage.toString(),
-                    per_page: "100",
-                });
+            const response = await this.fetchWithRetry(
+                `${this.gitlabBaseUrl}/api/v4/projects?${queryParams}`,
+            );
 
-                const response = await fetch(
-                    `${this.gitlabBaseUrl}/api/v4/projects?${queryParams}`,
-                    {
-                        headers: {
-                            Authorization: `Bearer ${this.gitlabToken}`,
-                            "Content-Type": "application/json",
-                        },
-                    }
-                );
-
-                if (!response.ok) {
-                    throw new Error(`Failed to list projects: ${response.statusText}`);
-                }
-
-                const projects = (await response.json()) as GitLabProject[];
-                allProjects.push(...projects);
-
-                const nextPage = response.headers.get("X-Next-Page");
-                hasNextPage = !!nextPage;
-                currentPage++;
+            if (!response.ok) {
+                throw new Error(`Failed to list projects (${response.status}): ${response.statusText}`);
             }
 
-            return allProjects;
-        } catch (error) {
-            console.error("Error listing projects:", error);
-            throw new Error(
-                `Failed to list projects: ${error instanceof Error ? error.message : "Unknown error"}`
-            );
+            const projects = (await response.json()) as GitLabProject[];
+            allProjects.push(...projects);
+
+            const nextPage = response.headers.get("X-Next-Page");
+            hasNextPage = !!nextPage;
+            currentPage++;
         }
+
+        return allProjects;
     }
 
     async getToken(): Promise<string | undefined> {
@@ -425,38 +500,23 @@ export class GitLabService {
     async getRepositoryFile(
         projectId: string,
         filePath: string,
-        ref: string = "main"
+        ref: string = "main",
     ): Promise<string> {
-        if (!this.gitlabToken || !this.gitlabBaseUrl) {
-            await this.initializeWithRetry();
-        }
+        await this.ensureInitialized();
+        const encodedFilePath = encodeURIComponent(filePath);
+        const encodedProjectId = encodeURIComponent(projectId);
+        const endpoint = `${this.gitlabBaseUrl}/api/v4/projects/${encodedProjectId}/repository/files/${encodedFilePath}/raw?ref=${encodeURIComponent(ref)}`;
 
-        try {
-            // URL-encode the file path for the API call
-            const encodedFilePath = encodeURIComponent(filePath);
-            const encodedProjectId = encodeURIComponent(projectId);
-            const endpoint = `${this.gitlabBaseUrl}/api/v4/projects/${encodedProjectId}/repository/files/${encodedFilePath}/raw?ref=${encodeURIComponent(ref)}`;
+        const response = await this.fetchWithRetry(endpoint);
 
-            const response = await fetch(endpoint, {
-                headers: {
-                    Authorization: `Bearer ${this.gitlabToken}`,
-                },
-            });
-
-            if (!response.ok) {
-                if (response.status === 404) {
-                    throw new Error(`File not found: ${filePath}`);
-                }
-                throw new Error(`Failed to fetch file: ${response.statusText}`);
+        if (!response.ok) {
+            if (response.status === 404) {
+                throw new Error(`File not found: ${filePath}`);
             }
-
-            return await response.text();
-        } catch (error) {
-            console.error("Error fetching repository file:", error);
-            throw new Error(
-                `Failed to fetch repository file: ${error instanceof Error ? error.message : "Unknown error"}`
-            );
+            throw new Error(`Failed to fetch file (${response.status}): ${response.statusText}`);
         }
+
+        return await response.text();
     }
 
     /**
@@ -471,17 +531,14 @@ export class GitLabService {
         projectId: string,
         path: string = "",
         ref: string = "main",
-        recursive: boolean = true
+        recursive: boolean = true,
     ): Promise<Array<{ name: string; path: string; type: "blob" | "tree"; mode: string }>> {
-        if (!this.gitlabToken || !this.gitlabBaseUrl) {
-            await this.initializeWithRetry();
-        }
-
         const allItems: Array<{ name: string; path: string; type: "blob" | "tree"; mode: string }> = [];
         let currentPage = 1;
-        const perPage = 100; // Max allowed by GitLab
+        const perPage = 100;
 
         try {
+            await this.ensureInitialized();
             const encodedProjectId = encodeURIComponent(projectId);
 
             while (true) {
@@ -496,18 +553,13 @@ export class GitLabService {
                 }
                 const endpoint = `${this.gitlabBaseUrl}/api/v4/projects/${encodedProjectId}/repository/tree?${params.toString()}`;
 
-                const response = await fetch(endpoint, {
-                    headers: {
-                        Authorization: `Bearer ${this.gitlabToken}`,
-                    },
-                });
+                const response = await this.fetchWithRetry(endpoint);
 
                 if (!response.ok) {
                     if (response.status === 404) {
-                        // Directory doesn't exist - return empty array
                         return [];
                     }
-                    throw new Error(`Failed to fetch repository tree: ${response.statusText}`);
+                    throw new Error(`Failed to fetch repository tree (${response.status}): ${response.statusText}`);
                 }
 
                 const items = await response.json();
@@ -517,7 +569,6 @@ export class GitLabService {
 
                 allItems.push(...items);
 
-                // If we got fewer items than per_page, we're on the last page
                 if (items.length < perPage) {
                     break;
                 }
@@ -527,8 +578,7 @@ export class GitLabService {
 
             return allItems;
         } catch (error) {
-            console.error("Error fetching repository tree:", error);
-            // Return what we have so far on error - don't fail the whole operation
+            console.error("[GitLabService] Error fetching repository tree:", error instanceof Error ? error.message : error);
             return allItems;
         }
     }
@@ -539,40 +589,25 @@ export class GitLabService {
      * @returns Array of contributors with username, name, email, and commit count
      */
     async getProjectContributors(
-        projectId: string
+        projectId: string,
     ): Promise<Array<{ username: string; name: string; email: string; commits: number }>> {
-        if (!this.gitlabToken || !this.gitlabBaseUrl) {
-            await this.initializeWithRetry();
+        await this.ensureInitialized();
+        const encodedProjectId = encodeURIComponent(projectId);
+        const endpoint = `${this.gitlabBaseUrl}/api/v4/projects/${encodedProjectId}/repository/contributors`;
+
+        const response = await this.fetchWithRetry(endpoint);
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch contributors (${response.status}): ${response.statusText}`);
         }
 
-        try {
-            const encodedProjectId = encodeURIComponent(projectId);
-            const endpoint = `${this.gitlabBaseUrl}/api/v4/projects/${encodedProjectId}/repository/contributors`;
-
-            const response = await fetch(endpoint, {
-                headers: {
-                    Authorization: `Bearer ${this.gitlabToken}`,
-                    "Content-Type": "application/json",
-                },
-            });
-
-            if (!response.ok) {
-                throw new Error(`Failed to fetch contributors: ${response.statusText}`);
-            }
-
-            const contributors = await response.json();
-            return contributors.map((contributor: any) => ({
-                username: contributor.username || contributor.name,
-                name: contributor.name,
-                email: contributor.email,
-                commits: contributor.commits,
-            }));
-        } catch (error) {
-            console.error("Error fetching project contributors:", error);
-            throw new Error(
-                `Failed to fetch project contributors: ${error instanceof Error ? error.message : "Unknown error"}`
-            );
-        }
+        const contributors = await response.json();
+        return contributors.map((contributor: any) => ({
+            username: contributor.username || contributor.name,
+            name: contributor.name,
+            email: contributor.email,
+            commits: contributor.commits,
+        }));
     }
 
     /**
@@ -590,70 +625,48 @@ export class GitLabService {
             roleName: string;
         }>
     > {
-        if (!this.gitlabToken || !this.gitlabBaseUrl) {
-            await this.initializeWithRetry();
-        }
+        await this.ensureInitialized();
+        const encodedProjectId = encodeURIComponent(projectId);
+        const allMembers: any[] = [];
+        let page = 1;
+        const perPage = 100;
 
-        try {
-            const encodedProjectId = encodeURIComponent(projectId);
-            const allMembers: any[] = [];
-            let page = 1;
-            const perPage = 100; // Max per page
+        while (true) {
+            const endpoint = `${this.gitlabBaseUrl}/api/v4/projects/${encodedProjectId}/members/all?per_page=${perPage}&page=${page}`;
 
-            // Fetch all pages of members
-            while (true) {
-                // Use 'all' endpoint to include inherited members from groups
-                const endpoint = `${this.gitlabBaseUrl}/api/v4/projects/${encodedProjectId}/members/all?per_page=${perPage}&page=${page}`;
+            const response = await this.fetchWithRetry(endpoint);
 
-                const response = await fetch(endpoint, {
-                    headers: {
-                        Authorization: `Bearer ${this.gitlabToken}`,
-                        "Content-Type": "application/json",
-                    },
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Failed to fetch project members: ${response.statusText}`);
-                }
-
-                const members = await response.json();
-
-                if (!Array.isArray(members) || members.length === 0) {
-                    // No more members to fetch
-                    break;
-                }
-
-                allMembers.push(...members);
-
-                // Check if there are more pages
-                const totalPages = response.headers.get("x-total-pages");
-                if (totalPages && page >= parseInt(totalPages, 10)) {
-                    break;
-                }
-
-                // If we got fewer results than per_page, we're on the last page
-                if (members.length < perPage) {
-                    break;
-                }
-
-                page++;
+            if (!response.ok) {
+                throw new Error(`Failed to fetch project members (${response.status}): ${response.statusText}`);
             }
 
-            console.log(`Fetched ${allMembers.length} total members for project ${projectId}`);
+            const members = await response.json();
 
-            return allMembers.map((member: any) => ({
-                username: member.username,
-                name: member.name,
-                email: member.email || member.public_email || "",
-                accessLevel: member.access_level,
-                roleName: this.getAccessLevelName(member.access_level),
-            }));
-        } catch (error) {
-            console.error("Error fetching project members:", error);
-            throw new Error(
-                `Failed to fetch project members: ${error instanceof Error ? error.message : "Unknown error"}`
-            );
+            if (!Array.isArray(members) || members.length === 0) {
+                break;
+            }
+
+            allMembers.push(...members);
+
+            const totalPages = response.headers.get("x-total-pages");
+            if (totalPages && page >= parseInt(totalPages, 10)) {
+                break;
+            }
+
+            if (members.length < perPage) {
+                break;
+            }
+
+            page++;
         }
+
+        return allMembers.map((member: any) => ({
+            username: member.username,
+            name: member.name,
+            email: member.email || member.public_email || "",
+            accessLevel: member.access_level,
+            roleName: this.getAccessLevelName(member.access_level),
+        }));
     }
 
     /**

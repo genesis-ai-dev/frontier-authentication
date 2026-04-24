@@ -134,8 +134,11 @@
             }
         }
     },
+    "vsce": {
+        "dependencies": false
+    },
     "scripts": {
-        "vscode:prepublish": "npm run test && npm run package",
+        "vscode:prepublish": "npm run test && pnpm run package",
         "clean": "node -e \"const fs=require('fs');['out','dist'].forEach(d=>{try{fs.rmSync(d,{recursive:true,force:true})}catch{}})\"",
         "compile": "webpack",
         "watch": "webpack --watch",
@@ -161,13 +164,11 @@
         "@typescript-eslint/eslint-plugin": "^7.0.2",
         "@typescript-eslint/parser": "^7.0.2",
         "@vscode/test-electron": "^2.3.9",
-        "crypto-browserify": "^3.12.0",
+        "copy-webpack-plugin": "^13.0.1",
         "eslint": "^8.56.0",
         "glob": "^8.1.0",
         "husky": "^9.1.7",
-        "memfs": "^4.7.1",
         "mocha": "^10.2.0",
-        "path-browserify": "^1.0.1",
         "prettier": "^3.4.1",
         "ts-loader": "^9.5.1",
         "typescript": "^5.3.3",
@@ -176,9 +177,10 @@
     },
     "dependencies": {
         "@aws-crypto/sha256-universal": "^2.0.0",
-        "@fetsorn/isogit-lfs": "^0.5.3",
         "diff3": "^0.0.4",
-        "isomorphic-git": "^1.25.3",
-        "node-fetch": "^2.7.0"
+        "dugite": "^3.0.0",
+        "isomorphic-git": "^1.37.4",
+        "node-fetch": "^2.7.0",
+        "tar": "^7.5.9"
     }
 }

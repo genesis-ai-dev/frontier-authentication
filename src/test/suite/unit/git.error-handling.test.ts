@@ -2,7 +2,7 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import * as git from "isomorphic-git";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { GitService } from "../../../git/GitService";
 
 suite("GitService Error Handling", () => {
@@ -17,6 +17,10 @@ suite("GitService Error Handling", () => {
 
     const service = new GitService(stateStub);
 
+    suiteSetup(() => {
+        dugiteGit.useEmbeddedGitBinary();
+    });
+
     setup(async () => {
         repoDir = fs.mkdtempSync(path.join(tmpRoot, "repo-"));
         await service.init(repoDir);
@@ -25,13 +29,11 @@ suite("GitService Error Handling", () => {
         // Create initial commit
         const testFile = path.join(repoDir, "test.txt");
         await fs.promises.writeFile(testFile, "initial content", "utf8");
-        await git.add({ fs, dir: repoDir, filepath: "test.txt" });
-        await git.commit({
-            fs,
-            dir: repoDir,
-            message: "Initial commit",
-            author: { name: "Test", email: "test@example.com" },
-        });
+        await dugiteGit.add(repoDir, "test.txt");
+        await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
+
+        // Bypass the network connectivity check so mocked fetch/push are reached
+        (service as any).isOnline = async () => true;
     });
 
     teardown(async () => {
@@ -42,8 +44,8 @@ suite("GitService Error Handling", () => {
 
     suite("syncChanges - Network Failures", () => {
         test("fetch fails with ENOTFOUND error", async () => {
-            const originalFetch = git.fetch;
-            (git as any).fetch = async () => {
+            const originalFetchOrigin = dugiteGit.fetchOrigin;
+            (dugiteGit as any).fetchOrigin = async () => {
                 const error: any = new Error("getaddrinfo ENOTFOUND example.com");
                 error.code = "ENOTFOUND";
                 throw error;
@@ -64,13 +66,13 @@ suite("GitService Error Handling", () => {
                     "Should throw user-friendly network error"
                 );
             } finally {
-                (git as any).fetch = originalFetch;
+                (dugiteGit as any).fetchOrigin = originalFetchOrigin;
             }
         });
 
         test("fetch fails with ETIMEDOUT error", async () => {
-            const originalFetch = git.fetch;
-            (git as any).fetch = async () => {
+            const originalFetchOrigin = dugiteGit.fetchOrigin;
+            (dugiteGit as any).fetchOrigin = async () => {
                 const error: any = new Error("ETIMEDOUT");
                 error.code = "ETIMEDOUT";
                 throw error;
@@ -91,13 +93,13 @@ suite("GitService Error Handling", () => {
                     "Should throw user-friendly timeout error"
                 );
             } finally {
-                (git as any).fetch = originalFetch;
+                (dugiteGit as any).fetchOrigin = originalFetchOrigin;
             }
         });
 
         test("fetch fails with 401 authentication error", async () => {
-            const originalFetch = git.fetch;
-            (git as any).fetch = async () => {
+            const originalFetchOrigin = dugiteGit.fetchOrigin;
+            (dugiteGit as any).fetchOrigin = async () => {
                 const error: any = new Error("401 Unauthorized");
                 error.statusCode = 401;
                 throw error;
@@ -118,13 +120,13 @@ suite("GitService Error Handling", () => {
                     "Should throw user-friendly auth error"
                 );
             } finally {
-                (git as any).fetch = originalFetch;
+                (dugiteGit as any).fetchOrigin = originalFetchOrigin;
             }
         });
 
         test("fetch fails with 403 forbidden error", async () => {
-            const originalFetch = git.fetch;
-            (git as any).fetch = async () => {
+            const originalFetchOrigin = dugiteGit.fetchOrigin;
+            (dugiteGit as any).fetchOrigin = async () => {
                 const error: any = new Error("403 Forbidden");
                 error.statusCode = 403;
                 throw error;
@@ -145,17 +147,17 @@ suite("GitService Error Handling", () => {
                     "Should throw user-friendly permission error"
                 );
             } finally {
-                (git as any).fetch = originalFetch;
+                (dugiteGit as any).fetchOrigin = originalFetchOrigin;
             }
         });
 
         test("push fails with network error", async () => {
             // Setup: fetch succeeds, push fails
-            const originalFetch = git.fetch;
-            const originalPush = git.push;
+            const originalFetchOrigin = dugiteGit.fetchOrigin;
+            const originalPush = dugiteGit.push;
             
-            (git as any).fetch = async () => ({});
-            (git as any).push = async () => {
+            (dugiteGit as any).fetchOrigin = async () => {};
+            (dugiteGit as any).push = async () => {
                 const error: any = new Error("ECONNREFUSED");
                 error.code = "ECONNREFUSED";
                 throw error;
@@ -176,16 +178,16 @@ suite("GitService Error Handling", () => {
                     "Should throw push error"
                 );
             } finally {
-                (git as any).fetch = originalFetch;
-                (git as any).push = originalPush;
+                (dugiteGit as any).fetchOrigin = originalFetchOrigin;
+                (dugiteGit as any).push = originalPush;
             }
         });
     });
 
     suite("safePush - Error Scenarios", () => {
         test("push rejected due to branch protection (non-fast-forward)", async () => {
-            const originalPush = git.push;
-            (git as any).push = async () => {
+            const originalPush = dugiteGit.push;
+            (dugiteGit as any).push = async () => {
                 const error: any = new Error("One or more branches were not updated: refs/heads/main: failed to update ref");
                 error.name = "GitPushError";
                 throw error;
@@ -197,18 +199,18 @@ suite("GitService Error Handling", () => {
                         await service.push(repoDir, { username: "oauth2", password: "token" });
                     },
                     (error: Error) => {
-                        return error.message.includes("Remote branch changed since last sync");
+                        return error.message.includes("Remote has newer changes");
                     },
                     "Should throw user-friendly branch protection error"
                 );
             } finally {
-                (git as any).push = originalPush;
+                (dugiteGit as any).push = originalPush;
             }
         });
 
         test("push rejected because remote changed (specific error message)", async () => {
-            const originalPush = git.push;
-            (git as any).push = async () => {
+            const originalPush = dugiteGit.push;
+            (dugiteGit as any).push = async () => {
                 const error: any = new Error("failed to update ref");
                 error.name = "GitPushError";
                 throw error;
@@ -220,21 +222,21 @@ suite("GitService Error Handling", () => {
                         await service.push(repoDir, { username: "oauth2", password: "token" });
                     },
                     (error: Error) => {
-                        return error.message.includes("Remote branch changed since last sync");
+                        return error.message.includes("Remote has newer changes");
                     },
                     "Should throw user-friendly remote changed error"
                 );
             } finally {
-                (git as any).push = originalPush;
+                (dugiteGit as any).push = originalPush;
             }
         });
 
         test("push timeout handling", async function() {
             this.timeout(10000); // Longer timeout for test
             
-            const originalPush = git.push;
+            const originalPush = dugiteGit.push;
             let pushCalled = false;
-            (git as any).push = async () => {
+            (dugiteGit as any).push = async () => {
                 pushCalled = true;
                 // Simulate timeout by throwing timeout error
                 const error: any = new Error("ETIMEDOUT");
@@ -255,13 +257,13 @@ suite("GitService Error Handling", () => {
                 );
                 assert.strictEqual(pushCalled, true, "Push should be called");
             } finally {
-                (git as any).push = originalPush;
+                (dugiteGit as any).push = originalPush;
             }
         });
 
         test("push with invalid credentials", async () => {
-            const originalPush = git.push;
-            (git as any).push = async () => {
+            const originalPush = dugiteGit.push;
+            (dugiteGit as any).push = async () => {
                 const error: any = new Error("401 authentication failed");
                 error.statusCode = 401;
                 throw error;
@@ -278,21 +280,20 @@ suite("GitService Error Handling", () => {
                     "Should throw authentication error"
                 );
             } finally {
-                (git as any).push = originalPush;
+                (dugiteGit as any).push = originalPush;
             }
         });
 
         test("push when remote ref changed between fetch and push (race condition)", async () => {
-            const originalFetch = git.fetch;
-            const originalPush = git.push;
+            const originalFetchOrigin = dugiteGit.fetchOrigin;
+            const originalPush = dugiteGit.push;
             
             let fetchCount = 0;
-            (git as any).fetch = async () => {
+            (dugiteGit as any).fetchOrigin = async () => {
                 fetchCount++;
-                return {};
             };
             
-            (git as any).push = async () => {
+            (dugiteGit as any).push = async () => {
                 // Simulate race: remote changed after fetch
                 const error: any = new Error("One or more branches were not updated: refs/heads/main: failed to update ref");
                 error.name = "GitPushError";
@@ -309,13 +310,13 @@ suite("GitService Error Handling", () => {
                         );
                     },
                     (error: Error) => {
-                        return error.message.includes("Remote branch changed since last sync");
+                        return error.message.includes("Remote has newer changes");
                     },
                     "Should handle race condition gracefully"
                 );
             } finally {
-                (git as any).fetch = originalFetch;
-                (git as any).push = originalPush;
+                (dugiteGit as any).fetchOrigin = originalFetchOrigin;
+                (dugiteGit as any).push = originalPush;
             }
         });
     });
@@ -347,8 +348,8 @@ suite("GitService Error Handling", () => {
         });
 
         test("handles error when getting remote URL", async () => {
-            const originalListRemotes = git.listRemotes;
-            (git as any).listRemotes = async () => {
+            const originalListRemotes = dugiteGit.listRemotes;
+            (dugiteGit as any).listRemotes = async () => {
                 throw new Error("Failed to list remotes");
             };
 
@@ -357,9 +358,8 @@ suite("GitService Error Handling", () => {
                 // Should return undefined on error (based on implementation)
                 assert.strictEqual(url, undefined);
             } finally {
-                (git as any).listRemotes = originalListRemotes;
+                (dugiteGit as any).listRemotes = originalListRemotes;
             }
         });
     });
 });
-

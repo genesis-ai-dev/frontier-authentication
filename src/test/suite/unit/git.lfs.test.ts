@@ -2,6 +2,7 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { GitService } from "../../../git/GitService";
 
 suite("Git LFS - Empty Pointer Handling", () => {
@@ -21,6 +22,7 @@ suite("Git LFS - Empty Pointer Handling", () => {
         repoDir = fs.mkdtempSync(path.join(tmpRoot, "repo-"));
         // Initialize repo and set remote
         await git.init(repoDir);
+        await dugiteGit.disableLfsFilters(repoDir);
         await git.addRemote(repoDir, "origin", "https://example.com/repo.git");
 
         // Write .gitattributes marking pointers path as LFS-tracked
@@ -93,6 +95,7 @@ suite("Git LFS - High Priority Scenarios", () => {
     setup(async () => {
         repoDir = fs.mkdtempSync(path.join(tmpRoot, "repo-"));
         await git.init(repoDir);
+        await dugiteGit.disableLfsFilters(repoDir);
         await git.addRemote(repoDir, "origin", "https://example.com/repo.git");
         const attrs = [".project/attachments/pointers/** filter=lfs"].join("\n");
         await fs.promises.writeFile(path.join(repoDir, ".gitattributes"), attrs, "utf8");

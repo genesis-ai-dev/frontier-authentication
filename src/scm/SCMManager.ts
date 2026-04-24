@@ -3,8 +3,7 @@ import * as path from "path";
 import * as fs from "fs";
 import { ConflictedFile, GitService } from "../git/GitService";
 import { GitLabService } from "../gitlab/GitLabService";
-import * as git from "isomorphic-git";
-import http from "isomorphic-git/http/node";
+import * as dugiteGit from "../git/dugiteGit";
 import { PublishWorkspaceOptions } from "../commands/scmCommands";
 import { StateManager } from "../state";
 import { ResolvedFile } from "../extension";
@@ -42,6 +41,7 @@ export class SCMManager {
         };
     }> = new vscode.EventEmitter();
     public readonly onSyncStatusChange = this.syncEventEmitter.event;
+    private isSyncInProgress = false;
 
     constructor(gitLabService: GitLabService, context: vscode.ExtensionContext) {
         this.context = context;
@@ -189,12 +189,11 @@ export class SCMManager {
                 await this.initializeSCM(workspacePath);
             }
 
-            const action = project.url.includes("already exists") ? "cloned" : "created and cloned";
-            vscode.window.showInformationMessage(`Project ${options.name} ${action} successfully!`);
+            vscode.window.showInformationMessage(`Project "${options.name}" is ready!`);
         } catch (error) {
             if (error instanceof Error) {
                 vscode.window.showErrorMessage(
-                    `Failed to create and clone project: ${error.message}`
+                    `Failed to set up project: ${error.message}`
                 );
             }
             throw error;
@@ -240,17 +239,17 @@ export class SCMManager {
                 await this.initializeSCM(workspacePath);
             }
 
-            vscode.window.showInformationMessage("Repository cloned successfully!");
+            vscode.window.showInformationMessage("Project downloaded successfully!");
         } catch (error) {
             if (error instanceof Error) {
-                vscode.window.showErrorMessage(`Failed to clone repository: ${error.message}`);
+                vscode.window.showErrorMessage(`Failed to download project: ${error.message}`);
             }
             throw error;
         }
     }
 
     private async promptForWorkspacePath(defaultName: string): Promise<string | undefined> {
-        vscode.window.showInformationMessage("Prompting for workspace path");
+        vscode.window.showInformationMessage("Choose where to save the project");
         // Use the default downloads directory or home directory
         const homeDir = process.env.HOME || process.env.USERPROFILE;
         const defaultUri = vscode.Uri.file(path.join(homeDir || "", defaultName));
@@ -316,7 +315,7 @@ export class SCMManager {
         } catch (error) {
             console.error("Clone error:", error);
             throw new Error(
-                `Failed to clone repository: ${
+                `Failed to download project: ${
                     error instanceof Error ? error.message : "Unknown error"
                 }`
             );
@@ -465,23 +464,50 @@ export class SCMManager {
     ): Promise<{
         hasConflicts: boolean;
         conflicts?: ConflictedFile[];
+        /** True when sync was blocked by a pre-condition (e.g., outdated extensions). */
+        blocked?: boolean;
         /**
          * Optional diagnostics to help clients validate remote changes vs merged conflicts.
          */
         allChangedFilePaths?: string[];
         remoteChangedFilePaths?: string[];
     }> {
+        // In-memory guard: prevents a second call from slipping through
+        // between the isSyncLocked() check and the actual filesystem lock acquisition
+        if (this.isSyncInProgress) {
+            this.syncEventEmitter.fire({ status: "skipped", message: "Sync already in progress" });
+            return { hasConflicts: false };
+        }
+        this.isSyncInProgress = true;
+
+        try {
+            return await this._syncChangesInner(options, isManualSync);
+        } finally {
+            this.isSyncInProgress = false;
+        }
+    }
+
+    private async _syncChangesInner(
+        options?: { commitMessage?: string },
+        isManualSync: boolean = false
+    ): Promise<{
+        hasConflicts: boolean;
+        conflicts?: ConflictedFile[];
+        blocked?: boolean;
+        allChangedFilePaths?: string[];
+        remoteChangedFilePaths?: string[];
+    }> {
         // Check extension version compatibility with project metadata before syncing
         const canSync = await checkMetadataVersionsForSync(this.context, isManualSync);
         if (!canSync) {
-            return { hasConflicts: false };
+            return { hasConflicts: false, blocked: true };
         }
 
         // Check if another sync is already in progress before firing 'started' event
         if (this.gitService.isSyncLocked()) {
             this.syncEventEmitter.fire({ status: "skipped", message: "Sync already in progress" });
             vscode.window.showInformationMessage(
-                "Sync already in progress. Please wait for the current synchronization to complete."
+                "Sync already in progress. Please wait for it to finish."
             );
             return { hasConflicts: false };
         }
@@ -512,7 +538,7 @@ export class SCMManager {
         try {
             const token = await this.gitLabService.getToken();
             if (!token) {
-                throw new Error("GitLab token not found. Please authenticate first.");
+                throw new Error("Not logged in. Please sign in first.");
             }
 
             const auth = {
@@ -534,36 +560,26 @@ export class SCMManager {
             // Fetch and check remote metadata.json requirements without merging
             try {
                 // Fetch latest remote refs
-                await git.fetch({
-                    fs,
-                    http,
-                    dir: workspacePath,
-                    onAuth: () => auth,
-                });
+                await dugiteGit.fetchOrigin(workspacePath, auth);
 
-                const currentBranch = await git.currentBranch({ fs, dir: workspacePath });
+                const currentBranch = await dugiteGit.currentBranch(workspacePath);
                 if (currentBranch) {
                     const remoteRef = `refs/remotes/origin/${currentBranch}`;
                     let remoteHead: string | undefined;
                     try {
-                        remoteHead = await git.resolveRef({
-                            fs,
-                            dir: workspacePath,
-                            ref: remoteRef,
-                        });
+                        remoteHead = await dugiteGit.resolveRef(workspacePath, remoteRef);
                     } catch (e) {
                         // No remote branch yet; skip remote metadata check
                     }
 
                     if (remoteHead) {
                         try {
-                            const result = await git.readBlob({
-                                fs,
-                                dir: workspacePath,
-                                oid: remoteHead,
-                                filepath: "metadata.json",
-                            });
-                            const text = new TextDecoder().decode(result.blob);
+                            const blob = await dugiteGit.readBlobAtRef(
+                                workspacePath,
+                                remoteHead,
+                                "metadata.json",
+                            );
+                            const text = new TextDecoder().decode(blob);
                             const remoteMetadata = JSON.parse(text) as {
                                 meta?: {
                                     requiredExtensions?: {
@@ -624,7 +640,7 @@ export class SCMManager {
                                         isManualSync
                                     );
                                     if (!allow) {
-                                        return { hasConflicts: false };
+                                        return { hasConflicts: false, blocked: true };
                                     }
                                 }
                             }
@@ -666,12 +682,29 @@ export class SCMManager {
                     }, 4000);
                 }
                 vscode.window.showWarningMessage(
-                    "Sync skipped: another synchronization appears to be in progress. If this persists, ensure .git/frontier-sync.lock does not exist."
+                    "Sync skipped: another sync is already in progress. If this keeps happening, try restarting the app."
                 );
                 // Fire sync skipped event
                 this.syncEventEmitter.fire({
                     status: "skipped",
                     message: "Sync skipped: another sync in progress",
+                });
+                return { hasConflicts: false };
+            }
+
+            // If device was offline, report it instead of showing success
+            if (syncResult.offline) {
+                clearInterval(animationInterval);
+                if (this.syncStatusBarItem) {
+                    this.syncStatusBarItem.text = `$(cloud-offline) Sync skipped (offline)`;
+                    this.syncStatusBarItem.show();
+                    setTimeout(() => {
+                        this.syncStatusBarItem?.hide();
+                    }, 4000);
+                }
+                this.syncEventEmitter.fire({
+                    status: "skipped",
+                    message: "Sync skipped: device is offline",
                 });
                 return { hasConflicts: false };
             }
@@ -791,7 +824,7 @@ export class SCMManager {
             // Push changes
             const token = await this.gitLabService.getToken();
             if (!token) {
-                throw new Error("GitLab token not found. Please authenticate first.");
+                throw new Error("Not logged in. Please sign in first.");
             }
 
             const auth = {
@@ -801,10 +834,10 @@ export class SCMManager {
 
             await this.gitService.push(workspacePath, auth);
 
-            vscode.window.showInformationMessage("Changes committed and pushed successfully");
+            vscode.window.showInformationMessage("Changes uploaded successfully");
         } catch (error) {
             if (error instanceof Error) {
-                vscode.window.showErrorMessage(`Failed to commit changes: ${error.message}`);
+                vscode.window.showErrorMessage(`Failed to upload changes: ${error.message}`);
             }
         }
     }
@@ -822,8 +855,25 @@ export class SCMManager {
         visibility?: "private" | "internal" | "public";
         groupId?: string;
     }): Promise<void> {
+        // Guard against concurrent sync operations for the entire publish flow.
+        // publishWorkspace calls gitService.syncChanges() directly (bypassing
+        // SCMManager.syncChanges()), so without this guard a scheduled auto-sync
+        // can slip through _syncChangesInner, pass the early lock check, start a
+        // slow fetchOrigin, and then collide with publish's lock acquisition —
+        // producing a spurious "Sync skipped" warning to the user.
+        this.isSyncInProgress = true;
+        this.syncEventEmitter.fire({ status: "started", message: "Publishing workspace..." });
+
         try {
             console.log("Starting workspace publish with options:", options);
+
+            // Block publish if installed extensions are older than what metadata.json requires
+            const canPublish = await checkMetadataVersionsForSync(this.context, true);
+            if (!canPublish) {
+                throw new Error(
+                    "Cannot publish: one or more extensions need updating. Please update your extensions and try again."
+                );
+            }
 
             // Initialize GitLab service
             await this.gitLabService.initializeWithRetry();
@@ -923,14 +973,59 @@ export class SCMManager {
             };
 
             console.log("Running full sync as part of publish...");
+            this.syncEventEmitter.fire({ status: "progress", message: "Publishing: syncing changes" });
+
             const syncResult = await this.gitService.syncChanges(workspacePath, auth, author, {
                 commitMessage: "Initial commit",
+                onProgress: (phase, loaded, total, description) => {
+                    this.syncEventEmitter.fire({
+                        status: "progress",
+                        message: description || `${phase}: ${loaded}/${total}`,
+                        progress: { phase, loaded, total, description },
+                    });
+                },
             });
 
+            if (syncResult.skippedDueToLock) {
+                this.syncEventEmitter.fire({ status: "error", message: "Publish failed: sync lock was held by another operation" });
+                throw new Error(
+                    "Publish failed: another sync operation was in progress. Please try again."
+                );
+            }
+
+            if (syncResult.offline) {
+                this.syncEventEmitter.fire({ status: "error", message: "Publish failed: device is offline" });
+                throw new Error(
+                    "Publish failed: you appear to be offline. Please check your internet connection and try again."
+                );
+            }
+
             if (syncResult.hadConflicts) {
+                this.syncEventEmitter.fire({ status: "error", message: "Publish encountered merge conflicts" });
                 throw new Error(
                     "Publish encountered merge conflicts with remote. Please resolve conflicts via sync before publishing."
                 );
+            }
+
+            // Verify the push actually reached the remote by checking the remote tracking ref
+            try {
+                const currentBranch = await dugiteGit.currentBranch(workspacePath);
+                if (currentBranch) {
+                    const localHead = await dugiteGit.resolveRef(workspacePath, "HEAD");
+                    await dugiteGit.fetchOrigin(workspacePath, auth);
+                    const remoteRef = `refs/remotes/origin/${currentBranch}`;
+                    const remoteHead = await dugiteGit.resolveRef(workspacePath, remoteRef);
+                    if (localHead !== remoteHead) {
+                        console.error("[PublishWorkspace] Post-push verification failed: local HEAD", localHead, "!= remote HEAD", remoteHead);
+                        throw new Error("Publish failed: files were not pushed to the remote. Please try again.");
+                    }
+                    console.log("[PublishWorkspace] Post-push verification passed: remote HEAD matches local HEAD");
+                }
+            } catch (verifyError) {
+                if (verifyError instanceof Error && verifyError.message.includes("Publish failed")) {
+                    throw verifyError;
+                }
+                console.warn("[PublishWorkspace] Could not verify push (non-fatal):", verifyError);
             }
 
             // Initialize SCM
@@ -940,17 +1035,25 @@ export class SCMManager {
             // Clear LFS source URL after successful publish
             await this.clearLocalLfsSourceUrl(workspacePath);
 
+            this.syncEventEmitter.fire({ status: "completed", message: "Publish sync complete" });
+
             vscode.window.showInformationMessage(
-                `Workspace published successfully to ${project.url}`
+                `Project published successfully!`
             );
         } catch (error) {
             console.error("Error in publishWorkspace:", error);
+            this.syncEventEmitter.fire({
+                status: "error",
+                message: error instanceof Error ? error.message : "Publish error",
+            });
             if (error instanceof Error) {
                 const errorMessage = error.message;
-                vscode.window.showErrorMessage(`Failed to publish workspace: ${errorMessage}`);
-                throw new Error(`Failed to publish workspace: ${errorMessage}`);
+                vscode.window.showErrorMessage(`Failed to publish project: ${errorMessage}`);
+                throw new Error(`Failed to publish workspace: ${errorMessage}`); // Keep technical for error propagation
             }
             throw error;
+        } finally {
+            this.isSyncInProgress = false;
         }
     }
 

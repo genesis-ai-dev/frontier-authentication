@@ -2,7 +2,7 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import * as git from "isomorphic-git";
+import * as dugiteGit from "../../../git/dugiteGit";
 import { GitService } from "../../../git/GitService";
 
 suite("GitService Working Copy & Repository State", () => {
@@ -16,6 +16,10 @@ suite("GitService Working Copy & Repository State", () => {
     };
 
     const service = new GitService(stateStub);
+
+    suiteSetup(() => {
+        dugiteGit.useEmbeddedGitBinary();
+    });
 
     setup(async () => {
         repoDir = fs.mkdtempSync(path.join(tmpRoot, "repo-"));
@@ -34,13 +38,8 @@ suite("GitService Working Copy & Repository State", () => {
             // Create initial commit
             const file1 = path.join(repoDir, "file1.txt");
             await fs.promises.writeFile(file1, "content1", "utf8");
-            await git.add({ fs, dir: repoDir, filepath: "file1.txt" });
-            await git.commit({
-                fs,
-                dir: repoDir,
-                message: "Initial commit",
-                author: { name: "Test", email: "test@example.com" },
-            });
+            await dugiteGit.add(repoDir, "file1.txt");
+            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
 
             // Add new file (untracked)
             const file2 = path.join(repoDir, "file2.txt");
@@ -57,13 +56,8 @@ suite("GitService Working Copy & Repository State", () => {
             // Create initial commit
             const file1 = path.join(repoDir, "file1.txt");
             await fs.promises.writeFile(file1, "content1", "utf8");
-            await git.add({ fs, dir: repoDir, filepath: "file1.txt" });
-            await git.commit({
-                fs,
-                dir: repoDir,
-                message: "Initial commit",
-                author: { name: "Test", email: "test@example.com" },
-            });
+            await dugiteGit.add(repoDir, "file1.txt");
+            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
 
             // Modify file
             await fs.promises.writeFile(file1, "modified content", "utf8");
@@ -78,13 +72,8 @@ suite("GitService Working Copy & Repository State", () => {
             // Create initial commit
             const file1 = path.join(repoDir, "file1.txt");
             await fs.promises.writeFile(file1, "content1", "utf8");
-            await git.add({ fs, dir: repoDir, filepath: "file1.txt" });
-            await git.commit({
-                fs,
-                dir: repoDir,
-                message: "Initial commit",
-                author: { name: "Test", email: "test@example.com" },
-            });
+            await dugiteGit.add(repoDir, "file1.txt");
+            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
 
             // Delete file
             await fs.promises.unlink(file1);
@@ -99,17 +88,12 @@ suite("GitService Working Copy & Repository State", () => {
             // Create initial commit
             const file1 = path.join(repoDir, "file1.txt");
             await fs.promises.writeFile(file1, "content1", "utf8");
-            await git.add({ fs, dir: repoDir, filepath: "file1.txt" });
-            await git.commit({
-                fs,
-                dir: repoDir,
-                message: "Initial commit",
-                author: { name: "Test", email: "test@example.com" },
-            });
+            await dugiteGit.add(repoDir, "file1.txt");
+            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
 
             // Modify and stage
             await fs.promises.writeFile(file1, "modified", "utf8");
-            await git.add({ fs, dir: repoDir, filepath: "file1.txt" });
+            await dugiteGit.add(repoDir, "file1.txt");
 
             const state = await service.getWorkingCopyState(repoDir);
             assert.strictEqual(state.isDirty, true, "Should detect staged changes");
@@ -129,13 +113,8 @@ suite("GitService Working Copy & Repository State", () => {
             // Create initial commit
             const file1 = path.join(repoDir, "file1.txt");
             await fs.promises.writeFile(file1, "content1", "utf8");
-            await git.add({ fs, dir: repoDir, filepath: "file1.txt" });
-            await git.commit({
-                fs,
-                dir: repoDir,
-                message: "Initial commit",
-                author: { name: "Test", email: "test@example.com" },
-            });
+            await dugiteGit.add(repoDir, "file1.txt");
+            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
 
             const state = await service.getWorkingCopyState(repoDir);
             assert.strictEqual(state.isDirty, false, "Clean repo should not be dirty");
@@ -149,14 +128,9 @@ suite("GitService Working Copy & Repository State", () => {
             const file2 = path.join(repoDir, "file2.txt");
             await fs.promises.writeFile(file1, "content1", "utf8");
             await fs.promises.writeFile(file2, "content2", "utf8");
-            await git.add({ fs, dir: repoDir, filepath: "file1.txt" });
-            await git.add({ fs, dir: repoDir, filepath: "file2.txt" });
-            await git.commit({
-                fs,
-                dir: repoDir,
-                message: "Initial commit",
-                author: { name: "Test", email: "test@example.com" },
-            });
+            await dugiteGit.add(repoDir, "file1.txt");
+            await dugiteGit.add(repoDir, "file2.txt");
+            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
 
             // Make mixed changes
             await fs.promises.writeFile(file1, "modified", "utf8"); // Modified
@@ -183,13 +157,8 @@ suite("GitService Working Copy & Repository State", () => {
             // Create initial commit
             const file1 = path.join(repoDir, "file1.txt");
             await fs.promises.writeFile(file1, "content1", "utf8");
-            await git.add({ fs, dir: repoDir, filepath: "file1.txt" });
-            await git.commit({
-                fs,
-                dir: repoDir,
-                message: "Initial commit",
-                author: { name: "Test", email: "test@example.com" },
-            });
+            await dugiteGit.add(repoDir, "file1.txt");
+            await dugiteGit.commit(repoDir, "Initial commit", { name: "Test", email: "test@example.com" });
 
             const hasRepo = await service.hasGitRepository(repoDir);
             assert.strictEqual(hasRepo, true, "Should return true after first commit");
@@ -214,13 +183,8 @@ suite("GitService Working Copy & Repository State", () => {
             for (let i = 1; i <= 3; i++) {
                 const file = path.join(repoDir, `file${i}.txt`);
                 await fs.promises.writeFile(file, `content${i}`, "utf8");
-                await git.add({ fs, dir: repoDir, filepath: `file${i}.txt` });
-                await git.commit({
-                    fs,
-                    dir: repoDir,
-                    message: `Commit ${i}`,
-                    author: { name: "Test", email: "test@example.com" },
-                });
+                await dugiteGit.add(repoDir, `file${i}.txt`);
+                await dugiteGit.commit(repoDir, `Commit ${i}`, { name: "Test", email: "test@example.com" });
             }
 
             const hasRepo = await service.hasGitRepository(repoDir);
@@ -228,4 +192,3 @@ suite("GitService Working Copy & Repository State", () => {
         });
     });
 });
-

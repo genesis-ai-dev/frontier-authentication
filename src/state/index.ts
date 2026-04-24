@@ -201,12 +201,23 @@ export class StateManager {
                 const ownerGone = typeof lockPid === "number" ? !this.isPidAlive(lockPid) : false;
                 const legacyAndStale = typeof lockPid !== "number" && isStale;
 
-                if (ownerGone || legacyAndStale) {
+                // Detect orphan locks left by our own process.  This happens when
+                // a heartbeat setInterval callback fires during releaseSyncLock's
+                // async unlink and recreates the file.  In that case the PID in the
+                // lock matches ours but hasAcquiredLock is already false.
+                const ownPidButNotAcquired =
+                    typeof lockPid === "number" &&
+                    lockPid === process.pid &&
+                    !this.hasAcquiredLock;
+
+                if (ownerGone || legacyAndStale || ownPidButNotAcquired) {
                     // Lock is stale, force release it
                     console.log(
-                        ownerGone
-                            ? "Orphaned sync lock detected (owner process gone), releasing it"
-                            : "Legacy stale sync lock detected, releasing it"
+                        ownPidButNotAcquired
+                            ? "Orphaned sync lock from heartbeat race detected (our PID, not acquired), releasing it"
+                            : ownerGone
+                                ? "Orphaned sync lock detected (owner process gone), releasing it"
+                                : "Legacy stale sync lock detected, releasing it"
                     );
                     // Directly remove stale file (we don't own an acquired lock here)
                     try {
@@ -229,21 +240,25 @@ export class StateManager {
 
     async releaseSyncLock(): Promise<void> {
         if (this.hasAcquiredLock && this.lockFilePath) {
+            const pathToDelete = this.lockFilePath;
+
+            // Clear in-memory state SYNCHRONOUSLY before the async unlink.
+            // The heartbeat setInterval may have an already-queued callback that
+            // fires when the unlink yields to the event loop.  If hasAcquiredLock
+            // is still true at that point, the heartbeat will recreate the file
+            // (via writeFile) and leave an orphan lock on disk.
+            this.lockFilePath = undefined;
+            this.hasAcquiredLock = false;
+
             try {
-                // Remove the lock file
-                await fs.promises.unlink(this.lockFilePath);
+                await fs.promises.unlink(pathToDelete);
                 console.log("Sync lock released");
             } catch (error: any) {
                 if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
-                    // File already removed externally; treat as released
                     console.log("Lock file already removed; clearing in-memory lock state");
                 } else {
                     console.log("Error releasing sync lock:", error);
-                    // For non-ENOENT errors, still clear in-memory lock to avoid wedging the session
                 }
-            } finally {
-                this.lockFilePath = undefined;
-                this.hasAcquiredLock = false;
             }
         }
     }
@@ -463,24 +478,30 @@ export class StateManager {
         phase?: string;
         progress?: { current: number; total: number; description?: string };
     }): Promise<void> {
-        if (!this.hasAcquiredLock || !this.lockFilePath) {
-            return; // Don't write if we don't own the lock
+        // Capture path locally so it can't become undefined between the guard
+        // and the async fs calls if releaseSyncLock() runs concurrently.
+        const filePath = this.lockFilePath;
+        if (!this.hasAcquiredLock || !filePath) {
+            return;
         }
         
         try {
-            // Read existing data (for merge)
             let existingData: any = { pid: process.pid };
             try {
-                const content = await fs.promises.readFile(this.lockFilePath, 'utf8');
+                const content = await fs.promises.readFile(filePath, 'utf8');
                 existingData = JSON.parse(content);
             } catch {
                 // File missing or corrupted - will create fresh
             }
+
+            // If lock was released while we were reading, bail out
+            if (!this.hasAcquiredLock) {
+                return;
+            }
             
-            // Merge new data
             const payload = JSON.stringify({
                 ...existingData,
-                pid: process.pid, // Always our PID
+                pid: process.pid,
                 timestamp: data?.timestamp || Date.now(),
                 lastProgress: data?.lastProgress || existingData.lastProgress || Date.now(),
                 phase: data?.phase || existingData.phase || 'syncing',
@@ -490,12 +511,11 @@ export class StateManager {
                 ...(data?.progress && { progress: data.progress })
             });
             
-            // Write atomically (not append mode, full replace)
-            await fs.promises.writeFile(this.lockFilePath, payload, { encoding: 'utf8' });
+            await fs.promises.writeFile(filePath, payload, { encoding: 'utf8' });
             
         } catch (error) {
             console.error("[StateManager] Failed to update lock heartbeat:", error);
-            throw error; // Propagate so caller can track failures
+            throw error;
         }
     }
 

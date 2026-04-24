@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
 
 /**
  * Extension version checker for frontier-authentication.
@@ -6,6 +8,7 @@ import * as vscode from "vscode";
  * DESIGN: This extension delegates all metadata.json writes to codex-editor
  * via commands. This implements the "single writer" principle to prevent
  * conflicts and the issues that were causing metadata.json to be deleted.
+ * Reads, however, can safely go directly to disk.
  */
 
 // Compare only the numeric x.y.z core. Affixes like -pr123 or -pr123-shorthash are ignored.
@@ -142,26 +145,46 @@ interface MetadataVersionCheckResult {
 }
 
 /**
- * Read extension versions from metadata.json via codex-editor command
+ * Read extension versions from metadata.json.
+ * Prefers the codex-editor command (which goes through the write-queue-aware
+ * MetadataManager), but falls back to a direct disk read when codex-editor
+ * isn't active yet (common during startup). Reads are always safe — the
+ * "single writer" principle only governs writes.
  */
 async function getExtensionVersionsViaCommand(): Promise<{
     success: boolean;
     versions?: { codexEditor?: string; frontierAuthentication?: string };
     error?: string;
 }> {
+    // Try via codex-editor command first (write-queue-aware, most reliable)
+    const commandResult = await tryReadViaCommand();
+    if (commandResult.success) {
+        return commandResult;
+    }
+
+    // Fallback: read metadata.json directly from disk
+    debug(`[getExtensionVersions] Command unavailable (${commandResult.error}), reading metadata.json directly`);
+    return readVersionsFromDisk();
+}
+
+async function tryReadViaCommand(): Promise<{
+    success: boolean;
+    versions?: { codexEditor?: string; frontierAuthentication?: string };
+    error?: string;
+}> {
     try {
-        // Check if codex-editor is available
         const codexExtension = vscode.extensions.getExtension("project-accelerate.codex-editor-extension");
         if (!codexExtension) {
             return { success: false, error: "Codex Editor extension not available" };
         }
 
-        // Ensure it's activated
+        // Never force-activate codex-editor here: this function is called from
+        // the version-check command that codex-editor itself may await during its
+        // own activation, which would create a circular-wait deadlock.
         if (!codexExtension.isActive) {
-            await codexExtension.activate();
+            return { success: false, error: "Codex Editor extension not yet active" };
         }
 
-        // Call the command
         const result = await vscode.commands.executeCommand<{
             success: boolean;
             versions?: { codexEditor?: string; frontierAuthentication?: string };
@@ -174,33 +197,34 @@ async function getExtensionVersionsViaCommand(): Promise<{
     }
 }
 
-/**
- * Update extension versions in metadata.json via codex-editor command
- */
-async function updateExtensionVersionsViaCommand(
-    versions: { codexEditor?: string; frontierAuthentication?: string }
-): Promise<{ success: boolean; error?: string }> {
+async function readVersionsFromDisk(): Promise<{
+    success: boolean;
+    versions?: { codexEditor?: string; frontierAuthentication?: string };
+    error?: string;
+}> {
     try {
-        // Check if codex-editor is available
-        const codexExtension = vscode.extensions.getExtension("project-accelerate.codex-editor-extension");
-        if (!codexExtension) {
-            return { success: false, error: "Codex Editor extension not available" };
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            return { success: false, error: "No workspace folder open" };
         }
 
-        // Ensure it's activated
-        if (!codexExtension.isActive) {
-            await codexExtension.activate();
+        const metadataPath = path.join(workspaceFolder.uri.fsPath, "metadata.json");
+        const content = await fs.promises.readFile(metadataPath, "utf8");
+        const text = content.trim();
+
+        if (!text) {
+            return { success: false, error: "metadata.json is empty" };
         }
 
-        // Call the command
-        const result = await vscode.commands.executeCommand<{ success: boolean; error?: string }>(
-            "codex-editor.updateMetadataExtensionVersions",
-            versions
-        );
-
-        return result || { success: false, error: "No response from command" };
+        const metadata = JSON.parse(text);
+        const versions = metadata?.meta?.requiredExtensions ?? {};
+        return { success: true, versions };
     } catch (error) {
-        return { success: false, error: `Command failed: ${(error as Error).message}` };
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+            return { success: true, versions: {} };
+        }
+        return { success: false, error: `Direct read failed: ${(error as Error).message}` };
     }
 }
 
@@ -210,14 +234,14 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
 
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
         if (!workspaceFolder) {
-            console.warn("[MetadataVersionChecker] ❌ No workspace folder found");
+            console.warn("[MetadataVersionChecker] No workspace folder found");
             return { canSync: false, metadataUpdated: false, reason: "No workspace folder" };
         }
 
         const codexEditorVersion = getCurrentExtensionVersion("project-accelerate.codex-editor-extension");
         const frontierAuthVersion = getCurrentExtensionVersion("frontier-rnd.frontier-authentication");
 
-        debug("[MetadataVersionChecker] 📦 Current versions:");
+        debug("[MetadataVersionChecker] Installed versions:");
         debug(`  - Codex Editor: ${codexEditorVersion || "not found"}`);
         debug(`  - Frontier Authentication: ${frontierAuthVersion || "not found"}`);
 
@@ -227,7 +251,7 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
             if (!frontierAuthVersion) missingExtensions.push("Frontier Authentication");
 
             console.error(
-                `[MetadataVersionChecker] ❌ Missing required extensions: ${missingExtensions.join(", ")}`
+                `[MetadataVersionChecker] Missing required extensions: ${missingExtensions.join(", ")}`
             );
             return {
                 canSync: false,
@@ -237,10 +261,10 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
             };
         }
 
-        // Read current versions via codex-editor command
+        // Read-only: read versions from metadata.json (codex-editor owns all writes)
         const currentVersionsResult = await getExtensionVersionsViaCommand();
         if (!currentVersionsResult.success) {
-            console.warn("[MetadataVersionChecker] ❌ Could not read metadata.json:", currentVersionsResult.error);
+            console.warn("[MetadataVersionChecker] Could not read metadata.json:", currentVersionsResult.error);
             return { canSync: false, metadataUpdated: false, reason: "Could not read metadata file" };
         }
 
@@ -248,21 +272,13 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
         const metadataCodexVersion = currentVersions.codexEditor;
         const metadataFrontierVersion = currentVersions.frontierAuthentication;
 
-        debug("[MetadataVersionChecker] 📋 Metadata requires:");
+        debug("[MetadataVersionChecker] Metadata requires:");
         debug(`  - Codex Editor: ${metadataCodexVersion || "not set"}`);
         debug(`  - Frontier Authentication: ${metadataFrontierVersion || "not set"}`);
 
-        let needsUpdate = false;
+        // Compare installed vs required — only block if installed is explicitly older.
+        // Missing versions in metadata are fine: codex-editor writes them on activation.
         const outdatedExtensions: ExtensionVersionInfo[] = [];
-        const versionsToUpdate: { codexEditor?: string; frontierAuthentication?: string } = {};
-
-        // Check if versions need updating
-        if (!metadataCodexVersion || !metadataFrontierVersion) {
-            debug("[MetadataVersionChecker] ➕ Adding missing extension version requirements to metadata");
-            needsUpdate = true;
-            if (!metadataCodexVersion) versionsToUpdate.codexEditor = codexEditorVersion;
-            if (!metadataFrontierVersion) versionsToUpdate.frontierAuthentication = frontierAuthVersion;
-        }
 
         if (metadataCodexVersion) {
             const codexCheck = checkRequiredVersion(
@@ -281,7 +297,7 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
 
             if (codexCheck.kind === "ok" && codexCheck.comparison < 0) {
                 console.warn(
-                    `[MetadataVersionChecker] ⚠️  Codex Editor outdated: ${codexEditorVersion} < ${metadataCodexVersion}`
+                    `[MetadataVersionChecker] Codex Editor outdated: ${codexEditorVersion} < ${metadataCodexVersion}`
                 );
                 outdatedExtensions.push({
                     extensionId: "project-accelerate.codex-editor-extension",
@@ -291,13 +307,10 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
                     downloadUrl: "",
                     displayName: "Codex Editor",
                 });
-            } else if (codexCheck.kind === "ok" && codexCheck.comparison > 0) {
-                debug(
-                    `[MetadataVersionChecker] 🚀 Updating Codex Editor version: ${metadataCodexVersion} → ${codexEditorVersion}`
-                );
-                versionsToUpdate.codexEditor = codexEditorVersion;
-                needsUpdate = true;
             }
+            // kind === "invalid_required": logged inside helper; fall through (fail-open).
+            // kind === "ok" && comparison >= 0: codex-editor owns writes via
+            // MetadataManager.ensureExtensionVersionsRecorded on project open.
         }
 
         if (metadataFrontierVersion) {
@@ -317,7 +330,7 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
 
             if (frontierCheck.kind === "ok" && frontierCheck.comparison < 0) {
                 console.warn(
-                    `[MetadataVersionChecker] ⚠️  Frontier Authentication outdated: ${frontierAuthVersion} < ${metadataFrontierVersion}`
+                    `[MetadataVersionChecker] Frontier Authentication outdated: ${frontierAuthVersion} < ${metadataFrontierVersion}`
                 );
                 outdatedExtensions.push({
                     extensionId: "frontier-rnd.frontier-authentication",
@@ -327,37 +340,16 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
                     downloadUrl: "",
                     displayName: "Frontier Authentication",
                 });
-            } else if (frontierCheck.kind === "ok" && frontierCheck.comparison > 0) {
-                debug(
-                    `[MetadataVersionChecker] 🚀 Updating Frontier Authentication version: ${metadataFrontierVersion} → ${frontierAuthVersion}`
-                );
-                versionsToUpdate.frontierAuthentication = frontierAuthVersion;
-                needsUpdate = true;
             }
         }
 
-        // Update metadata via codex-editor command if needed
-        if (needsUpdate) {
-            const updateResult = await updateExtensionVersionsViaCommand(versionsToUpdate);
-            if (!updateResult.success) {
-                console.error("[MetadataVersionChecker] ❌ Failed to update metadata:", updateResult.error);
-                return {
-                    canSync: false,
-                    metadataUpdated: false,
-                    reason: `Failed to update metadata: ${updateResult.error}`,
-                };
-            }
-            debug("[MetadataVersionChecker] 💾 Metadata updated with latest extension versions");
-        }
-
-        const canSync = outdatedExtensions.length === 0;
-        if (!canSync) {
+        if (outdatedExtensions.length > 0) {
             console.warn(
-                `[MetadataVersionChecker] 🚫 Sync blocked due to ${outdatedExtensions.length} outdated extension(s)`
+                `[MetadataVersionChecker] Sync blocked due to ${outdatedExtensions.length} outdated extension(s)`
             );
             return {
                 canSync: false,
-                metadataUpdated: needsUpdate,
+                metadataUpdated: false,
                 reason: `Extensions need updating: ${outdatedExtensions
                     .map((ext) => `${ext.displayName} (${ext.currentVersion} → ${ext.latestVersion})`)
                     .join(", ")}`,
@@ -366,10 +358,10 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
             };
         }
 
-        debug("[MetadataVersionChecker] ✅ All extension versions compatible with metadata");
-        return { canSync: true, metadataUpdated: needsUpdate };
+        debug("[MetadataVersionChecker] All extension versions compatible with metadata");
+        return { canSync: true, metadataUpdated: false };
     } catch (error) {
-        console.error("[MetadataVersionChecker] ❌ Error during metadata version check:", error);
+        console.error("[MetadataVersionChecker] Error during metadata version check:", error);
         return {
             canSync: false,
             metadataUpdated: false,
@@ -643,25 +635,26 @@ export function registerVersionCheckCommands(context: vscode.ExtensionContext): 
 
                 // Fetch remote refs and read remote metadata.json (best effort)
                 try {
-                    const git = await import("isomorphic-git");
-                    const fs = (await import("fs")).promises as any;
-                    const http = (await import("isomorphic-git/http/node")).default;
-                    await git.fetch({ fs, http, dir: workspacePath } as any);
+                    const dugiteGit = await import("../git/dugiteGit");
+                    // Only fetch if git binary is configured (it may not be during tests)
+                    if (dugiteGit.isGitBinaryConfigured()) {
+                        // We need auth but don't have it here — skip fetch, rely on cached remote refs
+                        // The SCMManager fetch in syncChanges will have updated refs already
+                    }
                 } catch {}
 
                 let mismatch = false;
                 try {
-                    const git = await import("isomorphic-git");
-                    const fs = (await import("fs")).promises as any;
-                    const currentBranch = await git.currentBranch({ fs, dir: workspacePath });
+                    const dugiteGit = await import("../git/dugiteGit");
+                    const currentBranch = await dugiteGit.currentBranch(workspacePath);
                     if (currentBranch) {
                         const remoteRef = `refs/remotes/origin/${currentBranch}`;
                         let remoteHead: string | undefined;
-                        try { remoteHead = await git.resolveRef({ fs, dir: workspacePath, ref: remoteRef }); } catch {}
+                        try { remoteHead = await dugiteGit.resolveRef(workspacePath, remoteRef); } catch {}
                         if (remoteHead) {
                             try {
-                                const result = await git.readBlob({ fs, dir: workspacePath, oid: remoteHead, filepath: "metadata.json" });
-                                const text = new TextDecoder().decode(result.blob);
+                                const blob = await dugiteGit.readBlobAtRef(workspacePath, remoteHead, "metadata.json");
+                                const text = new TextDecoder().decode(blob);
                                 const remoteMetadata = JSON.parse(text) as { meta?: { requiredExtensions?: { codexEditor?: string; frontierAuthentication?: string } } };
                                 const required = remoteMetadata.meta?.requiredExtensions;
                                 if (required) {

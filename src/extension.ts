@@ -12,6 +12,9 @@ import {
 import { initialState, StateManager } from "./state";
 import { AuthState } from "./types/state";
 import { ConflictedFile, GitService as GitServiceClass } from "./git/GitService";
+import * as gitBinaryManager from "./git/gitBinaryManager";
+import * as dugiteGit from "./git/dugiteGit";
+import * as path from "path";
 
 // Module-level gitService instance
 let gitServiceInstance: GitServiceClass | undefined;
@@ -136,6 +139,24 @@ export interface FrontierAPI {
         path?: string,
         ref?: string
     ) => Promise<Array<{ name: string; path: string; type: "blob" | "tree" }>>;
+
+    /**
+     * Get the path to the dugite-native git binary (downloaded at runtime).
+     * Used by codex-editor to share the same binary without downloading again.
+     */
+    getGitBinaryPath: () => { localGitDir: string; execPath: string } | undefined;
+    isGitBinaryAvailable: () => boolean;
+    /** Returns true when git operations can succeed (native binary OR isomorphic-git fallback). */
+    isGitAvailable: () => boolean;
+    /**
+     * Returns true when the current OS/arch has a prebuilt dugite-native
+     * asset in the release we pin to. When false, any "Download and install"
+     * UI should be hidden — the download can never succeed on this platform.
+     */
+    isGitBinaryNativelySupported: () => boolean;
+    retryGitBinaryDownload: () => Promise<boolean>;
+    /** Delete the downloaded git binary directory so it is re-downloaded on next reload. */
+    deleteGitBinary: () => Promise<boolean>;
 }
 
 export interface ResolvedFile {
@@ -172,6 +193,44 @@ export async function activate(context: vscode.ExtensionContext) {
         console.error("Error initializing authentication provider:", error);
         // Continue anyway, as initialization errors will be handled gracefully
         // and retried with exponential backoff as needed
+    }
+
+    // Initialize git binary (downloads dugite-native if needed).
+    // In test mode (ExtensionMode.Test), skip the download entirely — tests
+    // call dugiteGit.useEmbeddedGitBinary() to use dugite's bundled binary,
+    // so downloading a separate copy is wasted time and network traffic.
+    // Offers the user a manual retry when all automatic attempts are exhausted.
+    let gitInitialized = false;
+    if (context.extensionMode === vscode.ExtensionMode.Test) {
+        console.log("[Frontier] Test mode detected — skipping git binary download (tests use embedded binary)");
+        dugiteGit.useEmbeddedGitBinary();
+        const askpassPath = path.join(context.extensionPath, "dist", "askpass.js");
+        dugiteGit.setAskpassPath(askpassPath);
+        gitInitialized = true;
+    }
+    while (!gitInitialized) {
+        try {
+            const gitPaths = await gitBinaryManager.ensureGitBinary(context);
+            if (!gitPaths) {
+                console.log("[Frontier] Native git unavailable — continuing with builtin sync");
+                break;
+            }
+            dugiteGit.setGitBinaryPath(gitPaths.localGitDir, gitPaths.execPath);
+
+            const askpassPath = path.join(context.extensionPath, "dist", "askpass.js");
+            try {
+                await import("fs").then((fsModule) => fsModule.promises.chmod(askpassPath, 0o755));
+            } catch {
+                // May fail on read-only filesystems; git will fall back gracefully
+            }
+            dugiteGit.setAskpassPath(askpassPath);
+
+            console.log("[Frontier] Git binary initialized:", gitPaths.localGitDir);
+            gitInitialized = true;
+        } catch (error) {
+            console.error("[Frontier] Failed to initialize git binary:", error);
+            break;
+        }
     }
 
     // Create GitService for debug logging control
@@ -228,6 +287,19 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Register status bar item
     // Removed redundant registration here
+
+    // Log when codex-editor's git backend preference changes so operators
+    // can verify both extensions are reading the same value.
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration((e) => {
+            if (e.affectsConfiguration("codex-editor.gitBackendMode")) {
+                const mode = vscode.workspace
+                    .getConfiguration("codex-editor")
+                    .get<string>("gitBackendMode");
+                console.log(`[Frontier] Git backend mode changed to: ${mode}`);
+            }
+        })
+    );
 
     const frontierAPI: FrontierAPI = {
         // Export the authentication provider for other extensions
@@ -331,6 +403,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 hasConflicts: boolean;
                 conflicts?: Array<ConflictedFile>;
                 offline?: boolean;
+                blocked?: boolean;
             }>,
         completeMerge: async (resolvedFiles: ResolvedFile[], workspacePath: string | undefined) =>
             vscode.commands.executeCommand(
@@ -402,7 +475,7 @@ export async function activate(context: vscode.ExtensionContext) {
             const remoteUrl = await gitService.getRemoteUrl(projectPath);
             if (!remoteUrl) {
                 throw new Error(
-                    "No remote URL found for project. This project may not be connected to a remote repository."
+                    "This project doesn't have a corresponding project on the server. It may not be set up for syncing."
                 );
             }
 
@@ -453,10 +526,10 @@ export async function activate(context: vscode.ExtensionContext) {
 
                 if (errorMsg.includes("404") || errorMsg.includes("not found")) {
                     throw new Error(
-                        `Media file not found on server (OID: ${oid.substring(0, 8)}...)`
+                        `Media file not found on the server.`
                     );
                 } else if (errorMsg.includes("401") || errorMsg.includes("403")) {
-                    throw new Error("Authentication failed. Please log in again.");
+                    throw new Error("Access denied. Please log in again.");
                 } else if (errorMsg.includes("timeout") || errorMsg.includes("ETIMEDOUT")) {
                     throw new Error("Download timed out. Please check your internet connection.");
                 } else {
@@ -502,6 +575,57 @@ export async function activate(context: vscode.ExtensionContext) {
             } catch (e) {
                 console.warn("Failed to set repo media strategy:", e);
                 throw e;
+            }
+        },
+
+        getGitBinaryPath: () => gitBinaryManager.getResolvedPath(),
+
+        isGitBinaryAvailable: () => gitBinaryManager.getResolvedPath() !== undefined,
+
+        isGitAvailable: () => {
+            // Always true: isomorphic-git is bundled as a fallback when
+            // the native binary is unavailable.
+            return true;
+        },
+
+        isGitBinaryNativelySupported: () => gitBinaryManager.isGitBinaryNativelySupported(),
+
+        retryGitBinaryDownload: async (): Promise<boolean> => {
+            try {
+                gitBinaryManager.resetResolvedPaths();
+                const gitPaths = await gitBinaryManager.ensureGitBinary(context);
+                if (!gitPaths) {
+                    return false;
+                }
+                dugiteGit.setGitBinaryPath(gitPaths.localGitDir, gitPaths.execPath);
+
+                const askpassPath = path.join(context.extensionPath, "dist", "askpass.js");
+                try {
+                    await import("fs").then((fsModule) => fsModule.promises.chmod(askpassPath, 0o755));
+                } catch {
+                    // May fail on read-only filesystems; git will fall back gracefully
+                }
+                dugiteGit.setAskpassPath(askpassPath);
+
+                console.log("[Frontier] Git binary downloaded via retry:", gitPaths.localGitDir);
+                return true;
+            } catch (error) {
+                console.error("[Frontier] Git binary retry failed:", error);
+                return false;
+            }
+        },
+
+        deleteGitBinary: async (): Promise<boolean> => {
+            try {
+                gitBinaryManager.resetResolvedPaths();
+                const fsModule = await import("fs");
+                const gitDir = path.join(context.globalStorageUri.fsPath, "git");
+                await fsModule.promises.rm(gitDir, { recursive: true, force: true });
+                console.log("[Frontier] Git binary directory deleted:", gitDir);
+                return true;
+            } catch (error) {
+                console.error("[Frontier] Failed to delete git binary:", error);
+                return false;
             }
         },
     };
