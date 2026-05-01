@@ -3,7 +3,7 @@
     "displayName": "Frontier Authentication",
     "description": "Authentication extension for Frontier",
     "publisher": "frontier-rnd",
-    "version": "0.5.0",
+    "version": "0.6.0",
     "repository": {
         "type": "git",
         "url": "https://github.com/frontier-rnd/frontier-authentication"
