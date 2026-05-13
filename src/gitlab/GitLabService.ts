@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { FrontierAuthProvider } from "../auth/AuthenticationProvider";
+import { GitLabApiError } from "../utils/apiError";
 
 interface GitLabUser {
     id: number;
@@ -213,6 +214,34 @@ export class GitLabService {
         }
     }
 
+    /**
+     * Throw a `GitLabApiError` carrying the response body if the response is
+     * not OK, and log the full body to the extension host log so we can see
+     * GitLab's actual error message in `Help → Toggle Developer Tools` /
+     * the platform log file. Without this, errors like "Forbidden" give us
+     * nothing to diagnose with — GitLab's body is where the real reason lives.
+     */
+    private async assertOk(
+        response: Response,
+        operation: string,
+        method: string,
+        url: string,
+    ): Promise<void> {
+        if (response.ok) return;
+        const body = await response.text().catch(() => "");
+        console.error(
+            `[GitLabService] API error: ${method} ${url} → ${response.status} ${response.statusText}\n${body || "(empty body)"}`,
+        );
+        throw new GitLabApiError(
+            operation,
+            response.status,
+            response.statusText,
+            url,
+            method,
+            body,
+        );
+    }
+
     async initialize(): Promise<void> {
         const sessions = await this.authProvider.getSessions();
         const session = sessions[0];
@@ -269,12 +298,9 @@ export class GitLabService {
 
     async getCurrentUser(): Promise<GitLabUser> {
         await this.ensureInitialized();
-        const response = await this.fetchWithRetry(`${this.gitlabBaseUrl}/api/v4/user`);
-
-        if (!response.ok) {
-            throw new Error(`Failed to get user info: ${response.statusText}`);
-        }
-
+        const url = `${this.gitlabBaseUrl}/api/v4/user`;
+        const response = await this.fetchWithRetry(url);
+        await this.assertOk(response, "get user info", "GET", url);
         return (await response.json()) as GitLabUser;
     }
 
@@ -286,10 +312,7 @@ export class GitLabService {
                 : `${this.gitlabBaseUrl}/api/v4/users/${(await this.getCurrentUser()).id}/projects?search=${encodeURIComponent(name)}`;
 
             const response = await this.fetchWithRetry(endpoint);
-
-            if (!response.ok) {
-                throw new Error(`Failed to get project (${response.status}): ${response.statusText}`);
-            }
+            await this.assertOk(response, "get project", "GET", endpoint);
 
             const projects = await response.json();
             const project = projects.find((p: any) => p.name.toLowerCase() === name.toLowerCase());
@@ -342,17 +365,7 @@ export class GitLabService {
             body: JSON.stringify(body),
         });
 
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => null);
-            const errorMessage = errorData?.message || errorData?.error || response.statusText;
-            console.error("[GitLabService] API error creating project:", {
-                status: response.status,
-                statusText: response.statusText,
-                errorData,
-                requestUrl: endpoint,
-            });
-            throw new Error(`Failed to create project (${response.status}): ${errorMessage}`);
-        }
+        await this.assertOk(response, "create project", "POST", endpoint);
 
         const project = await response.json();
 
@@ -389,17 +402,9 @@ export class GitLabService {
                 per_page: "100",
             }).toString();
 
-            const response = await this.fetchWithRetry(
-                `${this.gitlabBaseUrl}/api/v4/groups?${params}`,
-            );
-
-            if (!response.ok) {
-                const errorText = await response.text();
-                console.error(`[GitLabService] API error listing groups (${response.status}):`, errorText);
-                throw new Error(
-                    `Failed to list groups (${response.status}): ${response.statusText}`,
-                );
-            }
+            const groupsUrl = `${this.gitlabBaseUrl}/api/v4/groups?${params}`;
+            const response = await this.fetchWithRetry(groupsUrl);
+            await this.assertOk(response, "list groups", "GET", groupsUrl);
 
             const groups = await response.json();
             allGroups.push(
@@ -446,13 +451,9 @@ export class GitLabService {
                 per_page: "100",
             });
 
-            const response = await this.fetchWithRetry(
-                `${this.gitlabBaseUrl}/api/v4/projects?${queryParams}`,
-            );
-
-            if (!response.ok) {
-                throw new Error(`Failed to list projects (${response.status}): ${response.statusText}`);
-            }
+            const projectsUrl = `${this.gitlabBaseUrl}/api/v4/projects?${queryParams}`;
+            const response = await this.fetchWithRetry(projectsUrl);
+            await this.assertOk(response, "list projects", "GET", projectsUrl);
 
             const projects = (await response.json()) as GitLabProject[];
             allProjects.push(...projects);
@@ -509,12 +510,10 @@ export class GitLabService {
 
         const response = await this.fetchWithRetry(endpoint);
 
-        if (!response.ok) {
-            if (response.status === 404) {
-                throw new Error(`File not found: ${filePath}`);
-            }
-            throw new Error(`Failed to fetch file (${response.status}): ${response.statusText}`);
+        if (response.status === 404) {
+            throw new Error(`File not found: ${filePath}`);
         }
+        await this.assertOk(response, "fetch file", "GET", endpoint);
 
         return await response.text();
     }
@@ -555,12 +554,10 @@ export class GitLabService {
 
                 const response = await this.fetchWithRetry(endpoint);
 
-                if (!response.ok) {
-                    if (response.status === 404) {
-                        return [];
-                    }
-                    throw new Error(`Failed to fetch repository tree (${response.status}): ${response.statusText}`);
+                if (response.status === 404) {
+                    return [];
                 }
+                await this.assertOk(response, "fetch repository tree", "GET", endpoint);
 
                 const items = await response.json();
                 if (!Array.isArray(items) || items.length === 0) {
@@ -596,10 +593,7 @@ export class GitLabService {
         const endpoint = `${this.gitlabBaseUrl}/api/v4/projects/${encodedProjectId}/repository/contributors`;
 
         const response = await this.fetchWithRetry(endpoint);
-
-        if (!response.ok) {
-            throw new Error(`Failed to fetch contributors (${response.status}): ${response.statusText}`);
-        }
+        await this.assertOk(response, "fetch contributors", "GET", endpoint);
 
         const contributors = await response.json();
         return contributors.map((contributor: any) => ({
@@ -635,10 +629,7 @@ export class GitLabService {
             const endpoint = `${this.gitlabBaseUrl}/api/v4/projects/${encodedProjectId}/members/all?per_page=${perPage}&page=${page}`;
 
             const response = await this.fetchWithRetry(endpoint);
-
-            if (!response.ok) {
-                throw new Error(`Failed to fetch project members (${response.status}): ${response.statusText}`);
-            }
+            await this.assertOk(response, "fetch project members", "GET", endpoint);
 
             const members = await response.json();
 
