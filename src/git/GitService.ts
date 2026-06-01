@@ -690,10 +690,63 @@ async function uploadBlobsToLFSBucket(
 }
 
 /**
+ * In-flight LFS download promises keyed by `${url}::${oid}`. When the same
+ * OID is requested by multiple concurrent callers (e.g. the audio playback
+ * fallback in codex-editor firing while the export pipeline also downloads
+ * the same blob, or two webview cells requesting the same attachment back-
+ * to-back), they all share a single HTTP request instead of each opening
+ * their own batch + GET.
+ *
+ * Lifecycle: a Promise is added before any I/O starts and removed in the
+ * `finally` block of `downloadLFSObject`. So the entry exists strictly for
+ * the duration of an in-flight request; once it settles (success or
+ * failure) future callers start fresh — this is dedup, not memoization.
+ * The in-memory byte cache (`mediaCache.ts` in codex-editor) is the
+ * memoization layer for callers that opt into it.
+ *
+ * Note: the `auth` is implicitly tied to `url` (one repo, one credential),
+ * so it doesn't need to participate in the key.
+ */
+const inFlightLFSDownloads = new Map<string, Promise<Uint8Array>>();
+
+/**
  * Download a single LFS object using the batch API and returned download action
  * Exported for use by FrontierAPI
  */
 export async function downloadLFSObject(
+    args: {
+        headers?: Record<string, string>;
+        url: string;
+        auth?: { username?: string; password?: string; token?: string; };
+    },
+    object: { oid: string; size: number; },
+    options?: { maxPointerDepth?: number; }
+): Promise<Uint8Array> {
+    const dedupKey = `${args.url}::${object.oid}`;
+    const existing = inFlightLFSDownloads.get(dedupKey);
+    if (existing) {
+        // Another caller is already fetching these bytes; share their result.
+        return existing;
+    }
+
+    const promise = doDownloadLFSObject(args, object, options);
+    inFlightLFSDownloads.set(dedupKey, promise);
+    try {
+        return await promise;
+    } finally {
+        // Clear the entry whether the request succeeded or failed, so the
+        // next caller can issue a fresh request rather than awaiting a
+        // stale/rejected promise.
+        inFlightLFSDownloads.delete(dedupKey);
+    }
+}
+
+/**
+ * Internal worker for `downloadLFSObject`. Holds the actual HTTP + nested-
+ * pointer-follow logic so the public entry point can transparently dedup
+ * concurrent callers without conflating dedup state with request state.
+ */
+async function doDownloadLFSObject(
     {
         headers = {},
         url,
@@ -801,7 +854,8 @@ export async function downloadLFSObject(
                 break;
             }
             const nested = { oid: oidMatch[1], size: Number(sizeMatch[1]) };
-            // Fetch the nested target
+            // Fetch the nested target — go through the public entry point so
+            // nested fetches participate in the same dedup map.
             bytes = new Uint8Array(
                 await downloadLFSObject({ headers, url, auth }, nested, {
                     maxPointerDepth: 0,
@@ -974,6 +1028,49 @@ export class GitService {
     }
 
     /**
+     * Resolve the active media strategy for a repo, falling back to disk if the
+     * in-memory `StateManager` doesn't know about this workspace yet.
+     *
+     * Why this exists: `StateManager.setRepoStrategy` is only called when the
+     * user explicitly changes strategy (StartupFlow) or finishes a clone. After
+     * a VS Code restart, the strategy map is empty until something repopulates
+     * it. If we then sync a `stream-only` project, `getRepoStrategy(dir)`
+     * returns `undefined`, the reconcile defaults to the auto-download branch,
+     * and we silently bulk-download LFS objects the user explicitly opted out
+     * of — eating disk and bandwidth they may not have.
+     *
+     * This helper plugs that hole by reading the per-machine
+     * `.project/localProjectSettings.json` (which IS the source of truth, since
+     * it's gitignored and survives restart) and caching the result back into
+     * `StateManager` so subsequent calls hit the fast path.
+     */
+    private async resolveRepoStrategy(dir: string): Promise<MediaFilesStrategy | undefined> {
+        const cached = this.stateManager.getRepoStrategy(dir);
+        if (cached !== undefined) {
+            return cached;
+        }
+
+        try {
+            const settingsPath = path.join(dir, ".project", "localProjectSettings.json");
+            const content = await fs.promises.readFile(settingsPath, "utf8");
+            const settings = JSON.parse(content);
+            const fromDisk: MediaFilesStrategy | undefined =
+                settings?.currentMediaFilesStrategy ?? settings?.mediaFilesStrategy;
+
+            if (fromDisk === "auto-download" || fromDisk === "stream-and-save" || fromDisk === "stream-only") {
+                // Cache for the rest of this session so we only do the disk read once per restart.
+                await this.stateManager.setRepoStrategy(dir, fromDisk);
+                this.debugLog(`[GitService] Loaded media strategy from disk: ${fromDisk}`);
+                return fromDisk;
+            }
+        } catch {
+            // Missing settings file (e.g. brand-new clone) or parse error — fall through.
+        }
+
+        return undefined;
+    }
+
+    /**
      * Reconcile pointers/files for the repository:
      * - For every path in status: if it's under pointers, and content is a pointer, ensure files dir has bytes.
      * - If under pointers but content is not pointer (blob), upload to LFS, rewrite as pointer, and write bytes to files dir.
@@ -1012,7 +1109,12 @@ export class GitService {
                 // - auto-download: allow downloads
                 let enableDownloads = true;
                 try {
-                    const strategy = this.stateManager.getRepoStrategy(dir);
+                    // Use `resolveRepoStrategy` (not raw `getRepoStrategy`) so the
+                    // user's strategy choice survives a VS Code restart even when
+                    // the in-memory map is empty. Without this, post-restart
+                    // syncs in stream-only/stream-and-save projects would silently
+                    // bulk-download via the default branch below.
+                    const strategy = await this.resolveRepoStrategy(dir);
                     if (strategy === "stream-only") {
                         this.debugLog(
                             "[GitService] Stream-only mode: skipping reconciliation (no downloads, no conversions)"
@@ -1376,6 +1478,44 @@ export class GitService {
                         if (!oid) {
                             return;
                         }
+
+                        // Re-check `files/<X>` existence right before issuing the
+                        // HTTP request. Between the Phase-1 scan (which populated
+                        // oidToTargets) and now, the bytes for this OID may have
+                        // landed on disk via a different code path — most often
+                        // the audio playback fallback in codex-editor, which now
+                        // persists bytes after on-demand auto-download
+                        // (`codexCellEditorMessagehandling.ts` ~ line 2193).
+                        // If every target for this OID is already on disk, skip
+                        // the HTTP request entirely to avoid redundant bandwidth.
+                        const targetsForOid = oidToTargets.get(oid) ?? [];
+                        if (targetsForOid.length > 0) {
+                            const presence = await Promise.all(
+                                targetsForOid.map(async (t) => {
+                                    try {
+                                        await fs.promises.access(t.filesAbs, fs.constants.F_OK);
+                                        return true;
+                                    } catch {
+                                        return false;
+                                    }
+                                })
+                            );
+                            if (presence.every(Boolean)) {
+                                this.debugLog(
+                                    `[GitService] Skipping reconcile download for oid ${oid} — all files-dir targets already present`
+                                );
+                                completed += 1;
+                                const progressMessage =
+                                    alreadyDownloaded > 0
+                                        ? `📎 Resuming: file ${alreadyDownloaded + completed} of ${totalFiles}`
+                                        : `📎 Downloading file ${completed} of ${totalToDownload}`;
+                                progress.report({
+                                    message: progressMessage,
+                                });
+                                continue;
+                            }
+                        }
+
                         const action = actionByOid.get(oid);
                         if (!action?.href) {
                             this.debugLog(`[GitService] Missing download action for oid ${oid}`);
@@ -2019,8 +2159,10 @@ export class GitService {
                 console.log("[GitService] ✓ Local and remote are already in sync");
                 this.debugLog("Local and remote are already in sync");
                 if (this.progressCallback) {
-                    // Check if we need to download media files
-                    const strategy = this.stateManager.getRepoStrategy(dir);
+                    // Check if we need to download media files. Use `resolveRepoStrategy`
+                    // so the progress message is accurate even when the in-memory
+                    // strategy map is empty (post-restart syncs).
+                    const strategy = await this.resolveRepoStrategy(dir);
                     const needsMediaDownload = strategy === "auto-download";
                     const message = needsMediaDownload
                         ? "Project is up to date • Downloading media files for offline use"
