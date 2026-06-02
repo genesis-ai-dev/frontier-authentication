@@ -888,43 +888,25 @@ async function uploadBlobsToLFSBucket(
 const inFlightLFSDownloads = new Map<string, Promise<Uint8Array>>();
 
 /**
- * Download a single LFS object using the batch API and returned download action
- * Exported for use by FrontierAPI
+ * Result of the LFS "download" batch step: a (typically presigned) URL plus any
+ * headers the server requires for the GET. For object stores like R2/S3 the
+ * href is self-contained and `header` is empty — which is what allows a browser
+ * <video> element to stream it directly via Range requests.
  */
-export async function downloadLFSObject(
-    args: {
-        headers?: Record<string, string>;
-        url: string;
-        auth?: { username?: string; password?: string; token?: string; };
-    },
-    object: { oid: string; size: number; },
-    options?: { maxPointerDepth?: number; }
-): Promise<Uint8Array> {
-    const dedupKey = `${args.url}::${object.oid}`;
-    const existing = inFlightLFSDownloads.get(dedupKey);
-    if (existing) {
-        // Another caller is already fetching these bytes; share their result.
-        return existing;
-    }
-
-    const promise = doDownloadLFSObject(args, object, options);
-    inFlightLFSDownloads.set(dedupKey, promise);
-    try {
-        return await promise;
-    } finally {
-        // Clear the entry whether the request succeeded or failed, so the
-        // next caller can issue a fresh request rather than awaiting a
-        // stale/rejected promise.
-        inFlightLFSDownloads.delete(dedupKey);
-    }
+export interface LFSDownloadAction {
+    href: string;
+    header: Record<string, string>;
+    /** Milliseconds until the presigned href expires, when the server reports it. */
+    expiresInMs?: number;
 }
 
 /**
- * Internal worker for `downloadLFSObject`. Holds the actual HTTP + nested-
- * pointer-follow logic so the public entry point can transparently dedup
- * concurrent callers without conflating dedup state with request state.
+ * Run the LFS "download" batch request for a single object and return its
+ * download action (href + headers). Shared by the byte-downloading path
+ * (`doDownloadLFSObject`) and by the streaming path
+ * (`FrontierAPI.getLFSDownloadUrl`) so both resolve URLs identically.
  */
-async function doDownloadLFSObject(
+export async function getLFSDownloadAction(
     {
         headers = {},
         url,
@@ -934,9 +916,8 @@ async function doDownloadLFSObject(
         url: string;
         auth?: { username?: string; password?: string; token?: string; };
     },
-    object: { oid: string; size: number; },
-    options?: { maxPointerDepth?: number; }
-): Promise<Uint8Array> {
+    object: { oid: string; size: number; }
+): Promise<LFSDownloadAction> {
     const authHeaders: Record<string, string> = {
         "User-Agent": "curl/7.54", // Helpful for certain servers [[memory:5628983]]
     };
@@ -992,12 +973,81 @@ async function doDownloadLFSObject(
         );
     }
 
+    let expiresInMs: number | undefined;
+    if (typeof download.expires_in === "number" && download.expires_in > 0) {
+        expiresInMs = download.expires_in * 1000;
+    } else if (download.expires_at) {
+        const expiresAt = Date.parse(download.expires_at);
+        if (!Number.isNaN(expiresAt)) {
+            expiresInMs = Math.max(0, expiresAt - Date.now());
+        }
+    }
+
+    return {
+        href: download.href,
+        header: download.header ?? {},
+        expiresInMs,
+    };
+}
+
+/**
+ * Download a single LFS object using the batch API and returned download action
+ * Exported for use by FrontierAPI
+ */
+export async function downloadLFSObject(
+    args: {
+        headers?: Record<string, string>;
+        url: string;
+        auth?: { username?: string; password?: string; token?: string; };
+    },
+    object: { oid: string; size: number; },
+    options?: { maxPointerDepth?: number; }
+): Promise<Uint8Array> {
+    const dedupKey = `${args.url}::${object.oid}`;
+    const existing = inFlightLFSDownloads.get(dedupKey);
+    if (existing) {
+        // Another caller is already fetching these bytes; share their result.
+        return existing;
+    }
+
+    const promise = doDownloadLFSObject(args, object, options);
+    inFlightLFSDownloads.set(dedupKey, promise);
+    try {
+        return await promise;
+    } finally {
+        // Clear the entry whether the request succeeded or failed, so the
+        // next caller can issue a fresh request rather than awaiting a
+        // stale/rejected promise.
+        inFlightLFSDownloads.delete(dedupKey);
+    }
+}
+
+/**
+ * Internal worker for `downloadLFSObject`. Holds the actual HTTP + nested-
+ * pointer-follow logic so the public entry point can transparently dedup
+ * concurrent callers without conflating dedup state with request state.
+ */
+async function doDownloadLFSObject(
+    {
+        headers = {},
+        url,
+        auth,
+    }: {
+        headers?: Record<string, string>;
+        url: string;
+        auth?: { username?: string; password?: string; token?: string; };
+    },
+    object: { oid: string; size: number; },
+    options?: { maxPointerDepth?: number; }
+): Promise<Uint8Array> {
+    const action = await getLFSDownloadAction({ headers, url, auth }, object);
+
     const dlHeaders: Record<string, string> = {
         ...headers,
-        ...(download.header ?? {}),
+        ...action.header,
     };
 
-    const fileResp = await fetchWithTimeout(download.href, {
+    const fileResp = await fetchWithTimeout(action.href, {
         method: "GET",
         headers: dlHeaders,
         keepalive: false,
