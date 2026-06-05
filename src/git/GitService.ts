@@ -11,7 +11,14 @@ import {
     LFSBatchRequest,
     LFSBatchResponse,
     LfsPointerInfo,
+    LfsUploadEvents,
 } from "../types/lfs";
+import {
+    retryWithBackoff,
+    errorWithCause,
+    getNetworkErrorDetails,
+    parseRetryAfterMs,
+} from "./networkRetry";
 
 /** Retry and batching constants for LFS uploads */
 const LFS_MAX_RETRIES = 3;
@@ -24,6 +31,28 @@ const LFS_UPLOAD_CONCURRENCY = 10;
 const LFS_FETCH_TIMEOUT_MS = 60_000;
 /** Timeout for lightweight health-check requests (10 s) */
 const HEALTH_CHECK_TIMEOUT_MS = 10_000;
+
+/**
+ * Inactivity window for streamed LFS uploads. The upload is aborted only when
+ * NO progress is made for this long — there is deliberately no overall cap, so
+ * a large file on a very slow connection (e.g. near-dial-up speeds) can upload
+ * for as long as it needs, as long as bytes keep flowing.
+ */
+const LFS_UPLOAD_STALL_TIMEOUT_MS = 120_000;
+/**
+ * Soft "no progress" warning threshold. Surfaced to the UI as
+ * "connection interrupted, waiting to resume…" well before the hard abort, so
+ * users get quick feedback when the connection drops. Chosen comfortably above
+ * the worst-case per-chunk time on very slow links to avoid false positives
+ * (and it self-clears the moment the next chunk lands anyway).
+ */
+const LFS_UPLOAD_STALL_WARN_MS = 30_000;
+/**
+ * Chunk size used when streaming an upload body (64 KiB). Small enough that even
+ * a near-dial-up link delivers a chunk every few seconds, keeping the stall
+ * detector responsive without false alarms.
+ */
+const LFS_UPLOAD_CHUNK_SIZE = 64 * 1024;
 
 /**
  * Wrapper around `fetch` that aborts after `timeoutMs`.
@@ -52,68 +81,163 @@ function fetchWithTimeout(
 }
 
 /**
- * Determine whether an error is retryable (server-side / transient network errors).
+ * PUT a byte buffer using a streamed request body with a *stall* (inactivity)
+ * timeout rather than a fixed overall deadline.
+ *
+ * Why: a fixed total timeout will kill a perfectly healthy upload on a slow
+ * link. Instead we reset the timer every time the socket accepts another chunk,
+ * so an upload can take arbitrarily long as long as it keeps making progress; we
+ * only abort when nothing has moved for `stallTimeoutMs`. This also fails fast
+ * on a genuinely dead socket instead of hanging until some huge deadline.
+ *
+ * A `Content-Length` header is set explicitly so undici sends a fixed-length
+ * body instead of `Transfer-Encoding: chunked` — object stores (S3/GCS/Azure)
+ * presigned PUT endpoints typically reject chunked uploads.
  */
-function isRetryableError(error: unknown): boolean {
-    if (error && typeof error === "object" && "status" in error) {
-        const status = (error as { status: number }).status;
-        if (status >= 500) {
-            return true;
-        }
-        // Known HTTP status below 500 (e.g. 4xx client errors) — not retryable.
-        // Return early so message-based heuristics below don't produce false positives
-        // (e.g. "limit: 500MB" matching /5\d{2}/, or "authentication timeout" matching /timeout/).
-        if (typeof status === "number" && status > 0) {
-            return false;
-        }
+export function fetchUploadWithStallTimeout(
+    url: string,
+    body: Uint8Array,
+    init: {
+        headers: Record<string, string>;
+        stallTimeoutMs?: number;
+        stallWarnMs?: number;
+        chunkSize?: number;
+        signal?: AbortSignal;
+        /**
+         * Notified when the upload stops making progress (`true`) and again when
+         * progress resumes (`false`), so callers can surface a "waiting for
+         * connection" hint long before the hard abort.
+         */
+        onStallStateChange?: (stalled: boolean) => void;
+        /**
+         * Notified as bytes are streamed to the socket (`bytesSent` of
+         * `totalBytes`), enabling a live progress meter.
+         */
+        onProgress?: (bytesSent: number, totalBytes: number) => void;
+    },
+): Promise<Response> {
+    const {
+        headers,
+        stallTimeoutMs = LFS_UPLOAD_STALL_TIMEOUT_MS,
+        stallWarnMs = LFS_UPLOAD_STALL_WARN_MS,
+        chunkSize = LFS_UPLOAD_CHUNK_SIZE,
+        signal: externalSignal,
+        onStallStateChange,
+        onProgress,
+    } = init;
+
+    if (externalSignal?.aborted) {
+        return Promise.reject(externalSignal.reason ?? new DOMException("Aborted", "AbortError"));
     }
-    const msg = error instanceof Error ? error.message : String(error);
-    return (
-        /ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|timeout|abort|socket hang up/i.test(msg) ||
-        /5\d{2}/i.test(msg)
-    );
+
+    const controller = new AbortController();
+    let stallTimer: ReturnType<typeof setTimeout> | undefined;
+    let warnTimer: ReturnType<typeof setTimeout> | undefined;
+    let stalled = false;
+
+    const setStalled = (next: boolean) => {
+        if (stalled === next) {
+            return;
+        }
+        stalled = next;
+        onStallStateChange?.(next);
+    };
+
+    const armWarnTimer = () => {
+        if (warnTimer) {
+            clearTimeout(warnTimer);
+        }
+        if (stallWarnMs > 0 && stallWarnMs < stallTimeoutMs) {
+            warnTimer = setTimeout(() => setStalled(true), stallWarnMs);
+        }
+    };
+
+    const armStallTimer = () => {
+        if (stallTimer) {
+            clearTimeout(stallTimer);
+        }
+        stallTimer = setTimeout(
+            () =>
+                controller.abort(
+                    new DOMException(
+                        `Upload stalled — no progress for ${Math.round(stallTimeoutMs / 1000)}s`,
+                        "TimeoutError",
+                    ),
+                ),
+            stallTimeoutMs,
+        );
+    };
+
+    const markProgress = () => {
+        // Real progress → clear any "stalled" state and reset both timers.
+        setStalled(false);
+        armStallTimer();
+        armWarnTimer();
+    };
+
+    const clearTimers = () => {
+        if (stallTimer) {
+            clearTimeout(stallTimer);
+            stallTimer = undefined;
+        }
+        if (warnTimer) {
+            clearTimeout(warnTimer);
+            warnTimer = undefined;
+        }
+    };
+
+    const onExternalAbort = () => controller.abort(externalSignal!.reason);
+    externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
+
+    let offset = 0;
+    const bodyStream = new ReadableStream<Uint8Array>({
+        start() {
+            // Covers connection setup / time-to-first-chunk.
+            armStallTimer();
+            armWarnTimer();
+        },
+        pull(streamController) {
+            if (offset >= body.length) {
+                streamController.close();
+                return;
+            }
+            const end = Math.min(offset + chunkSize, body.length);
+            // subarray is a view (no copy) — keeps memory flat for large files.
+            streamController.enqueue(body.subarray(offset, end));
+            offset = end;
+            // A pull means undici accepted the previous chunk → real progress.
+            markProgress();
+            onProgress?.(offset, body.length);
+        },
+        cancel() {
+            clearTimers();
+        },
+    });
+
+    const finalHeaders: Record<string, string> = {
+        ...headers,
+        "Content-Length": String(body.length),
+    };
+    delete finalHeaders["Transfer-Encoding"];
+
+    return fetch(url, {
+        method: "PUT",
+        headers: finalHeaders,
+        body: bodyStream,
+        signal: controller.signal,
+        // Required by the fetch spec when streaming a request body.
+        duplex: "half",
+    } as RequestInit & { duplex: "half"; }).finally(() => {
+        clearTimers();
+        externalSignal?.removeEventListener("abort", onExternalAbort);
+    });
 }
 
-/**
- * Retry a function with exponential back-off (delay = base * 3^attempt).
- * Only retries when `isRetryableError` returns true.
- */
-async function retryWithBackoff<T>(
-    fn: () => Promise<T>,
-    label: string,
-    maxRetries: number = LFS_MAX_RETRIES,
-    baseDelayMs: number = LFS_RETRY_BASE_DELAY_MS,
-    signal?: AbortSignal,
-): Promise<T> {
-    let hadFailure = false;
-    for (let attempt = 0; ; attempt++) {
-        if (signal?.aborted) {
-            throw signal.reason ?? new DOMException("Aborted", "AbortError");
-        }
-        try {
-            const result = await fn();
-            if (hadFailure) {
-                console.log(
-                    `[LFS Retry] ${label} succeeded on attempt ${attempt + 1} after previous failure(s)`
-                );
-            }
-            return result;
-        } catch (error) {
-            hadFailure = true;
-            if (signal?.aborted) {
-                throw signal.reason ?? new DOMException("Aborted", "AbortError");
-            }
-            if (attempt >= maxRetries || !isRetryableError(error)) {
-                throw error;
-            }
-            const delay = baseDelayMs * Math.pow(3, attempt); // 1 s, 3 s, 9 s
-            console.log(
-                `[LFS Retry] ${label} failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delay}ms: ${error instanceof Error ? error.message : error}`,
-            );
-            await new Promise((resolve) => setTimeout(resolve, delay));
-        }
-    }
-}
+/** Retry options shared by all LFS network calls. */
+const LFS_RETRY_OPTIONS = {
+    maxRetries: LFS_MAX_RETRIES,
+    baseDelayMs: LFS_RETRY_BASE_DELAY_MS,
+} as const;
 
 /**
  * Run an array of async tasks with a concurrency limit.
@@ -273,6 +397,7 @@ async function uploadBlobsToLFSBucket(
     }: UploadBlobsOptions & { recovery?: { dir: string; filepaths: string[]; }; },
     contents: Uint8Array[],
     onFileStatus?: (status: LfsFileStatus) => void,
+    events?: LfsUploadEvents,
 ): Promise<LfsPointerInfo[]> {
     debugLog("[LFS Patch] Using patched uploadBlobs function");
     debugLog("[LFS Patch] URL:", url);
@@ -512,11 +637,15 @@ async function uploadBlobsToLFSBucket(
                 `LFS request failed with status ${lfsInfoRes.status}: ${lfsInfoRes.statusText}\nResponse: ${errorText}`
             );
             (err as any).status = lfsInfoRes.status;
+            const retryAfterMs = parseRetryAfterMs(lfsInfoRes.headers.get("retry-after"));
+            if (retryAfterMs !== undefined) {
+                (err as any).retryAfterMs = retryAfterMs;
+            }
             throw err;
         }
 
         return (await lfsInfoRes.json()) as unknown;
-    }, "LFS batch API");
+    }, "LFS batch API", LFS_RETRY_OPTIONS);
 
     debugLog("[LFS Patch] Server response:", lfsInfoResponseData);
 
@@ -584,12 +713,24 @@ async function uploadBlobsToLFSBucket(
             // Upload with retry on transient/server errors
             await retryWithBackoff(async () => {
                 try {
-                    const resp = await fetchWithTimeout(upload.href, {
-                        method: "PUT",
+                    // Stream the body with a stall timeout (no overall cap) so
+                    // slow-but-progressing uploads aren't killed; see
+                    // fetchUploadWithStallTimeout.
+                    const resp = await fetchUploadWithStallTimeout(upload.href, fileBytes, {
                         headers: uploadHeaders,
-                        body: Buffer.from(fileBytes),
-                        keepalive: false,
-                        timeoutMs: 600_000,
+                        onStallStateChange: (stalled) =>
+                            events?.onStallStateChange?.({
+                                index,
+                                label: effectiveFilepaths[index],
+                                stalled,
+                            }),
+                        onProgress: (bytesSent, totalBytes) =>
+                            events?.onBytes?.({
+                                index,
+                                label: effectiveFilepaths[index],
+                                bytesSent,
+                                totalBytes,
+                            }),
                     });
 
                     if (!resp.ok) {
@@ -601,6 +742,10 @@ async function uploadBlobsToLFSBucket(
                             `Upload failed for ${fileLabel(index)}, HTTP ${resp.status}: ${resp.statusText}\nResponse: ${errorText}`
                         );
                         (err as any).status = resp.status;
+                        const retryAfterMs = parseRetryAfterMs(resp.headers.get("retry-after"));
+                        if (retryAfterMs !== undefined) {
+                            (err as any).retryAfterMs = retryAfterMs;
+                        }
                         throw err;
                     }
 
@@ -623,36 +768,63 @@ async function uploadBlobsToLFSBucket(
                         });
                     }
 
-                    // Rethrow with descriptive message; retryWithBackoff will decide whether to retry
+                    // HTTP errors already carry a `status` (and any Retry-After) —
+                    // re-throw as-is so the retry classifier can act on the status.
+                    if ((fetchError as any).status) {
+                        throw fetchError;
+                    }
+
+                    // Wrap transport errors with a descriptive message while
+                    // ALWAYS preserving the original error as `cause`. This keeps
+                    // the underlying undici reason (e.g. UND_ERR_SOCKET) visible to
+                    // both the retry classifier and the user-facing error report,
+                    // instead of collapsing everything to a bare "fetch failed".
+                    const detail = getNetworkErrorDetails(fetchError);
                     if (
                         fetchError.message?.includes("certificate") ||
                         fetchError.message?.includes("SSL") ||
                         fetchError.message?.includes("TLS")
                     ) {
-                        throw new Error(
-                            `SSL/Certificate error uploading ${fileLabel(index)} to LFS storage. Original error: ${fetchError.message}`
+                        throw errorWithCause(
+                            `SSL/Certificate error uploading ${fileLabel(index)} to LFS storage: ${detail}`,
+                            fetchError,
                         );
                     } else if (
                         fetchError.message?.includes("ECONNREFUSED") ||
                         fetchError.message?.includes("ENOTFOUND")
                     ) {
-                        throw new Error(
-                            `Network connection error uploading ${fileLabel(index)} to LFS storage. Original error: ${fetchError.message}`
+                        throw errorWithCause(
+                            `Network connection error uploading ${fileLabel(index)} to LFS storage: ${detail}`,
+                            fetchError,
                         );
-                    } else if (fetchError.message?.includes("timeout") || fetchError.name === "AbortError") {
-                        throw new Error(
-                            `Upload timeout for ${fileLabel(index)} to LFS storage. Original error: ${fetchError.message}`
+                    } else if (
+                        fetchError.message?.includes("timeout") ||
+                        fetchError.name === "AbortError" ||
+                        fetchError.name === "TimeoutError"
+                    ) {
+                        throw errorWithCause(
+                            `Upload timeout for ${fileLabel(index)} to LFS storage: ${detail}`,
+                            fetchError,
                         );
-                    } else if ((fetchError as any).status) {
-                        // Already has status from our HTTP check above; re-throw as-is
-                        throw fetchError;
                     } else {
-                        throw new Error(
-                            `Network error uploading ${fileLabel(index)} to LFS storage: ${fetchError.message}`
+                        throw errorWithCause(
+                            `Network error uploading ${fileLabel(index)} to LFS storage: ${detail}`,
+                            fetchError,
                         );
                     }
                 }
-            }, `LFS PUT ${fileLabel(index)}`);
+            }, `LFS PUT ${fileLabel(index)}`, {
+                ...LFS_RETRY_OPTIONS,
+                onRetry: ({ attempt, maxRetries, delayMs, error }) =>
+                    events?.onRetry?.({
+                        index,
+                        label: effectiveFilepaths[index],
+                        retry: attempt + 1,
+                        maxRetries,
+                        delayMs,
+                        reason: getNetworkErrorDetails(error),
+                    }),
+            });
 
             // Handle verification if required (also with retry)
             if (actions.verify) {
@@ -678,9 +850,15 @@ async function uploadBlobsToLFSBucket(
                             `Verification failed for ${fileLabel(index)}, HTTP ${verificationResp.status}: ${verificationResp.statusText}`
                         );
                         (err as any).status = verificationResp.status;
+                        const retryAfterMs = parseRetryAfterMs(
+                            verificationResp.headers.get("retry-after"),
+                        );
+                        if (retryAfterMs !== undefined) {
+                            (err as any).retryAfterMs = retryAfterMs;
+                        }
                         throw err;
                     }
-                }, `LFS verify ${fileLabel(index)}`);
+                }, `LFS verify ${fileLabel(index)}`, LFS_RETRY_OPTIONS);
             }
     });
     await runWithConcurrency(uploadTasks, LFS_UPLOAD_CONCURRENCY);
@@ -710,43 +888,25 @@ async function uploadBlobsToLFSBucket(
 const inFlightLFSDownloads = new Map<string, Promise<Uint8Array>>();
 
 /**
- * Download a single LFS object using the batch API and returned download action
- * Exported for use by FrontierAPI
+ * Result of the LFS "download" batch step: a (typically presigned) URL plus any
+ * headers the server requires for the GET. For object stores like R2/S3 the
+ * href is self-contained and `header` is empty — which is what allows a browser
+ * <video> element to stream it directly via Range requests.
  */
-export async function downloadLFSObject(
-    args: {
-        headers?: Record<string, string>;
-        url: string;
-        auth?: { username?: string; password?: string; token?: string; };
-    },
-    object: { oid: string; size: number; },
-    options?: { maxPointerDepth?: number; }
-): Promise<Uint8Array> {
-    const dedupKey = `${args.url}::${object.oid}`;
-    const existing = inFlightLFSDownloads.get(dedupKey);
-    if (existing) {
-        // Another caller is already fetching these bytes; share their result.
-        return existing;
-    }
-
-    const promise = doDownloadLFSObject(args, object, options);
-    inFlightLFSDownloads.set(dedupKey, promise);
-    try {
-        return await promise;
-    } finally {
-        // Clear the entry whether the request succeeded or failed, so the
-        // next caller can issue a fresh request rather than awaiting a
-        // stale/rejected promise.
-        inFlightLFSDownloads.delete(dedupKey);
-    }
+export interface LFSDownloadAction {
+    href: string;
+    header: Record<string, string>;
+    /** Milliseconds until the presigned href expires, when the server reports it. */
+    expiresInMs?: number;
 }
 
 /**
- * Internal worker for `downloadLFSObject`. Holds the actual HTTP + nested-
- * pointer-follow logic so the public entry point can transparently dedup
- * concurrent callers without conflating dedup state with request state.
+ * Run the LFS "download" batch request for a single object and return its
+ * download action (href + headers). Shared by the byte-downloading path
+ * (`doDownloadLFSObject`) and by the streaming path
+ * (`FrontierAPI.getLFSDownloadUrl`) so both resolve URLs identically.
  */
-async function doDownloadLFSObject(
+export async function getLFSDownloadAction(
     {
         headers = {},
         url,
@@ -756,9 +916,8 @@ async function doDownloadLFSObject(
         url: string;
         auth?: { username?: string; password?: string; token?: string; };
     },
-    object: { oid: string; size: number; },
-    options?: { maxPointerDepth?: number; }
-): Promise<Uint8Array> {
+    object: { oid: string; size: number; }
+): Promise<LFSDownloadAction> {
     const authHeaders: Record<string, string> = {
         "User-Agent": "curl/7.54", // Helpful for certain servers [[memory:5628983]]
     };
@@ -814,12 +973,81 @@ async function doDownloadLFSObject(
         );
     }
 
+    let expiresInMs: number | undefined;
+    if (typeof download.expires_in === "number" && download.expires_in > 0) {
+        expiresInMs = download.expires_in * 1000;
+    } else if (download.expires_at) {
+        const expiresAt = Date.parse(download.expires_at);
+        if (!Number.isNaN(expiresAt)) {
+            expiresInMs = Math.max(0, expiresAt - Date.now());
+        }
+    }
+
+    return {
+        href: download.href,
+        header: download.header ?? {},
+        expiresInMs,
+    };
+}
+
+/**
+ * Download a single LFS object using the batch API and returned download action
+ * Exported for use by FrontierAPI
+ */
+export async function downloadLFSObject(
+    args: {
+        headers?: Record<string, string>;
+        url: string;
+        auth?: { username?: string; password?: string; token?: string; };
+    },
+    object: { oid: string; size: number; },
+    options?: { maxPointerDepth?: number; }
+): Promise<Uint8Array> {
+    const dedupKey = `${args.url}::${object.oid}`;
+    const existing = inFlightLFSDownloads.get(dedupKey);
+    if (existing) {
+        // Another caller is already fetching these bytes; share their result.
+        return existing;
+    }
+
+    const promise = doDownloadLFSObject(args, object, options);
+    inFlightLFSDownloads.set(dedupKey, promise);
+    try {
+        return await promise;
+    } finally {
+        // Clear the entry whether the request succeeded or failed, so the
+        // next caller can issue a fresh request rather than awaiting a
+        // stale/rejected promise.
+        inFlightLFSDownloads.delete(dedupKey);
+    }
+}
+
+/**
+ * Internal worker for `downloadLFSObject`. Holds the actual HTTP + nested-
+ * pointer-follow logic so the public entry point can transparently dedup
+ * concurrent callers without conflating dedup state with request state.
+ */
+async function doDownloadLFSObject(
+    {
+        headers = {},
+        url,
+        auth,
+    }: {
+        headers?: Record<string, string>;
+        url: string;
+        auth?: { username?: string; password?: string; token?: string; };
+    },
+    object: { oid: string; size: number; },
+    options?: { maxPointerDepth?: number; }
+): Promise<Uint8Array> {
+    const action = await getLFSDownloadAction({ headers, url, auth }, object);
+
     const dlHeaders: Record<string, string> = {
         ...headers,
-        ...(download.header ?? {}),
+        ...action.header,
     };
 
-    const fileResp = await fetchWithTimeout(download.href, {
+    const fileResp = await fetchWithTimeout(action.href, {
         method: "GET",
         headers: dlHeaders,
         keepalive: false,
@@ -3125,6 +3353,93 @@ export class GitService {
             let skippedBytes = 0;
             let skippedCount = 0;
             const skippedLfsFiles: string[] = [];
+            // Indices of files currently stalled (no upload progress). Used to
+            // show a "waiting for connection" hint while ≥1 upload is stuck.
+            const stalledIndices = new Set<number>();
+            // Live bytes sent for files still uploading in the current batch,
+            // keyed by batch index. Added to `processedBytes` (completed files)
+            // for a live total; an entry is removed the moment its file completes
+            // so it is never double-counted against `processedBytes`.
+            const inFlightBytes = new Map<number, number>();
+            // Throttle: only push a new status when the integer percent changes.
+            let lastEmittedPct = -1;
+
+            const displayedBytes = (): number => {
+                let inflight = 0;
+                for (const sent of inFlightBytes.values()) {
+                    inflight += sent;
+                }
+                // Cap to total: the last chunk is reported as "sent" slightly
+                // before the file truly finishes, which could otherwise read >100%.
+                return Math.min(processedBytes + inflight, totalLfsBytes);
+            };
+
+            // Emit the standard "Uploading media (x%)" status, or `override`
+            // verbatim for transient connection/retry hints.
+            const emitMediaStatus = (override?: string) => {
+                if (!this.progressCallback) {
+                    return;
+                }
+                if (override) {
+                    this.progressCallback("uploading_lfs", processedBytes, totalLfsBytes, override);
+                    return;
+                }
+                const shown = displayedBytes();
+                const pct = totalLfsBytes > 0
+                    ? Math.round((shown / totalLfsBytes) * 100)
+                    : 100;
+                lastEmittedPct = pct;
+                const skippedPart = skippedBytes > 0
+                    ? ` — ${GitService.formatBytes(skippedBytes)} already synced`
+                    : "";
+                this.progressCallback(
+                    "uploading_lfs",
+                    shown,
+                    totalLfsBytes,
+                    `Uploading media (${pct}% — ${GitService.formatBytes(shown)} of ${GitService.formatBytes(totalLfsBytes)}${skippedPart})`,
+                );
+            };
+
+            // Surface live progress, retries, and stalls so the user can see what
+            // is happening rather than a frozen progress bar.
+            const uploadEvents: LfsUploadEvents = {
+                onBytes: ({ index, bytesSent }) => {
+                    inFlightBytes.set(index, bytesSent);
+                    // Don't override an active "waiting" hint with progress text.
+                    if (stalledIndices.size > 0) {
+                        return;
+                    }
+                    const shown = displayedBytes();
+                    const pct = totalLfsBytes > 0
+                        ? Math.round((shown / totalLfsBytes) * 100)
+                        : 100;
+                    if (pct !== lastEmittedPct) {
+                        emitMediaStatus();
+                    }
+                },
+                onRetry: ({ index, delayMs, retry, maxRetries }) => {
+                    // We're actively retrying this file → no longer "waiting", and
+                    // its partial in-flight bytes will be re-sent from scratch.
+                    stalledIndices.delete(index);
+                    inFlightBytes.delete(index);
+                    const secs = Math.max(1, Math.round(delayMs / 1000));
+                    emitMediaStatus(
+                        `Uploading media — connection issue, retrying in ${secs}s (retry ${retry} of ${maxRetries})`,
+                    );
+                },
+                onStallStateChange: ({ index, stalled }) => {
+                    if (stalled) {
+                        stalledIndices.add(index);
+                    } else {
+                        stalledIndices.delete(index);
+                    }
+                    if (stalledIndices.size > 0) {
+                        emitMediaStatus("Uploading media — connection interrupted, waiting to resume…");
+                    } else {
+                        emitMediaStatus();
+                    }
+                },
+            };
 
             for (let i = 0; i < rawBytesFiles.length; i += LFS_UPLOAD_BATCH_SIZE) {
                 const batch = rawBytesFiles.slice(i, i + LFS_UPLOAD_BATCH_SIZE);
@@ -3132,6 +3447,9 @@ export class GitService {
                 this.debugLog(
                     `[GitService] Uploading batch ${batchNum}/${totalBatches} (${batch.length} files)`
                 );
+                // In-flight/stall tracking is per-batch (batches run sequentially).
+                stalledIndices.clear();
+                inFlightBytes.clear();
 
                 const pointerInfos = await uploadBlobsToLFSBucket(
                     {
@@ -3147,21 +3465,14 @@ export class GitService {
                             skippedBytes += status.size;
                             skippedCount++;
                         }
-                        if (this.progressCallback) {
-                            const pct = totalLfsBytes > 0
-                                ? Math.round((processedBytes / totalLfsBytes) * 100)
-                                : 100;
-                            const skippedPart = skippedBytes > 0
-                                ? ` — ${GitService.formatBytes(skippedBytes)} already synced`
-                                : "";
-                            this.progressCallback(
-                                "uploading_lfs",
-                                processedBytes,
-                                totalLfsBytes,
-                                `Uploading media (${pct}% — ${GitService.formatBytes(processedBytes)} of ${GitService.formatBytes(totalLfsBytes)}${skippedPart})`,
-                            );
-                        }
+                        // Completed file: no longer in-flight/stalled. Its full
+                        // size now lives in processedBytes, so drop the in-flight
+                        // entry to avoid double-counting.
+                        stalledIndices.delete(status.index);
+                        inFlightBytes.delete(status.index);
+                        emitMediaStatus();
                     },
+                    uploadEvents,
                 );
 
                 // uploadBlobsToLFSBucket may skip corrupted/empty files, so the
