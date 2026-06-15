@@ -122,10 +122,16 @@ export interface FrontierAPI {
      * @param projectPath - Path to the git repository
      * @param oid - SHA256 OID of the LFS object
      * @param size - Expected size of the object in bytes
+     * @param signal - Optional AbortSignal to cancel the download in flight
      * @returns Buffer containing the file data
      * @throws Error if not authenticated, no remote URL, or download fails
      */
-    downloadLFSFile: (projectPath: string, oid: string, size: number) => Promise<Buffer>;
+    downloadLFSFile: (
+        projectPath: string,
+        oid: string,
+        size: number,
+        signal?: AbortSignal
+    ) => Promise<Buffer>;
 
     /**
      * Resolve a (typically presigned) download URL for a single LFS object
@@ -470,7 +476,8 @@ export async function activate(context: vscode.ExtensionContext) {
         downloadLFSFile: async (
             projectPath: string,
             oid: string,
-            size: number
+            size: number,
+            signal?: AbortSignal
         ): Promise<Buffer> => {
             // Import GitService and downloadLFSObject
             const { GitService } = await import("./git/GitService");
@@ -531,12 +538,22 @@ export async function activate(context: vscode.ExtensionContext) {
                         url: lfsBaseUrl,
                         headers: {},
                         auth,
+                        signal,
                     },
                     { oid, size }
                 );
 
                 return Buffer.from(bytes);
             } catch (error) {
+                // Propagate cancellations untouched so callers can distinguish a
+                // user-initiated abort from a genuine download failure.
+                if (
+                    (error instanceof Error && error.name === "AbortError") ||
+                    signal?.aborted
+                ) {
+                    throw error;
+                }
+
                 // Provide more context in error message
                 const errorMsg = error instanceof Error ? error.message : String(error);
 

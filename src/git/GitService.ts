@@ -885,7 +885,22 @@ async function uploadBlobsToLFSBucket(
  * Note: the `auth` is implicitly tied to `url` (one repo, one credential),
  * so it doesn't need to participate in the key.
  */
-const inFlightLFSDownloads = new Map<string, Promise<Uint8Array>>();
+/**
+ * A single in-flight LFS download shared by one or more callers. The shared
+ * fetch is driven by its own `controller`; per-caller `AbortSignal`s never abort
+ * the shared fetch directly. Instead each caller is counted in `waiters`, and
+ * the shared download is only aborted once every waiter has aborted (refcounted
+ * abort). This lets one caller cancel its await (e.g. an export being
+ * cancelled) without breaking an unrelated caller (e.g. the cell editor)
+ * downloading the same OID.
+ */
+interface InFlightLFSDownload {
+    promise: Promise<Uint8Array>;
+    controller: AbortController;
+    waiters: number;
+}
+
+const inFlightLFSDownloads = new Map<string, InFlightLFSDownload>();
 
 /**
  * Result of the LFS "download" batch step: a (typically presigned) URL plus any
@@ -911,10 +926,12 @@ export async function getLFSDownloadAction(
         headers = {},
         url,
         auth,
+        signal,
     }: {
         headers?: Record<string, string>;
         url: string;
         auth?: { username?: string; password?: string; token?: string; };
+        signal?: AbortSignal;
     },
     object: { oid: string; size: number; }
 ): Promise<LFSDownloadAction> {
@@ -951,6 +968,7 @@ export async function getLFSDownloadAction(
             "Content-Type": "application/vnd.git-lfs+json",
         },
         body: JSON.stringify(batchBody),
+        signal,
     });
 
     if (!batchResp.ok) {
@@ -999,26 +1017,82 @@ export async function downloadLFSObject(
         headers?: Record<string, string>;
         url: string;
         auth?: { username?: string; password?: string; token?: string; };
+        signal?: AbortSignal;
     },
     object: { oid: string; size: number; },
     options?: { maxPointerDepth?: number; }
 ): Promise<Uint8Array> {
-    const dedupKey = `${args.url}::${object.oid}`;
-    const existing = inFlightLFSDownloads.get(dedupKey);
-    if (existing) {
-        // Another caller is already fetching these bytes; share their result.
-        return existing;
+    const { signal } = args;
+
+    // A caller that is already aborted never joins the shared download.
+    if (signal?.aborted) {
+        throw signal.reason ?? new DOMException("Aborted", "AbortError");
     }
 
-    const promise = doDownloadLFSObject(args, object, options);
-    inFlightLFSDownloads.set(dedupKey, promise);
+    const dedupKey = `${args.url}::${object.oid}`;
+    let entry = inFlightLFSDownloads.get(dedupKey);
+
+    if (!entry) {
+        // Start a fresh shared download driven by its own controller. We
+        // deliberately do NOT forward the first caller's signal into the
+        // shared fetch — abort is refcounted via `waiters` below so one
+        // caller's cancellation cannot kill an unrelated co-waiter.
+        const controller = new AbortController();
+        const promise = doDownloadLFSObject(
+            { ...args, signal: controller.signal },
+            object,
+            options
+        );
+        entry = { promise, controller, waiters: 0 };
+        inFlightLFSDownloads.set(dedupKey, entry);
+
+        // Clear the entry whether the request succeeded or failed, so the next
+        // caller starts fresh rather than awaiting a stale/rejected promise.
+        // Use a settled handler (not await) so a rejection here never surfaces
+        // as an unhandled rejection independent of the waiters' own awaits.
+        const clear = () => {
+            if (inFlightLFSDownloads.get(dedupKey) === entry) {
+                inFlightLFSDownloads.delete(dedupKey);
+            }
+        };
+        promise.then(clear, clear);
+    }
+
+    const activeEntry = entry;
+    activeEntry.waiters += 1;
+
+    // Per-caller abort: stop awaiting the shared bytes for THIS caller. The
+    // shared download keeps running for any remaining waiters; it is only
+    // aborted once the last waiter has aborted (see finally below).
+    let onAbort: (() => void) | undefined;
+    const abortRace: Promise<never> | undefined = signal
+        ? new Promise<never>((_, reject) => {
+            onAbort = () =>
+                reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+            signal.addEventListener("abort", onAbort, { once: true });
+        })
+        : undefined;
+
     try {
-        return await promise;
+        return abortRace
+            ? await Promise.race([activeEntry.promise, abortRace])
+            : await activeEntry.promise;
     } finally {
-        // Clear the entry whether the request succeeded or failed, so the
-        // next caller can issue a fresh request rather than awaiting a
-        // stale/rejected promise.
-        inFlightLFSDownloads.delete(dedupKey);
+        if (onAbort && signal) {
+            signal.removeEventListener("abort", onAbort);
+        }
+        activeEntry.waiters -= 1;
+        // If every waiter has gone away because of an abort, stop the shared
+        // download so we don't keep consuming bandwidth for nobody.
+        if (
+            activeEntry.waiters <= 0 &&
+            signal?.aborted &&
+            inFlightLFSDownloads.get(dedupKey) === activeEntry
+        ) {
+            activeEntry.controller.abort(
+                signal.reason ?? new DOMException("Aborted", "AbortError")
+            );
+        }
     }
 }
 
@@ -1032,15 +1106,17 @@ async function doDownloadLFSObject(
         headers = {},
         url,
         auth,
+        signal,
     }: {
         headers?: Record<string, string>;
         url: string;
         auth?: { username?: string; password?: string; token?: string; };
+        signal?: AbortSignal;
     },
     object: { oid: string; size: number; },
     options?: { maxPointerDepth?: number; }
 ): Promise<Uint8Array> {
-    const action = await getLFSDownloadAction({ headers, url, auth }, object);
+    const action = await getLFSDownloadAction({ headers, url, auth, signal }, object);
 
     const dlHeaders: Record<string, string> = {
         ...headers,
@@ -1052,6 +1128,7 @@ async function doDownloadLFSObject(
         headers: dlHeaders,
         keepalive: false,
         timeoutMs: 600_000,
+        signal,
     });
 
     if (!fileResp.ok) {
@@ -1085,7 +1162,7 @@ async function doDownloadLFSObject(
             // Fetch the nested target — go through the public entry point so
             // nested fetches participate in the same dedup map.
             bytes = new Uint8Array(
-                await downloadLFSObject({ headers, url, auth }, nested, {
+                await downloadLFSObject({ headers, url, auth, signal }, nested, {
                     maxPointerDepth: 0,
                 })
             );
