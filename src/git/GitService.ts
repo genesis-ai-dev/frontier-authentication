@@ -1333,28 +1333,26 @@ export class GitService {
     }
 
     /**
-     * Resolve the active media strategy for a repo, falling back to disk if the
-     * in-memory `StateManager` doesn't know about this workspace yet.
+     * Resolve the active media strategy for a repo. Disk is the source of truth.
      *
-     * Why this exists: `StateManager.setRepoStrategy` is only called when the
-     * user explicitly changes strategy (StartupFlow) or finishes a clone. After
-     * a VS Code restart, the strategy map is empty until something repopulates
-     * it. If we then sync a `stream-only` project, `getRepoStrategy(dir)`
-     * returns `undefined`, the reconcile defaults to the auto-download branch,
-     * and we silently bulk-download LFS objects the user explicitly opted out
-     * of — eating disk and bandwidth they may not have.
+     * The per-machine `.project/localProjectSettings.json` is gitignored,
+     * survives restart, and is written synchronously by codex
+     * (`setMediaFilesStrategy`) whenever the user changes strategy. We read it
+     * FIRST and only fall back to the in-memory `StateManager` cache when the
+     * file is missing/unreadable (e.g. a brand-new clone before settings exist).
      *
-     * This helper plugs that hole by reading the per-machine
-     * `.project/localProjectSettings.json` (which IS the source of truth, since
-     * it's gitignored and survives restart) and caching the result back into
-     * `StateManager` so subsequent calls hit the fast path.
+     * Why disk must win over the cache: the `StateManager` strategy map is only
+     * updated via a best-effort `setRepoMediaStrategy` notification from codex,
+     * which can silently fail to land (auth API not yet available at switch
+     * time, a path-key mismatch with `dir`, or a persist race with the window
+     * reload on open). It is also persisted across restarts, so a stale
+     * `auto-download` set at clone time could survive and override a user's
+     * later switch to stream-and-save / stream-only — making reconcile bulk
+     * -download every LFS object the user explicitly opted out of. Reading disk
+     * first closes that hole, and we refresh the cache to match so other readers
+     * stay consistent for the rest of the session.
      */
     private async resolveRepoStrategy(dir: string): Promise<MediaFilesStrategy | undefined> {
-        const cached = this.stateManager.getRepoStrategy(dir);
-        if (cached !== undefined) {
-            return cached;
-        }
-
         try {
             const settingsPath = path.join(dir, ".project", "localProjectSettings.json");
             const content = await fs.promises.readFile(settingsPath, "utf8");
@@ -1363,16 +1361,25 @@ export class GitService {
                 settings?.currentMediaFilesStrategy ?? settings?.mediaFilesStrategy;
 
             if (fromDisk === "auto-download" || fromDisk === "stream-and-save" || fromDisk === "stream-only") {
-                // Cache for the rest of this session so we only do the disk read once per restart.
-                await this.stateManager.setRepoStrategy(dir, fromDisk);
-                this.debugLog(`[GitService] Loaded media strategy from disk: ${fromDisk}`);
+                // Keep the cache in sync with disk so the strategy map can never
+                // override the user's actual on-disk choice on a later read.
+                const cached = this.stateManager.getRepoStrategy(dir);
+                if (cached !== fromDisk) {
+                    await this.stateManager.setRepoStrategy(dir, fromDisk);
+                    this.debugLog(
+                        `[GitService] Media strategy from disk (${fromDisk}) overrides stale cache (${cached ?? "unset"})`
+                    );
+                } else {
+                    this.debugLog(`[GitService] Resolved media strategy from disk: ${fromDisk}`);
+                }
                 return fromDisk;
             }
         } catch {
-            // Missing settings file (e.g. brand-new clone) or parse error — fall through.
+            // Missing settings file (e.g. brand-new clone) or parse error — fall
+            // back to whatever the in-memory/persisted cache knows, if anything.
         }
 
-        return undefined;
+        return this.stateManager.getRepoStrategy(dir);
     }
 
     /**
