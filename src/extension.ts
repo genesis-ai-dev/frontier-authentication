@@ -122,10 +122,32 @@ export interface FrontierAPI {
      * @param projectPath - Path to the git repository
      * @param oid - SHA256 OID of the LFS object
      * @param size - Expected size of the object in bytes
+     * @param signal - Optional AbortSignal to cancel the download in flight
      * @returns Buffer containing the file data
      * @throws Error if not authenticated, no remote URL, or download fails
      */
-    downloadLFSFile: (projectPath: string, oid: string, size: number) => Promise<Buffer>;
+    downloadLFSFile: (
+        projectPath: string,
+        oid: string,
+        size: number,
+        signal?: AbortSignal
+    ) => Promise<Buffer>;
+
+    /**
+     * Resolve a (typically presigned) download URL for a single LFS object
+     * WITHOUT downloading the bytes. Used for streaming media directly from the
+     * object store (e.g. an R2 presigned URL fed to a <video> element).
+     *
+     * @returns href plus any headers the GET requires. When `header` is empty
+     *   the URL is self-contained and safe for a browser to fetch directly.
+     *   `expiresInMs` (when present) is how long the href stays valid.
+     * @throws Error if not authenticated, no remote URL, or the batch fails.
+     */
+    getLFSDownloadUrl: (
+        projectPath: string,
+        oid: string,
+        size: number
+    ) => Promise<{ href: string; header: Record<string, string>; expiresInMs?: number }>;
 
     /**
      * Get repository tree (list files in a directory) from GitLab
@@ -454,7 +476,8 @@ export async function activate(context: vscode.ExtensionContext) {
         downloadLFSFile: async (
             projectPath: string,
             oid: string,
-            size: number
+            size: number,
+            signal?: AbortSignal
         ): Promise<Buffer> => {
             // Import GitService and downloadLFSObject
             const { GitService } = await import("./git/GitService");
@@ -515,12 +538,22 @@ export async function activate(context: vscode.ExtensionContext) {
                         url: lfsBaseUrl,
                         headers: {},
                         auth,
+                        signal,
                     },
                     { oid, size }
                 );
 
                 return Buffer.from(bytes);
             } catch (error) {
+                // Propagate cancellations untouched so callers can distinguish a
+                // user-initiated abort from a genuine download failure.
+                if (
+                    (error instanceof Error && error.name === "AbortError") ||
+                    signal?.aborted
+                ) {
+                    throw error;
+                }
+
                 // Provide more context in error message
                 const errorMsg = error instanceof Error ? error.message : String(error);
 
@@ -536,6 +569,57 @@ export async function activate(context: vscode.ExtensionContext) {
                     throw new Error(`Failed to download media file: ${errorMsg}`);
                 }
             }
+        },
+
+        getLFSDownloadUrl: async (
+            projectPath: string,
+            oid: string,
+            size: number
+        ): Promise<{ href: string; header: Record<string, string>; expiresInMs?: number }> => {
+            const { GitService } = await import("./git/GitService");
+            const gitService = new GitService(stateManager);
+
+            // Validate inputs (mirror downloadLFSFile)
+            if (!projectPath) {
+                throw new Error("Project path is required");
+            }
+            if (!oid || !/^[a-f0-9]{64}$/i.test(oid)) {
+                throw new Error("Invalid OID format (expected 64-character hex string)");
+            }
+            if (!size || size <= 0) {
+                throw new Error("Invalid size (must be positive number)");
+            }
+
+            const remoteUrl = await gitService.getRemoteUrl(projectPath);
+            if (!remoteUrl) {
+                throw new Error(
+                    "This project doesn't have a corresponding project on the server. It may not be set up for syncing."
+                );
+            }
+
+            const { GitService: GitServiceStatic } = await import("./git/GitService");
+            const { cleanUrl, auth: embedded } = GitServiceStatic.parseGitUrl(remoteUrl);
+            const lfsBaseUrl = cleanUrl.endsWith(".git") ? cleanUrl : `${cleanUrl}.git`;
+
+            let auth: { username?: string; password?: string; token?: string } | undefined =
+                embedded;
+            if (!auth || !auth.password) {
+                try {
+                    const { GitLabService } = await import("./gitlab/GitLabService");
+                    const gl = new GitLabService(authenticationProvider);
+                    await gl.initializeWithRetry?.();
+                    const token = await gl.getToken();
+                    if (!token) {
+                        throw new Error("Not authenticated. Please log in to stream media files.");
+                    }
+                    auth = { username: "oauth2", password: token };
+                } catch (e) {
+                    throw new Error("Not authenticated. Please log in to stream media files.");
+                }
+            }
+
+            const { getLFSDownloadAction } = await import("./git/GitService");
+            return getLFSDownloadAction({ url: lfsBaseUrl, headers: {}, auth }, { oid, size });
         },
 
         getRepositoryTree: async (
