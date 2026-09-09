@@ -1,4 +1,10 @@
 import * as dugiteGit from "./dugiteGit";
+import {
+    findRemoteEquivalentAdditions,
+    findUnchangedSyncFiles,
+} from "./unchangedSyncFiles";
+import { assertMergeSnapshot } from "./mergeSnapshot";
+import type { MergeSnapshot } from "./mergeSnapshot";
 import { formatPointerInfo, buildPointerInfo } from "./lfsPointerUtils";
 import * as fs from "fs";
 import * as vscode from "vscode";
@@ -26,6 +32,22 @@ const LFS_RETRY_BASE_DELAY_MS = 1000;
 const LFS_UPLOAD_BATCH_SIZE = 50;
 /** Max simultaneous PUT uploads within a single batch */
 const LFS_UPLOAD_CONCURRENCY = 10;
+
+async function assertSyncHeads(
+    dir: string,
+    remoteRef: string,
+    expected: { localHead: string; remoteHead: string; },
+): Promise<void> {
+    const [localHead, remoteHead] = await Promise.all([
+        dugiteGit.resolveRef(dir, "HEAD"),
+        dugiteGit.resolveRef(dir, remoteRef),
+    ]);
+    if (localHead !== expected.localHead || remoteHead !== expected.remoteHead) {
+        throw new Error(
+            "non-fast-forward: sync history changed while files were being verified; retry the sync"
+        );
+    }
+}
 
 /** Default timeout for LFS API requests (60 s) */
 const LFS_FETCH_TIMEOUT_MS = 60_000;
@@ -309,6 +331,7 @@ export interface ConflictedFile {
 
 export interface SyncResult {
     hadConflicts: boolean;
+    mergeSnapshot?: MergeSnapshot;
     conflicts?: ConflictedFile[];
     offline?: boolean;
     skippedDueToLock?: boolean;
@@ -2306,158 +2329,219 @@ export class GitService {
                 throw new Error("Not on any branch");
             }
 
-            // 1. Commit local changes if needed
-            this.progressTracker.currentPhase = "committing";
-            const { isDirty, status: workingCopyStatusBeforeCommit } =
-                await this.getWorkingCopyState(dir);
-            if (isDirty) {
-                // Count changed files for progress reporting
-                const changedFiles = workingCopyStatusBeforeCommit.filter(
-                    (entry) => entry[1] !== entry[2] || entry[2] !== entry[3]
-                ).length;
-
-                console.log(
-                    `[GitService] 💾 Committing ${changedFiles} file${changedFiles !== 1 ? "s" : ""} to local repository`
-                );
-                this.debugLog(
-                    `Working copy is dirty, committing ${changedFiles} file(s) (LFS-aware)`
-                );
-                if (this.progressCallback) {
-                    const commitMsg =
-                        changedFiles > 0
-                            ? `Committing ${changedFiles} file${changedFiles !== 1 ? "s" : ""}`
-                            : "Committing local changes";
-                    this.progressCallback("committing", 0, changedFiles, commitMsg);
-                }
-                uploadedLfsFiles = await this.addAllWithLFS(dir, auth);
-                if (uploadedLfsFiles.length > 0) {
-                    this.debugLog(
-                        `[GitService] Uploaded ${uploadedLfsFiles.length} LFS file(s) during commit:`,
-                        uploadedLfsFiles
+            // Refresh origin before deciding what is local work. An interrupted
+            // merge can leave remote-only files in the worktree/index; against a
+            // stale remote ref those files are indistinguishable from new work.
+            const online = await this.isOnline();
+            const remoteRef = `refs/remotes/origin/${currentBranch}`;
+            let remoteUrl: string | undefined;
+            let fetchedRemoteHead: string | undefined;
+            if (online) {
+                this.progressTracker.currentPhase = "fetching";
+                remoteUrl = await this.getRemoteUrl(dir);
+                console.log("[GitService] ⬇️  Fetching remote changes from origin");
+                this.debugLog("[GitService] Fetching remote changes", { remoteUrl });
+                this.progressCallback?.("fetching", 0, 0, "Checking for remote changes");
+                try {
+                    const fetchController = new AbortController();
+                    await this.withTimeout(
+                        dugiteGit.fetchOrigin(dir, auth, (phase, loaded, total, transferInfo) => {
+                            console.log(
+                                `[GitService] ⬇️  Fetch progress: ${phase || "downloading"} ${loaded || 0}/${total || 0}`
+                            );
+                            this.updateSyncProgress("fetching", { phase, loaded, total, transferInfo });
+                        }, fetchController.signal),
+                        2 * 60 * 1000,
+                        "Fetch operation",
+                        remoteUrl,
+                        fetchController,
                     );
+                    console.log("[GitService] ✓ Fetch completed successfully");
+                    this.debugLog("[GitService] Fetch completed successfully");
+                    this.progressCallback?.("fetching", 1, 1, "Remote check complete");
+                } catch (fetchError) {
+                    const errorMessage =
+                        fetchError instanceof Error ? fetchError.message : String(fetchError);
+                    const gitStderr = (fetchError as any)?.gitStderr;
+                    console.error("[GitService] Fetch operation failed:", {
+                        error: errorMessage,
+                        gitStderr: gitStderr || "(not available — likely JS-level timeout)",
+                        directory: dir,
+                        remoteUrl,
+                        hasAuth: !!auth.username,
+                        platform: process.platform,
+                        timestamp: new Date().toISOString(),
+                    });
+
+                    let userFriendlyMessage = "fetch failed";
+                    const fetchHttpStatus = GitService.extractHttpStatus(fetchError);
+                    if (errorMessage.includes("ENOTFOUND") || errorMessage.includes("getaddrinfo")) {
+                        userFriendlyMessage =
+                            "fetch failed: Cannot reach server (check internet connection)";
+                    } else if (
+                        fetchHttpStatus === 401 ||
+                        errorMessage.includes("401") ||
+                        errorMessage.includes("authentication")
+                    ) {
+                        userFriendlyMessage =
+                            "fetch failed: Authentication failed (try logging out and back in)";
+                    } else if (fetchHttpStatus === 403 || errorMessage.includes("403") || errorMessage.includes("forbidden")) {
+                        userFriendlyMessage =
+                            "fetch failed: Access denied (check your project permissions)";
+                    } else if (
+                        errorMessage.includes("could not read Username") ||
+                        errorMessage.includes("could not read Password") ||
+                        errorMessage.includes("terminal prompts disabled")
+                    ) {
+                        userFriendlyMessage =
+                            "fetch failed: Credential helper error (try logging out and back in)";
+                    } else if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
+                        userFriendlyMessage =
+                            "fetch failed: Connection timeout (server not responding)";
+                    } else if (errorMessage.includes("ECONNREFUSED")) {
+                        userFriendlyMessage = "fetch failed: Connection refused (server may be down)";
+                    } else if (errorMessage.includes("SSL") || errorMessage.includes("certificate")) {
+                        userFriendlyMessage =
+                            "fetch failed: SSL/certificate error (check system certificates)";
+                    } else if (fetchHttpStatus && fetchHttpStatus >= 500) {
+                        userFriendlyMessage = `fetch failed: Server error (HTTP ${fetchHttpStatus})`;
+                    }
+
+                    const enhancedError = new Error(userFriendlyMessage);
+                    (enhancedError as any).originalError = fetchError;
+                    throw enhancedError;
                 }
-                await this.commit(dir, options?.commitMessage || "Local changes", author);
-                console.log(
-                    `[GitService] ✓ Committed ${changedFiles} file${changedFiles !== 1 ? "s" : ""} successfully`
+
+                try {
+                    fetchedRemoteHead = await dugiteGit.resolveRef(dir, remoteRef);
+                } catch (err) {
+                    const isRefNotFound =
+                        (err instanceof dugiteGit.GitOperationError && err.exitCode === 128) ||
+                        (err instanceof Error && (err as any).code === "NotFoundError");
+                    if (!isRefNotFound) { throw err; }
+                }
+            }
+
+            let workingState = await this.getWorkingCopyState(dir);
+            let remoteEquivalentFiles = new Set<string>();
+            if (fetchedRemoteHead && workingState.isDirty) {
+                let localHeadBeforeCommit: string | undefined;
+                try {
+                    localHeadBeforeCommit = await dugiteGit.resolveRef(dir, "HEAD");
+                } catch {
+                    // An unborn local branch has no committed tree to compare.
+                    // Preserve the existing first-commit behavior in that case.
+                }
+                if (localHeadBeforeCommit) {
+                    const recoverySnapshot = {
+                        localHead: localHeadBeforeCommit,
+                        remoteHead: fetchedRemoteHead,
+                    };
+                    try {
+                        remoteEquivalentFiles = await findRemoteEquivalentAdditions(
+                            dir,
+                            recoverySnapshot,
+                            workingState.status,
+                        );
+                    } catch (error) {
+                        this.debugLog("Remote-residue comparison unavailable; retaining files as local work", error);
+                    }
+                    await assertSyncHeads(dir, remoteRef, recoverySnapshot);
+                    if (remoteEquivalentFiles.size > 0) {
+                        console.log(
+                            `[GitService] Recovered ${remoteEquivalentFiles.size} remote-equivalent file(s) from an interrupted merge`
+                        );
+                        await dugiteGit.removeMany(dir, [...remoteEquivalentFiles]);
+                        await assertSyncHeads(dir, remoteRef, recoverySnapshot);
+                        workingState = await this.getWorkingCopyState(dir);
+                    }
+                }
+            }
+
+            // Commit only genuine local work. Remote-equivalent recovery files
+            // stay on disk but are excluded from LFS upload and local history.
+            this.progressTracker.currentPhase = "committing";
+            const workingCopyStatusBeforeCommit = workingState.status;
+            if (workingState.isDirty) {
+                const pendingFiles = workingCopyStatusBeforeCommit.filter(
+                    (entry) => !remoteEquivalentFiles.has(entry[0]) &&
+                        (entry[1] !== entry[2] || entry[2] !== entry[3])
+                ).length;
+                this.progressCallback?.("committing", 0, pendingFiles, `Preparing ${pendingFiles} changed file(s)`);
+                if (pendingFiles > 0) {
+                    uploadedLfsFiles = await this.addAllWithLFS(dir, auth, {
+                        exclude: remoteEquivalentFiles,
+                    });
+                }
+
+                const staged = (await dugiteGit.statusMatrix(dir)).filter(
+                    (entry) => !remoteEquivalentFiles.has(entry[0]) && entry[1] !== entry[3]
                 );
-                if (this.progressCallback) {
-                    const committedMsg =
-                        changedFiles > 0
-                            ? `Committed ${changedFiles} file${changedFiles !== 1 ? "s" : ""}`
-                            : "Local changes committed";
-                    this.progressCallback("committing", changedFiles, changedFiles, committedMsg);
+                if (staged.length > 0) {
+                    console.log(`[GitService] Committing ${staged.length} staged file(s) to local repository`);
+                    await this.commit(dir, options?.commitMessage || "Local changes", author);
+                    this.progressCallback?.("committing", staged.length, staged.length, `Committed ${staged.length} file(s)`);
+                } else {
+                    console.log("[GitService] No staged content changes; skipping local commit");
+                    this.progressCallback?.("committing", 0, 0, "No local content changes to commit");
                 }
             } else {
                 console.log("[GitService] ✓ Working directory clean, no files to commit");
             }
 
-            // 2. Check if we're online
-            if (!(await this.isOnline())) {
+            if (!online) {
                 return { hadConflicts: false, offline: true, uploadedLfsFiles };
             }
 
-            // 3. Fetch remote changes to get latest state
-            this.progressTracker.currentPhase = "fetching";
-            const remoteUrl = await this.getRemoteUrl(dir);
-            console.log("[GitService] ⬇️  Fetching remote changes from origin");
-            this.debugLog("[GitService] Fetching remote changes", { remoteUrl });
-            if (this.progressCallback) {
-                this.progressCallback("fetching", 0, 0, "Checking for remote changes");
-            }
-            try {
-                const fetchController = new AbortController();
-                await this.withTimeout(
-                    dugiteGit.fetchOrigin(dir, auth, (phase, loaded, total, transferInfo) => {
-                        console.log(
-                            `[GitService] ⬇️  Fetch progress: ${phase || "downloading"} ${loaded || 0}/${total || 0}`
-                        );
-                        this.updateSyncProgress("fetching", { phase, loaded, total, transferInfo });
-                    }, fetchController.signal),
-                    2 * 60 * 1000,
-                    "Fetch operation",
-                    remoteUrl,
-                    fetchController,
-                );
-                console.log("[GitService] ✓ Fetch completed successfully");
-                this.debugLog("[GitService] Fetch completed successfully");
-                if (this.progressCallback) {
-                    this.progressCallback("fetching", 1, 1, "Remote check complete");
-                }
-            } catch (fetchError) {
-                const errorMessage =
-                    fetchError instanceof Error ? fetchError.message : String(fetchError);
-                const gitStderr = (fetchError as any)?.gitStderr;
-                console.error("[GitService] Fetch operation failed:", {
-                    error: errorMessage,
-                    gitStderr: gitStderr || "(not available — likely JS-level timeout)",
-                    directory: dir,
-                    remoteUrl,
-                    hasAuth: !!auth.username,
-                    platform: process.platform,
-                    timestamp: new Date().toISOString(),
-                });
-
-                let userFriendlyMessage = "fetch failed";
-                const fetchHttpStatus = GitService.extractHttpStatus(fetchError);
-                if (errorMessage.includes("ENOTFOUND") || errorMessage.includes("getaddrinfo")) {
-                    userFriendlyMessage =
-                        "fetch failed: Cannot reach server (check internet connection)";
-                } else if (
-                    fetchHttpStatus === 401 ||
-                    errorMessage.includes("401") ||
-                    errorMessage.includes("authentication")
-                ) {
-                    userFriendlyMessage =
-                        "fetch failed: Authentication failed (try logging out and back in)";
-                } else if (fetchHttpStatus === 403 || errorMessage.includes("403") || errorMessage.includes("forbidden")) {
-                    userFriendlyMessage =
-                        "fetch failed: Access denied (check your project permissions)";
-                } else if (
-                    errorMessage.includes("could not read Username") ||
-                    errorMessage.includes("could not read Password") ||
-                    errorMessage.includes("terminal prompts disabled")
-                ) {
-                    userFriendlyMessage =
-                        "fetch failed: Credential helper error (try logging out and back in)";
-                } else if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
-                    userFriendlyMessage =
-                        "fetch failed: Connection timeout (server not responding)";
-                } else if (errorMessage.includes("ECONNREFUSED")) {
-                    userFriendlyMessage = "fetch failed: Connection refused (server may be down)";
-                } else if (errorMessage.includes("SSL") || errorMessage.includes("certificate")) {
-                    userFriendlyMessage =
-                        "fetch failed: SSL/certificate error (check system certificates)";
-                } else if (fetchHttpStatus && fetchHttpStatus >= 500) {
-                    userFriendlyMessage = `fetch failed: Server error (HTTP ${fetchHttpStatus})`;
-                }
-
-                const enhancedError = new Error(userFriendlyMessage);
-                (enhancedError as any).originalError = fetchError;
-                throw enhancedError;
-            }
-
-            // 4. Get references to current state
             let localHead = await dugiteGit.resolveRef(dir, "HEAD");
-            let remoteHead;
-            const remoteRef = `refs/remotes/origin/${currentBranch}`;
+            let remoteHead = fetchedRemoteHead;
+            if (!remoteHead) {
+                this.debugLog("Remote branch doesn't exist, pushing our changes");
+                await this.safePush(dir, auth);
+                return { hadConflicts: false, uploadedLfsFiles };
+            }
 
-            // 5. Check if remote branch exists.
-            // Native dugite signals a missing ref with exit code 128 ("bad revision").
-            // The isomorphic-git fallback throws a NotFoundError instead.
-            // Other failures (repo corruption, permission errors) must propagate
-            // so they aren't silently hidden behind a blind push.
-            try {
-                remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
-            } catch (err) {
-                const isRefNotFound =
-                    (err instanceof dugiteGit.GitOperationError && err.exitCode === 128) ||
-                    (err instanceof Error && (err as any).code === "NotFoundError");
-                if (isRefNotFound) {
-                    this.debugLog("Remote branch doesn't exist, pushing our changes");
-                    await this.safePush(dir, auth);
-                    return { hadConflicts: false, uploadedLfsFiles };
+            // The recovery scan removed remote-equivalent residue from the
+            // index so it could not become a bogus local commit. Put the exact
+            // immutable remote blobs back into the index before fast-forwarding.
+            // Git can then update HEAD without treating the existing worktree
+            // files as untracked files that would be overwritten.
+            if (remoteEquivalentFiles.size > 0) {
+                const adoptionSnapshot = { localHead, remoteHead };
+                const adoptionCandidates = await findRemoteEquivalentAdditions(
+                    dir,
+                    adoptionSnapshot,
+                    await dugiteGit.statusMatrix(dir),
+                );
+                try {
+                    await assertSyncHeads(dir, remoteRef, adoptionSnapshot);
+                    const remoteEntries = await dugiteGit.blobEntriesAtRef(dir, remoteHead);
+                    await dugiteGit.setIndexEntries(
+                        dir,
+                        [...adoptionCandidates].map((filepath) => {
+                            const entry = remoteEntries.get(filepath);
+                            if (!entry) {
+                                throw new Error(`Remote recovery blob disappeared: ${filepath}`);
+                            }
+                            return { filepath, ...entry };
+                        })
+                    );
+                    await assertSyncHeads(dir, remoteRef, adoptionSnapshot);
+                    const verified = await findRemoteEquivalentAdditions(
+                        dir,
+                        adoptionSnapshot,
+                        await dugiteGit.statusMatrix(dir),
+                    );
+                    if (verified.size !== adoptionCandidates.size) {
+                        throw new Error("Remote recovery index verification failed before fast-forward");
+                    }
+                    remoteEquivalentFiles = verified;
+                } catch (error) {
+                    // Keep disk content intact, but never leave a partially
+                    // adopted index after a verification or history race.
+                    await dugiteGit.removeMany(dir, [...adoptionCandidates]);
+                    throw error;
                 }
-                throw err;
             }
 
             // Get files changed in local HEAD (this doesn't need updating after refetch)
@@ -2628,6 +2712,75 @@ export class GitService {
                 updatedLocalStatusMatrix = localStatusMatrix;
             }
 
+            // Matching committed files still appeared in the changed-path lists,
+            // making clients reopen every pointer to verify it again. Exclude
+            // only paths whose index and actual disk bytes match immutable Git
+            // objects. Revalidate recovered remote additions after the refetch;
+            // a moving remote must never inherit a stale recovery decision.
+            const analysisSnapshot = { localHead, remoteHead };
+            remoteEquivalentFiles = new Set<string>();
+            let recoveryCandidates = new Set<string>();
+            try {
+                recoveryCandidates = await findRemoteEquivalentAdditions(
+                    dir,
+                    analysisSnapshot,
+                    updatedLocalStatusMatrix,
+                );
+            } catch (error) {
+                // Comparison failure is conservative: no paths are adopted.
+                this.debugLog("Remote-residue comparison unavailable; retaining conflict recovery", error);
+            }
+            if (recoveryCandidates.size > 0) {
+                try {
+                    await assertSyncHeads(dir, remoteRef, analysisSnapshot);
+                    const remoteEntries = await dugiteGit.blobEntriesAtRef(dir, remoteHead);
+                    await dugiteGit.setIndexEntries(
+                        dir,
+                        [...recoveryCandidates].map((filepath) => {
+                            const entry = remoteEntries.get(filepath);
+                            if (!entry) {
+                                throw new Error(`Remote recovery blob disappeared: ${filepath}`);
+                            }
+                            return { filepath, ...entry };
+                        })
+                    );
+                    await assertSyncHeads(dir, remoteRef, analysisSnapshot);
+                    updatedLocalStatusMatrix = await dugiteGit.statusMatrix(dir);
+                    remoteEquivalentFiles = await findRemoteEquivalentAdditions(
+                        dir,
+                        analysisSnapshot,
+                        updatedLocalStatusMatrix,
+                    );
+                    if (remoteEquivalentFiles.size !== recoveryCandidates.size) {
+                        throw new Error("Remote recovery index verification failed after refetch");
+                    }
+                } catch (error) {
+                    // Never leave a partially adopted tree behind after a
+                    // verification or history race. Disk content is untouched.
+                    await dugiteGit.removeMany(dir, [...recoveryCandidates]);
+                    throw error;
+                }
+            }
+            let unchangedFiles = new Set<string>();
+            try {
+                unchangedFiles = await findUnchangedSyncFiles(dir, analysisSnapshot, updatedLocalStatusMatrix);
+            } catch (error) {
+                // This is an optimisation. Fall back to the existing blob checks
+                // if a tree cannot be read, rather than guessing it is empty.
+                this.debugLog("Tree comparison unavailable; checking individual blobs", error);
+            }
+            for (const filepath of remoteEquivalentFiles) {
+                unchangedFiles.add(filepath);
+            }
+            try {
+                await assertSyncHeads(dir, remoteRef, analysisSnapshot);
+            } catch (error) {
+                if (remoteEquivalentFiles.size > 0) {
+                    await dugiteGit.removeMany(dir, [...remoteEquivalentFiles]);
+                }
+                throw error;
+            }
+
             // Convert status matrices to maps for easier lookup
             const localStatusMap = new Map(
                 updatedLocalStatusMatrix.map((entry: any) => [entry[0], entry.slice(1)])
@@ -2656,6 +2809,7 @@ export class GitService {
 
             // Analyze each file's status across all references
             for (const filepath of allFilepaths) {
+                if (unchangedFiles.has(filepath)) { continue; }
                 const localStatus = localStatusMap.get(filepath);
                 const remoteStatus = remoteStatusMap.get(filepath);
                 const mergeBaseStatus = mergeBaseStatusMap.get(filepath);
@@ -2928,6 +3082,11 @@ export class GitService {
             this.debugLog(`Found ${conflicts.length} conflicts that need resolution`);
             return {
                 hadConflicts: true,
+                mergeSnapshot: {
+                    localHead,
+                    remoteHead,
+                    baseHead: updatedMergeBaseCommits[0],
+                },
                 conflicts,
                 uploadedLfsFiles,
                 allChangedFilePaths,
@@ -3035,7 +3194,8 @@ export class GitService {
         resolvedFiles: Array<{
             filepath: string;
             resolution: "deleted" | "created" | "modified";
-        }>
+        }>,
+        snapshot?: MergeSnapshot
     ): Promise<void> {
         // Check if sync is already in progress
         if (this.stateManager.isSyncLocked()) {
@@ -3060,6 +3220,47 @@ export class GitService {
             if (!currentBranch) {
                 throw new Error("Not on any branch");
             }
+
+            // Current clients pass the exact commits used for conflict analysis.
+            // For older clients, pin the refs at entry so a fetch that advances
+            // the remote still aborts instead of committing a stale resolution.
+            const remoteRef = this.getRemoteRef(currentBranch);
+            const expectedSnapshot = snapshot ?? {
+                localHead: await dugiteGit.resolveRef(dir, "HEAD"),
+                remoteHead: await dugiteGit.resolveRef(dir, remoteRef),
+            };
+
+            this.debugLog("[GitService] Fetching latest changes before merge completion");
+            const mergeRemoteUrl = await this.getRemoteUrl(dir);
+            const mergeFetchController = new AbortController();
+            await this.withTimeout(
+                dugiteGit.fetchOrigin(dir, auth, undefined, mergeFetchController.signal),
+                2 * 60 * 1000,
+                "Pre-merge fetch operation",
+                mergeRemoteUrl,
+                mergeFetchController,
+            );
+
+            let localHead: string;
+            let remoteHead: string;
+            try {
+                localHead = await dugiteGit.resolveRef(dir, currentBranch);
+            } catch (refErr) {
+                throw new Error(
+                    `Cannot resolve local branch '${currentBranch}': ${refErr instanceof Error ? refErr.message : String(refErr)}. ` +
+                    `The merge was not completed — no changes have been pushed.`
+                );
+            }
+            try {
+                remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
+            } catch (refErr) {
+                throw new Error(
+                    `Cannot resolve remote ref '${remoteRef}': the remote branch may have been deleted. ` +
+                    `${refErr instanceof Error ? refErr.message : String(refErr)}. ` +
+                    `The merge was not completed — no changes have been pushed.`
+                );
+            }
+            assertMergeSnapshot(expectedSnapshot, { localHead, remoteHead });
 
             // Stage the resolved files based on their resolution type (LFS-aware).
             // Every resolved file MUST be staged successfully — if any fail, the
@@ -3111,45 +3312,10 @@ export class GitService {
                 );
             }
 
-            // Fetch latest changes to ensure we have the most recent remote state
-            // BEFORE we read local/remote heads to build the merge commit. This avoids
-            // creating a merge commit against a stale remote head, which would cause
-            // the subsequent push to be rejected as a non-fast-forward update.
-            this.debugLog("[GitService] Fetching latest changes before merge completion");
-            const mergeRemoteUrl = await this.getRemoteUrl(dir);
-            const mergeFetchController = new AbortController();
-            await this.withTimeout(
-                dugiteGit.fetchOrigin(dir, auth, undefined, mergeFetchController.signal),
-                2 * 60 * 1000,
-                "Pre-merge fetch operation",
-                mergeRemoteUrl,
-                mergeFetchController,
-            );
-
-            // Get the current state AFTER fetch so our merge commit reflects the latest
-            // remote tip. This guarantees that the resulting merge commit will be a
-            // fast-forward of the remote (barring a race where someone pushes again
-            // between this fetch and our push).
-            let localHead: string;
-            let remoteHead: string;
-            try {
-                localHead = await dugiteGit.resolveRef(dir, currentBranch);
-            } catch (refErr) {
-                throw new Error(
-                    `Cannot resolve local branch '${currentBranch}': ${refErr instanceof Error ? refErr.message : String(refErr)}. ` +
-                    `The merge was not completed — no changes have been pushed.`
-                );
-            }
-            const remoteRef = this.getRemoteRef(currentBranch);
-            try {
-                remoteHead = await dugiteGit.resolveRef(dir, remoteRef);
-            } catch (refErr) {
-                throw new Error(
-                    `Cannot resolve remote ref '${remoteRef}': the remote branch may have been deleted. ` +
-                    `${refErr instanceof Error ? refErr.message : String(refErr)}. ` +
-                    `The merge was not completed — no changes have been pushed.`
-                );
-            }
+            assertMergeSnapshot(expectedSnapshot, {
+                localHead: await dugiteGit.resolveRef(dir, "HEAD"),
+                remoteHead: await dugiteGit.resolveRef(dir, remoteRef),
+            });
             const commitMessage = `Merge branch 'origin/${currentBranch}'`;
             this.debugLog(`Creating merge commit with message: ${commitMessage}`);
 
@@ -3232,14 +3398,16 @@ export class GitService {
      */
     async addAllWithLFS(
         dir: string,
-        auth: { username: string; password: string; }
+        auth: { username: string; password: string; },
+        options?: { exclude?: ReadonlySet<string>; }
     ): Promise<string[]> {
         const status = await dugiteGit.statusMatrix(dir);
         const uploadedLfsFiles: string[] = [];
+        const excluded = options?.exclude ?? new Set<string>();
 
         // Handle deletions
         const deletedFiles = status
-            .filter((entry) => this.fileStatus.isDeleted(entry))
+            .filter((entry) => !excluded.has(entry[0]) && this.fileStatus.isDeleted(entry))
             .map(([filepath]) => filepath);
 
         await dugiteGit.removeMany(dir, deletedFiles);
@@ -3248,8 +3416,9 @@ export class GitService {
         const modifiedFiles = status
             .filter(
                 (entry) =>
-                    this.fileStatus.isNew(entry) ||
-                    (this.fileStatus.hasWorkdirChanges(entry) && !this.fileStatus.isDeleted(entry))
+                    !excluded.has(entry[0]) &&
+                    (this.fileStatus.isNew(entry) ||
+                        (this.fileStatus.hasWorkdirChanges(entry) && !this.fileStatus.isDeleted(entry)))
             )
             .map(([filepath]) => filepath);
 
@@ -4205,12 +4374,14 @@ export class GitService {
         filepath: string,
         auth: { username: string; password: string; }
     ): Promise<void> {
-        // If HEAD blob is a pointer and this is a pointers path, ensure files dir has bytes; no smudging into pointer path
-        const headPointer = await this.readHeadPointerInfo(dir, filepath);
-        if (headPointer && this.isPointerPath(filepath)) {
-            // Ensure pointer has bytes in files dir
-            await this.ensureSingleLfsPointerHasMatchingFile(dir, filepath, auth);
-            return;
+        if (this.isPointerPath(filepath)) {
+            const bytes = await fs.promises.readFile(path.join(dir, filepath));
+            if (this.parseLfsPointer(bytes.toString("utf8"))) {
+                await dugiteGit.add(dir, filepath);
+                // Reconciliation after the merge owns hydration and respects
+                // stream-only, stream-and-save, and auto-download settings.
+                return;
+            }
         }
 
         // Otherwise, if file should be tracked by LFS, add via LFS to stage pointer and ensure real bytes are in files dir when applicable

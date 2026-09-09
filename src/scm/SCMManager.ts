@@ -8,6 +8,7 @@ import { PublishWorkspaceOptions } from "../commands/scmCommands";
 import { StateManager } from "../state";
 import { ResolvedFile } from "../extension";
 import { MediaFilesStrategy } from "../types/state";
+import type { MergeSnapshot } from "../git/mergeSnapshot";
 import { checkMetadataVersionsForSync } from "../utils/extensionVersionChecker";
 import {
     checkRequiredVersion,
@@ -140,8 +141,11 @@ export class SCMManager {
         this.context.subscriptions.push(
             vscode.commands.registerCommand(
                 "frontier.completeMerge",
-                (resolvedFiles: ResolvedFile[], workspacePath: string | undefined) =>
-                    this.completeMerge(resolvedFiles, workspacePath)
+                (
+                    resolvedFiles: ResolvedFile[],
+                    workspacePath: string | undefined,
+                    snapshot?: MergeSnapshot
+                ) => this.completeMerge(resolvedFiles, workspacePath, snapshot)
             )
         );
     }
@@ -471,6 +475,12 @@ export class SCMManager {
          */
         allChangedFilePaths?: string[];
         remoteChangedFilePaths?: string[];
+        /**
+         * Commits the conflict list was computed from. Clients hand this back to
+         * completeMerge so the merge is verified against exactly those commits.
+         */
+        mergeSnapshot?: MergeSnapshot;
+        uploadedLfsFiles?: string[];
     }> {
         // In-memory guard: prevents a second call from slipping through
         // between the isSyncLocked() check and the actual filesystem lock acquisition
@@ -496,6 +506,8 @@ export class SCMManager {
         blocked?: boolean;
         allChangedFilePaths?: string[];
         remoteChangedFilePaths?: string[];
+        mergeSnapshot?: MergeSnapshot;
+        uploadedLfsFiles?: string[];
     }> {
         // Check extension version compatibility with project metadata before syncing
         const canSync = await checkMetadataVersionsForSync(this.context, isManualSync);
@@ -709,19 +721,24 @@ export class SCMManager {
                 return { hasConflicts: false };
             }
 
-            // If we have conflicts, return them to client
+            // If we have conflicts, return them to client. The snapshot must
+            // travel with the conflict list: completeMerge verifies the merge
+            // against these exact commits, and without it the guard can only
+            // fall back to whatever HEAD/origin point at when completeMerge starts.
             if (syncResult.hadConflicts && syncResult.conflicts) {
                 return {
                     hasConflicts: true,
                     conflicts: syncResult.conflicts,
                     allChangedFilePaths: syncResult.allChangedFilePaths,
                     remoteChangedFilePaths: syncResult.remoteChangedFilePaths,
+                    mergeSnapshot: syncResult.mergeSnapshot,
+                    uploadedLfsFiles: syncResult.uploadedLfsFiles,
                 };
             }
 
             // Everything synced successfully
             syncSucceeded = true;
-            return { hasConflicts: false };
+            return { hasConflicts: false, uploadedLfsFiles: syncResult.uploadedLfsFiles };
         } catch (error) {
             console.error("Sync error:", error);
             // Fire sync error event
@@ -1060,7 +1077,8 @@ export class SCMManager {
     // Add new method to complete merge
     async completeMerge(
         resolvedFiles: ResolvedFile[],
-        workspacePath: string | undefined
+        workspacePath: string | undefined,
+        snapshot?: MergeSnapshot
     ): Promise<void> {
         const token = await this.gitLabService.getToken();
         if (!token) {
@@ -1085,6 +1103,6 @@ export class SCMManager {
         if (!workspacePath) {
             workspacePath = this.getWorkspacePath();
         }
-        await this.gitService.completeMerge(workspacePath, auth, author, resolvedFiles);
+        await this.gitService.completeMerge(workspacePath, auth, author, resolvedFiles, snapshot);
     }
 }

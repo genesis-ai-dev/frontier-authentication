@@ -951,6 +951,62 @@ export async function clone(
 // Git operations — Status
 // ---------------------------------------------------------------------------
 
+/** A blob's identity and Git mode. */
+export interface GitBlobEntry {
+    oid: string;
+    mode: number;
+}
+
+/** Read stage-zero index entries without applying working-tree filters. */
+export async function blobEntriesAtIndex(dir: string): Promise<Map<string, GitBlobEntry>> {
+    const result = await gitExec(["ls-files", "--stage", "-z"], dir);
+    assertSuccess("ls-files --stage", result);
+    const entries = new Map<string, GitBlobEntry>();
+    for (const record of stdout(result).split("\0")) {
+        if (!record) { continue; }
+        const tab = record.indexOf("\t");
+        if (tab < 0) { throw new Error("Invalid ls-files --stage output"); }
+        const [mode, oid, stage] = record.slice(0, tab).split(" ");
+        if (stage === "0") {
+            entries.set(record.slice(tab + 1), { oid, mode: parseInt(mode, 8) });
+        }
+    }
+    return entries;
+}
+
+/** Install existing Git blobs in the index without invoking clean filters. */
+export async function setIndexEntries(
+    dir: string,
+    entries: Array<{ filepath: string; oid: string; mode: number }>,
+): Promise<void> {
+    const batchSize = 100;
+    for (let i = 0; i < entries.length; i += batchSize) {
+        const args = ["update-index", "--add"];
+        for (const entry of entries.slice(i, i + batchSize)) {
+            args.push("--cacheinfo", entry.mode.toString(8), entry.oid, entry.filepath);
+        }
+        const result = await gitExec(args, dir);
+        assertSuccess("update-index --cacheinfo", result);
+    }
+}
+
+/** Read all blob identities and modes from an immutable commit tree. */
+export async function blobEntriesAtRef(dir: string, ref: string): Promise<Map<string, GitBlobEntry>> {
+    const result = await gitExec(["ls-tree", "-r", "-z", ref], dir);
+    assertSuccess("ls-tree", result);
+    const entries = new Map<string, GitBlobEntry>();
+    for (const record of stdout(result).split("\0")) {
+        if (!record) { continue; }
+        const tab = record.indexOf("\t");
+        if (tab < 0) { throw new Error("Invalid ls-tree output"); }
+        const [mode, type, oid] = record.slice(0, tab).split(" ");
+        if (type === "blob") {
+            entries.set(record.slice(tab + 1), { oid, mode: parseInt(mode, 8) });
+        }
+    }
+    return entries;
+}
+
 /**
  * Status matrix entry, matching isomorphic-git's format:
  * [filepath, HEAD_status, WORKDIR_status, STAGE_status]

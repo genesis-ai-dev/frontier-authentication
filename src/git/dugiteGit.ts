@@ -19,7 +19,7 @@ import * as fallback from "./isomorphicGitAdapter";
 // Re-export types (identical in both implementations)
 // ---------------------------------------------------------------------------
 
-export type { StatusMatrixEntry, LogEntry, ProgressCallback } from "./dugiteGitNative";
+export type { StatusMatrixEntry, LogEntry, ProgressCallback, GitBlobEntry } from "./dugiteGitNative";
 export { GitOperationError } from "./dugiteGitNative";
 
 // ---------------------------------------------------------------------------
@@ -219,6 +219,32 @@ export async function log(
     options?: { depth?: number; ref?: string },
 ): Promise<native.LogEntry[]> {
     return shouldUseNative() ? native.log(dir, options) : fallback.log(dir, options);
+}
+
+export async function blobEntriesAtRef(
+    dir: string,
+    ref: string,
+): Promise<Map<string, native.GitBlobEntry>> {
+    return shouldUseNative()
+        ? native.blobEntriesAtRef(dir, ref)
+        : fallback.blobEntriesAtRef(dir, ref);
+}
+
+export async function blobEntriesAtIndex(
+    dir: string,
+): Promise<Map<string, native.GitBlobEntry>> {
+    return shouldUseNative()
+        ? native.blobEntriesAtIndex(dir)
+        : fallback.blobEntriesAtIndex(dir);
+}
+
+export async function setIndexEntries(
+    dir: string,
+    entries: Array<{ filepath: string; oid: string; mode: number }>,
+): Promise<void> {
+    return shouldUseNative()
+        ? native.setIndexEntries(dir, entries)
+        : fallback.setIndexEntries(dir, entries);
 }
 
 export async function readBlobAtRef(

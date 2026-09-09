@@ -9,10 +9,12 @@
 
 import git, { type GitProgressEvent } from "isomorphic-git";
 import http from "isomorphic-git/http/node";
+import { GitIndexManager } from "isomorphic-git/managers";
+import { FileSystem } from "isomorphic-git/models";
 import * as fs from "fs";
 import * as path from "path";
 
-import type { ProgressCallback, StatusMatrixEntry, LogEntry } from "./dugiteGitNative";
+import type { ProgressCallback, StatusMatrixEntry, LogEntry, GitBlobEntry } from "./dugiteGitNative";
 export type { ProgressCallback, StatusMatrixEntry, LogEntry } from "./dugiteGitNative";
 
 // Re-export error class so the routing layer can catch uniformly
@@ -184,23 +186,28 @@ export async function removeMany(
     filepaths: string[],
     options?: { batchSize?: number; maxRetries?: number },
 ): Promise<void> {
+    if (filepaths.length === 0) { return; }
     const maxRetries = options?.maxRetries ?? 3;
-    for (const filepath of filepaths) {
-        let lastError: Error | undefined;
-        for (let attempt = 0; attempt <= maxRetries; attempt++) {
-            try {
-                await remove(dir, filepath);
-                lastError = undefined;
-                break;
-            } catch (err) {
-                lastError = err instanceof Error ? err : new Error(String(err));
-                if (attempt < maxRetries) {
-                    await new Promise((r) => setTimeout(r, 100 * Math.pow(2, attempt)));
-                }
+    let lastError: Error | undefined;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            const wrappedFs = new FileSystem(fs);
+            await GitIndexManager.acquire(
+                { fs: wrappedFs as any, gitdir: path.join(dir, ".git"), cache: {} },
+                (index) => {
+                    for (const filepath of filepaths) { index.delete({ filepath }); }
+                },
+            );
+            lastError = undefined;
+            break;
+        } catch (err) {
+            lastError = err instanceof Error ? err : new Error(String(err));
+            if (attempt < maxRetries) {
+                await new Promise((r) => setTimeout(r, 100 * Math.pow(2, attempt)));
             }
         }
-        if (lastError) throw lastError;
     }
+    if (lastError) { throw lastError; }
 }
 
 export async function commit(
@@ -428,6 +435,73 @@ export async function statusMatrixAtRef(
     }
 
     return entries;
+}
+
+export async function blobEntriesAtRef(dir: string, ref: string): Promise<Map<string, GitBlobEntry>> {
+    // TREE treats an unknown ref as empty, so resolve it explicitly.
+    const commitOid = await git.resolveRef({ fs, dir, ref });
+    await git.readCommit({ fs, dir, oid: commitOid });
+    const entries = new Map<string, GitBlobEntry>();
+    await git.walk({
+        fs,
+        dir,
+        trees: [git.TREE({ ref: commitOid })],
+        map: async (filepath, [entry]) => {
+            if (entry && await entry.type() === "blob") {
+                entries.set(filepath, { oid: await entry.oid(), mode: await entry.mode() });
+            }
+            return undefined;
+        },
+    });
+    return entries;
+}
+
+export async function blobEntriesAtIndex(dir: string): Promise<Map<string, GitBlobEntry>> {
+    const entries = new Map<string, GitBlobEntry>();
+    await git.walk({
+        fs,
+        dir,
+        trees: [git.STAGE()],
+        map: async (filepath, [entry]) => {
+            if (!entry || filepath === "." || await entry.type() !== "blob") {
+                return undefined;
+            }
+            entries.set(filepath, { oid: await entry.oid(), mode: await entry.mode() });
+            return undefined;
+        },
+    });
+    return entries;
+}
+
+export async function setIndexEntries(
+    dir: string,
+    entries: Array<{ filepath: string; oid: string; mode: number }>,
+): Promise<void> {
+    if (entries.length === 0) { return; }
+    const wrappedFs = new FileSystem(fs);
+    await GitIndexManager.acquire(
+        { fs: wrappedFs as any, gitdir: path.join(dir, ".git"), cache: {} },
+        (index) => {
+            for (const entry of entries) {
+                index.insert({
+                    filepath: entry.filepath,
+                    oid: entry.oid,
+                    stats: {
+                        ctimeSeconds: 0,
+                        ctimeNanoseconds: 0,
+                        mtimeSeconds: 0,
+                        mtimeNanoseconds: 0,
+                        dev: 0,
+                        ino: 0,
+                        mode: entry.mode,
+                        uid: 0,
+                        gid: 0,
+                        size: 0,
+                    },
+                });
+            }
+        },
+    );
 }
 
 async function listTreeRecursive(dir: string, ref: string): Promise<Map<string, string>> {

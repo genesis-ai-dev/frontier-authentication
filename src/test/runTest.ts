@@ -1,12 +1,11 @@
 import * as path from "path";
 import * as fs from "fs";
-import * as cp from "child_process";
 
 import {
     downloadAndUnzipVSCode,
-    resolveCliArgsFromVSCodeExecutablePath,
     runTests,
 } from "@vscode/test-electron";
+import { resolveVSCodeTestExecutable } from "./vscodeTestExecutable";
 
 async function cleanupTestUserData(testUserDataDir: string) {
     if (fs.existsSync(testUserDataDir)) {
@@ -29,7 +28,7 @@ async function main() {
         await cleanupTestUserData(testUserDataDir);
 
         await runTests({
-            vscodeExecutablePath: await downloadAndUnzipVSCode(),
+            vscodeExecutablePath: resolveVSCodeTestExecutable(await downloadAndUnzipVSCode()),
             extensionDevelopmentPath,
             extensionTestsPath,
             launchArgs: [
@@ -45,7 +44,7 @@ async function main() {
             },
         });
     } catch (err) {
-        console.error("Failed to run tests");
+        console.error("Failed to run tests:", err);
         process.exit(1);
     }
 }

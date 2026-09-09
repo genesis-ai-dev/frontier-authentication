@@ -14,6 +14,7 @@ import { AuthState } from "./types/state";
 import { ConflictedFile, GitService as GitServiceClass } from "./git/GitService";
 import * as gitBinaryManager from "./git/gitBinaryManager";
 import * as dugiteGit from "./git/dugiteGit";
+import type { MergeSnapshot } from "./git/mergeSnapshot";
 import * as path from "path";
 
 // Module-level gitService instance
@@ -80,10 +81,13 @@ export interface FrontierAPI {
         offline?: boolean;
         allChangedFilePaths?: string[];
         remoteChangedFilePaths?: string[];
+        mergeSnapshot?: MergeSnapshot;
+        uploadedLfsFiles?: string[];
     }>;
     completeMerge: (
         resolvedFiles: ResolvedFile[],
-        workspacePath: string | undefined
+        workspacePath: string | undefined,
+        snapshot?: MergeSnapshot
     ) => Promise<void>;
     onSyncStatusChange: (
         callback: (status: {
@@ -427,11 +431,16 @@ export async function activate(context: vscode.ExtensionContext) {
                 offline?: boolean;
                 blocked?: boolean;
             }>,
-        completeMerge: async (resolvedFiles: ResolvedFile[], workspacePath: string | undefined) =>
+        completeMerge: async (
+            resolvedFiles: ResolvedFile[],
+            workspacePath: string | undefined,
+            snapshot?: MergeSnapshot
+        ) =>
             vscode.commands.executeCommand(
                 "frontier.completeMerge",
                 resolvedFiles,
-                workspacePath
+                workspacePath,
+                snapshot
             ) as Promise<void>,
         onSyncStatusChange: (
             callback: (status: {
