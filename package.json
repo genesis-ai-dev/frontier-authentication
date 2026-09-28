@@ -4,6 +4,7 @@
     "description": "Authentication extension for Frontier",
     "publisher": "frontier-rnd",
     "version": "0.10.0",
+    "codexProjectPinPolicyVersion": 1,
     "repository": {
         "type": "git",
         "url": "https://github.com/frontier-rnd/frontier-authentication"

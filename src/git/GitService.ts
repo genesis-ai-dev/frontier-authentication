@@ -1,3 +1,5 @@
+import { EXTENSION_PIN_POLICY } from "../utils/extensionPinFeatureFlag";
+import { clearProjectPins } from "../utils/extensionPins";
 import * as dugiteGit from "./dugiteGit";
 import {
     findRemoteEquivalentAdditions,
@@ -2126,6 +2128,30 @@ export class GitService {
         );
     }
 
+    /** Persist pin removal introduced by a fast-forward before pushing it upstream. */
+    private async commitPinRemoval(dir: string, author: { name: string; email: string }): Promise<void> {
+        if (!EXTENSION_PIN_POLICY.ignoreProjectPins) { return; }
+        await clearProjectPins(vscode.Uri.file(dir));
+        const status = await dugiteGit.statusMatrix(dir);
+        const metadataStatus = status.find(([file]) => file === "metadata.json");
+        if (!metadataStatus || metadataStatus[1] === 0 || metadataStatus[2] === 0) { return; }
+        // Another queued editor write may already have removed the pins on disk.
+        // Decide from committed metadata, not from whether this call changed disk.
+        const committed: { meta?: { pinnedExtensions?: unknown } } = JSON.parse(
+            new TextDecoder().decode(await dugiteGit.readBlobAtRef(dir, "HEAD", "metadata.json"))
+        );
+        const pins = committed.meta?.pinnedExtensions;
+        if (pins && typeof pins === "object" && !Array.isArray(pins) && Object.keys(pins).length === 0) { return; }
+        if (status.some(([file, head, , staged]) => file !== "metadata.json" && head !== staged)) {
+            throw new Error("Cannot commit pin removal while unrelated files are staged");
+        }
+        await dugiteGit.add(dir, "metadata.json");
+        const metadata = (await dugiteGit.statusMatrix(dir)).find(([file]) => file === "metadata.json");
+        if (metadata && metadata[1] !== metadata[3]) {
+            await this.commit(dir, "Remove disabled extension version pins", author);
+        }
+    }
+
     /**
      * Safe push operation with timeout, abort-on-timeout, and automatic
      * retry on non-fast-forward rejection (fetch + fast-forward + push).
@@ -2133,7 +2159,7 @@ export class GitService {
     private async safePush(
         dir: string,
         auth: { username: string; password: string; },
-        options?: { ref?: string; timeoutMs?: number; }
+        options?: { ref?: string; timeoutMs?: number; author?: { name: string; email: string }; }
     ): Promise<void> {
         const { ref, timeoutMs = 10 * 60 * 1000 } = options || {};
         const MAX_PUSH_RETRIES = 2;
@@ -2164,6 +2190,9 @@ export class GitService {
         }
 
         for (let attempt = 0; attempt <= MAX_PUSH_RETRIES; attempt++) {
+            if (options?.author) {
+                await this.commitPinRemoval(dir, options.author);
+            }
             const pushController = new AbortController();
             const pushOperation = dugiteGit.push(dir, auth, {
                 ...(ref && { ref }),
@@ -2324,6 +2353,7 @@ export class GitService {
         let uploadedLfsFiles: string[] = [];
 
         try {
+            await clearProjectPins(vscode.Uri.file(dir));
             const currentBranch = await dugiteGit.currentBranch(dir);
             if (!currentBranch) {
                 throw new Error("Not on any branch");
@@ -2497,7 +2527,7 @@ export class GitService {
             let remoteHead = fetchedRemoteHead;
             if (!remoteHead) {
                 this.debugLog("Remote branch doesn't exist, pushing our changes");
-                await this.safePush(dir, auth);
+                await this.safePush(dir, auth, { author });
                 return { hadConflicts: false, uploadedLfsFiles };
             }
 
@@ -2570,6 +2600,7 @@ export class GitService {
             }
 
             // 7. Try fast-forward first (simplest case)
+            let fastForwarded = false;
             try {
                 console.log(
                     `[GitService] 🔀 Attempting fast-forward merge (${localHead.substring(0, 8)}..${remoteHead.substring(0, 8)})`
@@ -2595,6 +2626,7 @@ export class GitService {
                     ffController,
                 );
 
+                fastForwarded = true;
                 console.log("[GitService] ✓ Fast-forward merge completed successfully");
                 if (this.progressCallback) {
                     this.progressCallback("merging", 1, 1, "Merge complete");
@@ -2602,7 +2634,7 @@ export class GitService {
 
                 // Fast-forward worked, push any local changes
                 this.debugLog("[GitService] Fast-forward successful, pushing any local changes");
-                await this.safePush(dir, auth);
+                await this.safePush(dir, auth, { author });
 
                 // After integrating remote changes, reconcile pointers/files
                 try {
@@ -2616,6 +2648,9 @@ export class GitService {
 
                 return { hadConflicts: false, uploadedLfsFiles };
             } catch (err) {
+                // Cleanup/push failures after HEAD moved must not fall through
+                // to conflict analysis using the old HEAD snapshot.
+                if (fastForwarded) { throw err; }
                 this.debugLog("[GitService] Fast-forward failed, analyzing conflicts:", {
                     error: err instanceof Error ? err.message : String(err),
                     localHead: localHead.substring(0, 8),
@@ -3262,6 +3297,10 @@ export class GitService {
             }
             assertMergeSnapshot(expectedSnapshot, { localHead, remoteHead });
 
+            if (await clearProjectPins(vscode.Uri.file(dir))) {
+                await dugiteGit.add(dir, "metadata.json");
+            }
+
             // Stage the resolved files based on their resolution type (LFS-aware).
             // Every resolved file MUST be staged successfully — if any fail, the
             // merge commit would be missing those resolutions, producing a commit
@@ -3342,7 +3381,7 @@ export class GitService {
             this.debugLog("Pushing merge commit");
             try {
                 // Try normal push first
-                await this.safePush(dir, auth, { ref: currentBranch });
+                await this.safePush(dir, auth, { ref: currentBranch, author });
                 this.debugLog("Successfully pushed merge commit");
 
                 // After successful merge and push, check for newly created files that might be LFS pointers
@@ -4219,7 +4258,7 @@ export class GitService {
     async push(
         dir: string,
         auth: { username: string; password: string; },
-        options?: {}
+        options?: { author?: { name: string; email: string } }
     ): Promise<void> {
         await this.safePush(dir, auth, options);
     }

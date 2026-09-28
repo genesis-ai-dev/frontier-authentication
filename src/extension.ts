@@ -207,6 +207,8 @@ const API_ENDPOINT = getApiEndpoint();
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
 export async function activate(context: vscode.ExtensionContext) {
+    // Metadata cleanup belongs to Codex Editor activation. Do not make
+    // authentication depend on another extension completing activation.
     // Initialize state manager first
     const stateManager = StateManager.initialize(context);
 
