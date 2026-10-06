@@ -1,4 +1,5 @@
 import * as dugiteGit from "./dugiteGit";
+import { analyzeConflicts } from "./conflictAnalysis";
 import {
     findRemoteEquivalentAdditions,
     findUnchangedSyncFiles,
@@ -319,6 +320,13 @@ function debugLog(message: string, data?: any): void {
         }
     }
 }
+
+/**
+ * Prefix of errors thrown when a blob needed for conflict analysis could not
+ * be read. codex-editor matches this exact string to retry the sync; keep it
+ * in lock-step with codex-editor/src/projectManager/utils/merge/transientSyncError.ts.
+ */
+export { BLOB_READ_FAILED_PREFIX } from "./conflictAnalysis";
 
 export interface ConflictedFile {
     filepath: string;
@@ -2919,165 +2927,41 @@ export class GitService {
                 ]),
             ];
 
-            // 9. Get all files changed in either branch with enhanced conflict detection
-            const conflictResults = await Promise.allSettled(
-                allChangedFilePaths.map(async (filepath) => {
-                    let localContent = "";
-                    let remoteContent = "";
-                    let baseContent = "";
-                    let isNew = false;
-                    let isDeleted = false;
-
-                    // More precise determination of file status (commit existence vs merge base)
-                    // Note: statusMap values are [head, workdir, stage] for the selected ref.
-                    const localEntry = localStatusMap.get(filepath) as any;
-                    const remoteEntry = remoteStatusMap.get(filepath) as any;
-                    const baseEntry = mergeBaseStatusMap.get(filepath) as any;
-
-                    const localExists = !!localEntry && localEntry[0] === 1;
-                    const remoteExists = !!remoteEntry && remoteEntry[0] === 1;
-                    const baseExists = !!baseEntry && baseEntry[0] === 1;
-
-                    const isAddedLocally = localExists && !baseExists;
-                    const isAddedRemotely = remoteExists && !baseExists;
-                    const isDeletedLocally = baseExists && remoteExists && !localExists;
-                    const isDeletedRemotely = baseExists && localExists && !remoteExists;
-
-                    // Determine if this is a new file (added on either side)
-                    isNew = isAddedLocally || isAddedRemotely;
-
-                    // Determine if this should be considered deleted
-                    isDeleted =
-                        (isDeletedLocally && !isAddedRemotely) ||
-                        (isDeletedRemotely && !isAddedLocally);
-
-                    // Try to read local content if it exists in local HEAD
-                    try {
-                        if (!isDeletedLocally && !isAddedLocally) {
-                            const lBlob = await dugiteGit.readBlobAtRef(dir, localHead, filepath);
-                            localContent = new TextDecoder().decode(lBlob);
-                        } else if (isAddedLocally) {
-                            // For locally added files, read from working directory
-                            try {
-                                const fileContent = await fs.promises.readFile(
-                                    path.join(dir, filepath),
-                                    "utf8"
-                                );
-                                localContent = fileContent;
-                            } catch (e) {
-                                this.debugLog(`Error reading locally added file ${filepath}:`, e);
-                            }
-                        }
-                    } catch (err) {
-                        this.debugLog(`File ${filepath} doesn't exist in local HEAD`);
-                    }
-
-                    // Try to read remote content if it exists in remote HEAD
-                    try {
-                        if (!isDeletedRemotely && !isAddedRemotely) {
-                            const rBlob = await dugiteGit.readBlobAtRef(dir, remoteHead, filepath);
-                            remoteContent = new TextDecoder().decode(rBlob);
-                        } else if (isAddedRemotely) {
-                            try {
-                                const rBlob = await dugiteGit.readBlobAtRef(dir, remoteHead, filepath);
-                                remoteContent = new TextDecoder().decode(rBlob);
-                            } catch (e) {
-                                this.debugLog(`Error reading remotely added file ${filepath}:`, e);
-                            }
-                        }
-                    } catch (err) {
-                        this.debugLog(`File ${filepath} doesn't exist in remote HEAD`);
-                    }
-
-                    // Try to read base content if available
-                    try {
-                        if (updatedMergeBaseCommits.length > 0) {
-                            const bBlob = await dugiteGit.readBlobAtRef(dir, updatedMergeBaseCommits[0], filepath);
-                            baseContent = new TextDecoder().decode(bBlob);
-                        }
-                    } catch (err) {
-                        this.debugLog(`File ${filepath} doesn't exist in merge base`);
-                    }
-
-                    // Special conflict cases handling
-                    let isConflict = false;
-
-                    // Case 1: File modified in both branches
-                    if (filesModifiedAndTreatedAsPotentialConflict.includes(filepath)) {
-                        isConflict = true;
-                    }
-                    // Case 2: Content differs between branches and at least one differs from base
-                    else if (
-                        localContent !== remoteContent &&
-                        (localContent !== baseContent || remoteContent !== baseContent)
-                    ) {
-                        isConflict = true;
-                    }
-                    // Case 3: Added in both branches with different content
-                    else if (isAddedLocally && isAddedRemotely && localContent !== remoteContent) {
-                        isConflict = true;
-                    }
-                    // Case 4: Modified locally but deleted remotely
-                    else if (
-                        !isDeletedLocally &&
-                        isDeletedRemotely &&
-                        localContent !== baseContent
-                    ) {
-                        isConflict = true;
-                    }
-                    // Case 5: Modified remotely but deleted locally
-                    else if (
-                        isDeletedLocally &&
-                        !isDeletedRemotely &&
-                        remoteContent !== baseContent
-                    ) {
-                        isConflict = true;
-                    }
-
-                    if (isConflict) {
-                        return {
-                            filepath,
-                            ours: localContent,
-                            theirs: remoteContent,
-                            base: baseContent,
-                            isNew,
-                            isDeleted,
-                        };
-                    }
-                    return null;
-                })
+            // 9. Analyse every changed file with bounded concurrency (issue #40).
+            // In native mode each blob read is a `git show` process; reading
+            // thousands of files at once exhausted the per-user process limit
+            // and the failed reads were swallowed as empty content, which
+            // silently dropped remote additions from the conflict list. A read
+            // failure now aborts the sync with a BLOB_READ_FAILED: error that
+            // clients treat as retriable.
+            const existsAt = (statusMap: ReadonlyMap<string, any>, filepath: string): boolean => {
+                const entry = statusMap.get(filepath);
+                return !!entry && entry[0] === 1;
+            };
+            const decode = (blob: Uint8Array): string => new TextDecoder().decode(blob);
+            const conflicts: ConflictedFile[] = await analyzeConflicts(
+                {
+                    existence: (filepath) => ({
+                        local: existsAt(localStatusMap, filepath),
+                        remote: existsAt(remoteStatusMap, filepath),
+                        base: existsAt(mergeBaseStatusMap, filepath),
+                    }),
+                    readLocalBlob: async (filepath) =>
+                        decode(await dugiteGit.readBlobAtRef(dir, localHead, filepath)),
+                    readWorkingFile: (filepath) =>
+                        fs.promises.readFile(path.join(dir, filepath), "utf8"),
+                    readRemoteBlob: async (filepath) =>
+                        decode(await dugiteGit.readBlobAtRef(dir, remoteHead, filepath)),
+                    readBaseBlob: async (filepath) =>
+                        decode(
+                            await dugiteGit.readBlobAtRef(dir, updatedMergeBaseCommits[0], filepath)
+                        ),
+                },
+                {
+                    filepaths: allChangedFilePaths,
+                    modifiedInBoth: filesModifiedAndTreatedAsPotentialConflict,
+                }
             );
-            const conflictSettledFailures = conflictResults.filter(
-                (r): r is PromiseRejectedResult => r.status === "rejected"
-            );
-            if (conflictSettledFailures.length > 0) {
-                console.warn(
-                    `[GitService] ${conflictSettledFailures.length} file(s) could not be analysed for conflicts:`,
-                    conflictSettledFailures.map((f) => f.reason instanceof Error ? f.reason.message : String(f.reason))
-                );
-            }
-            const conflicts = conflictResults
-                .filter(
-                    (r): r is PromiseFulfilledResult<{
-                        filepath: string;
-                        ours: string;
-                        theirs: string;
-                        base: string;
-                        isNew: boolean;
-                        isDeleted: boolean;
-                    } | null> => r.status === "fulfilled"
-                )
-                .map((r) => r.value)
-                .filter(
-                    (v): v is {
-                        filepath: string;
-                        ours: string;
-                        theirs: string;
-                        base: string;
-                        isNew: boolean;
-                        isDeleted: boolean;
-                    } => v !== null
-                );
 
             this.debugLog(`Found ${conflicts.length} conflicts that need resolution`);
             return {
