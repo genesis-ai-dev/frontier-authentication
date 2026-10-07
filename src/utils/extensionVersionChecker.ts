@@ -1,3 +1,5 @@
+import { EXTENSION_PIN_POLICY } from "./extensionPinFeatureFlag";
+import { clearCurrentProjectPins } from "./extensionPins";
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
@@ -483,47 +485,52 @@ export async function checkMetadataVersionsForSync(
     context: vscode.ExtensionContext,
     isManualSync: boolean = false
 ): Promise<boolean> {
-    // 1. Pin gate — delegate entirely to the Codex Conductor.
-    //    If the Conductor is available (current Codex build), it owns the pin check.
-    //    - Mismatches → notify and block.
-    //    - No mismatches but pins exist → return true (pins satisfied; skip requiredExtensions
-    //      entirely, since the pin takes precedence over any requiredExtensions constraint).
-    //    - No pins → fall through to the requiredExtensions check below.
-    //    If the Conductor is unavailable (older build) → fall through and rely on
-    //    requiredExtensions alone.
-    try {
-        const mismatches = await vscode.commands.executeCommand<{
-            extensionId: string;
-            pinnedVersion: string;
-            runningVersion: string | null;
-        }[]>("codex.conductor.getPinMismatches");
+    if (EXTENSION_PIN_POLICY.ignoreProjectPins) {
+        await clearCurrentProjectPins();
+    } else {
+        // 1. Pin gate — delegate entirely to the Codex Conductor.
+        //    If the Conductor is available (current Codex build), it owns the pin check.
+        //    - Mismatches → notify and block.
+        //    - No mismatches but pins exist → return true (pins satisfied; skip requiredExtensions
+        //      entirely, since the pin takes precedence over any requiredExtensions constraint).
+        //    - No pins → fall through to the requiredExtensions check below.
+        //    If the Conductor is unavailable (older build) → fall through and rely on
+        //    requiredExtensions alone.
+        try {
+            const mismatches = await vscode.commands.executeCommand<{
+                extensionId: string;
+                pinnedVersion: string;
+                runningVersion: string | null;
+            }[]>("codex.conductor.getPinMismatches");
 
-        if (mismatches && mismatches.length > 0) {
-            const summary = mismatches.map((m) => `${m.extensionId} running=${m.runningVersion} pinned=${m.pinnedVersion}`).join(", ");
-            debug(`[PinVersionChecker] Conductor pin mismatch: ${summary}`);
-            if (shouldShowVersionModal(context, isManualSync)) {
-                const bullets = mismatches
-                    .map((m) => `- ${extensionDisplayName(m.extensionId)} (pinned to v${m.pinnedVersion})`)
-                    .join("\n");
-                const message = `Extension version pin detected — sync paused.\n${bullets}`;
-                vscode.window.showInformationMessage(message);
+            if (mismatches && mismatches.length > 0) {
+                const summary = mismatches.map((m) => `${m.extensionId} running=${m.runningVersion} pinned=${m.pinnedVersion}`).join(", ");
+                debug(`[PinVersionChecker] Conductor pin mismatch: ${summary}`);
+                if (shouldShowVersionModal(context, isManualSync)) {
+                    const bullets = mismatches
+                        .map((m) => `- ${extensionDisplayName(m.extensionId)} (pinned to v${m.pinnedVersion})`)
+                        .join("\n");
+                    const message = `Extension version pin detected — sync paused.\n${bullets}`;
+                    vscode.window.showInformationMessage(message);
+                }
+                return false;
             }
-            return false;
+
+            const effectivePins = await vscode.commands.executeCommand<Record<string, unknown>>(
+                "codex.conductor.getEffectivePinnedExtensions"
+            );
+            if (effectivePins && Object.keys(effectivePins).length > 0) {
+                // Pins are active and satisfied — requiredExtensions is not authoritative.
+                return true;
+            }
+        } catch {
+            // Conductor not available (older build) — fall through to requiredExtensions check.
+            debug("[PinVersionChecker] Conductor unavailable, falling back to requiredExtensions");
         }
 
-        const effectivePins = await vscode.commands.executeCommand<Record<string, unknown>>(
-            "codex.conductor.getEffectivePinnedExtensions"
-        );
-        if (effectivePins && Object.keys(effectivePins).length > 0) {
-            // Pins are active and satisfied — requiredExtensions is not authoritative.
-            return true;
-        }
-    } catch {
-        // Conductor not available (older build) — fall through to requiredExtensions check.
-        debug("[PinVersionChecker] Conductor unavailable, falling back to requiredExtensions");
     }
 
-    // 2. requiredExtensions check (no active pins).
+    // Pins are temporarily disabled; minimum version requirements still apply.
     const result = await checkAndUpdateMetadataVersions();
 
     if (result.canSync) {

@@ -1,3 +1,4 @@
+import * as versionChecker from "../../../utils/extensionVersionChecker";
 import * as assert from "assert";
 import * as vscode from "vscode";
 import * as fs from "fs";
@@ -7,6 +8,14 @@ import { SCMManager } from "../../../scm/SCMManager";
 import { GitLabService } from "../../../gitlab/GitLabService";
 
 suite("Publish uses LFS during staging", () => {
+    let originalCheck: typeof versionChecker.checkMetadataVersionsForSync;
+    setup(() => {
+        originalCheck = versionChecker.checkMetadataVersionsForSync;
+        (versionChecker as any).checkMetadataVersionsForSync = async () => true;
+    });
+    teardown(() => {
+        (versionChecker as any).checkMetadataVersionsForSync = originalCheck;
+    });
     test("publishWorkspace calls addAllWithLFS and reuses token for push", async () => {
         const ctx: any = {
             subscriptions: [],
