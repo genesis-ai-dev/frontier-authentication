@@ -11,6 +11,7 @@ import type { StateManager } from "../../../state";
 import { clearProjectPins, clearConductorPinState } from "../../../utils/extensionPins";
 import { GitService } from "../../../git/GitService";
 import * as dugiteGit from "../../../git/dugiteGit";
+import { removeRepository } from "../../helpers/removeRepository";
 
 suite("Temporary extension pin removal", () => {
     let directory: string;
@@ -45,7 +46,7 @@ suite("Temporary extension pin removal", () => {
         vscode.commands.getCommands = originalCommands;
         vscode.commands.executeCommand = originalExecute;
         dugiteGit.useEmbeddedGitBinary();
-        fs.rmSync(directory, { recursive: true, force: true });
+        removeRepository(directory);
     });
 
     test("project opening delegates to the editor's destination policy", async () => {
