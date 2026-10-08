@@ -13,7 +13,6 @@ suite("Integration: GitService Merge Conflicts", () => {
     let workspaceDir: string;
     let gitService: GitService;
     let stateManager: StateManager;
-    let restoreVersionChecker: () => void;
 
     suiteSetup(async () => {
         dugiteGit.useEmbeddedGitBinary();
@@ -41,8 +40,6 @@ suite("Integration: GitService Merge Conflicts", () => {
 
         // Stub metadata version checker
         const versionChecker = await import("../../../utils/extensionVersionChecker");
-        const originalCheck = versionChecker.checkMetadataVersionsForSync;
-        restoreVersionChecker = () => { (versionChecker as any).checkMetadataVersionsForSync = originalCheck; };
         (versionChecker as any).checkMetadataVersionsForSync = async () => true;
     });
 
@@ -59,7 +56,6 @@ suite("Integration: GitService Merge Conflicts", () => {
     });
 
     suiteTeardown(async () => {
-        restoreVersionChecker?.();
         if (mockProvider) {
             mockProvider.dispose();
         }

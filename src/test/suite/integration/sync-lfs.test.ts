@@ -14,8 +14,6 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
     let originalFetch: any;
     let workspaceDir: string;
     let originalGetExtension: any;
-    let restoreSuiteStubs: () => void;
-    let restoreTestStubs: () => void;
 
     suiteSetup(async () => {
         dugiteGit.useEmbeddedGitBinary();
@@ -25,18 +23,6 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
         const ext = vscode.extensions.getExtension("frontier-rnd.frontier-authentication");
         assert.ok(ext, "Extension not found");
         await ext!.activate();
-
-        const versionChecker = await import("../../../utils/extensionVersionChecker");
-        const originalInitialize = GitLabService.prototype.initializeWithRetry;
-        const originalToken = GitLabService.prototype.getToken;
-        const originalUser = GitLabService.prototype.getCurrentUser;
-        const originalCheck = versionChecker.checkMetadataVersionsForSync;
-        restoreSuiteStubs = () => {
-            GitLabService.prototype.initializeWithRetry = originalInitialize;
-            GitLabService.prototype.getToken = originalToken;
-            GitLabService.prototype.getCurrentUser = originalUser;
-            (versionChecker as any).checkMetadataVersionsForSync = originalCheck;
-        };
 
         // Monkey-patch GitLabService methods used by sync
         (GitLabService as any).prototype.initializeWithRetry = async function () {
@@ -52,6 +38,7 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
         };
 
         // Stub metadata version checker to always allow syncing
+        const versionChecker = await import("../../../utils/extensionVersionChecker");
         (versionChecker as any).checkMetadataVersionsForSync = async () => true;
 
         // Keep original getExtension and patch to satisfy any version lookups
@@ -126,19 +113,6 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
         };
         StateManager.initialize(fakeContext);
 
-        const originalWorkspacePath = (SCMManager as any).prototype.getWorkspacePath;
-        const originalRegister = (SCMManager as any).prototype.registerCommands;
-        const originalFetchOrigin = dugiteGit.fetchOrigin;
-        const originalFastForward = dugiteGit.fastForward;
-        const originalPush = dugiteGit.push;
-        restoreTestStubs = () => {
-            (SCMManager as any).prototype.getWorkspacePath = originalWorkspacePath;
-            (SCMManager as any).prototype.registerCommands = originalRegister;
-            (dugiteGit as any).fetchOrigin = originalFetchOrigin;
-            (dugiteGit as any).fastForward = originalFastForward;
-            (dugiteGit as any).push = originalPush;
-        };
-
         // Force SCMManager to use our temp workspace path
         (SCMManager as any).prototype.getWorkspacePath = function () {
             return workspaceDir;
@@ -188,7 +162,6 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
     });
 
     teardown(async () => {
-        restoreTestStubs?.();
         // Restore fetch and cleanup
         (globalThis as any).fetch = originalFetch;
         try {
@@ -197,7 +170,6 @@ suite("Integration: sync uses Git LFS for pointer downloads", () => {
     });
 
     suiteTeardown(async () => {
-        restoreSuiteStubs?.();
         if (mockProvider) {
             mockProvider.dispose();
         }
