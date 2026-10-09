@@ -2939,29 +2939,48 @@ export class GitService {
                 return !!entry && entry[0] === 1;
             };
             const decode = (blob: Uint8Array): string => new TextDecoder().decode(blob);
-            const conflicts: ConflictedFile[] = await analyzeConflicts(
-                {
-                    existence: (filepath) => ({
-                        local: existsAt(localStatusMap, filepath),
-                        remote: existsAt(remoteStatusMap, filepath),
-                        base: existsAt(mergeBaseStatusMap, filepath),
-                    }),
-                    readLocalBlob: async (filepath) =>
-                        decode(await dugiteGit.readBlobAtRef(dir, localHead, filepath)),
-                    readWorkingFile: (filepath) =>
-                        fs.promises.readFile(path.join(dir, filepath), "utf8"),
-                    readRemoteBlob: async (filepath) =>
-                        decode(await dugiteGit.readBlobAtRef(dir, remoteHead, filepath)),
-                    readBaseBlob: async (filepath) =>
-                        decode(
-                            await dugiteGit.readBlobAtRef(dir, updatedMergeBaseCommits[0], filepath)
-                        ),
-                },
-                {
-                    filepaths: allChangedFilePaths,
-                    modifiedInBoth: filesModifiedAndTreatedAsPotentialConflict,
+            let conflicts: ConflictedFile[];
+            try {
+                conflicts = await analyzeConflicts(
+                    {
+                        existence: (filepath) => ({
+                            local: existsAt(localStatusMap, filepath),
+                            remote: existsAt(remoteStatusMap, filepath),
+                            base: existsAt(mergeBaseStatusMap, filepath),
+                        }),
+                        readLocalBlob: async (filepath) =>
+                            decode(await dugiteGit.readBlobAtRef(dir, localHead, filepath)),
+                        readWorkingFile: (filepath) =>
+                            fs.promises.readFile(path.join(dir, filepath), "utf8"),
+                        readRemoteBlob: async (filepath) =>
+                            decode(await dugiteGit.readBlobAtRef(dir, remoteHead, filepath)),
+                        readBaseBlob: async (filepath) =>
+                            decode(
+                                await dugiteGit.readBlobAtRef(dir, updatedMergeBaseCommits[0], filepath)
+                            ),
+                    },
+                    {
+                        filepaths: allChangedFilePaths,
+                        modifiedInBoth: filesModifiedAndTreatedAsPotentialConflict,
+                    }
+                );
+            } catch (error) {
+                // A read failure must not leave the remote-equivalent entries
+                // adopted above staged in the index, same as the assertSyncHeads
+                // guard. Disk content is untouched. The original error is kept
+                // even if the cleanup fails so clients still see BLOB_READ_FAILED.
+                if (remoteEquivalentFiles.size > 0) {
+                    try {
+                        await dugiteGit.removeMany(dir, [...remoteEquivalentFiles]);
+                    } catch (cleanupError) {
+                        console.warn(
+                            "[GitService] Could not unstage remote-equivalent files after conflict analysis failed:",
+                            cleanupError
+                        );
+                    }
                 }
-            );
+                throw error;
+            }
 
             this.debugLog(`Found ${conflicts.length} conflicts that need resolution`);
             return {
