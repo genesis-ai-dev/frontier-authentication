@@ -7,7 +7,7 @@ import { resolveEmbeddedGitDir, resolveGitBinary } from "dugite";
 import * as vscode from "vscode";
 import * as dugiteGit from "../../../git/dugiteGit";
 import * as nativeGit from "../../../git/dugiteGitNative";
-import { GitService } from "../../../git/GitService";
+import { BLOB_READ_FAILED_PREFIX, GitService } from "../../../git/GitService";
 import { findRemoteEquivalentAdditions, findUnchangedSyncFiles } from "../../../git/unchangedSyncFiles";
 
 /**
@@ -498,6 +498,94 @@ suite("GitService: unchanged sync file verification", function () {
             assert.strictEqual(git("write-tree"), indexTree);
         } finally {
             (dugiteGit as any).fetchOrigin = originalFetch;
+        }
+    });
+    test("unstages recovered remote-equivalent files when conflict analysis fails", async () => {
+        dugiteGit.setForceBuiltin(false);
+        write("base.txt", "base");
+        git("add", "base.txt");
+        git("commit", "-qm", "base");
+
+        git("checkout", "-qb", "remote");
+        const pointerDir = ".project/attachments/pointers/BOOK";
+        fs.mkdirSync(path.join(dir, pointerDir), { recursive: true });
+        const pointerPaths = Array.from({ length: 200 }, (_, index) =>
+            `${pointerDir}/audio-${index}.wav`
+        );
+        for (const [index, filepath] of pointerPaths.entries()) {
+            write(filepath, `version https://git-lfs.github.com/spec/v1\noid sha256:${index.toString(16).padStart(64, "0")}\nsize ${index}\n`);
+        }
+        // A genuine remote addition that is not on disk locally, so conflict
+        // analysis has to read its blob from the remote commit.
+        write("remote-only.txt", "only on the remote");
+        git("add", ".");
+        git("commit", "-qm", "remote pointers and a new file");
+        const remoteHead = git("rev-parse", "HEAD");
+
+        git("checkout", "-q", "main");
+        write("local.txt", "genuine local history");
+        git("add", "local.txt");
+        git("commit", "-qm", "local work");
+        const localHead = git("rev-parse", "HEAD");
+        git("remote", "add", "origin", "https://example.invalid/project.git");
+        git("update-ref", "refs/remotes/origin/main", remoteHead);
+
+        // Simulate an interrupted merge: the remote pointers are on disk and
+        // staged, byte-identical to the remote blobs.
+        fs.mkdirSync(path.join(dir, pointerDir), { recursive: true });
+        for (const [index, filepath] of pointerPaths.entries()) {
+            write(filepath, `version https://git-lfs.github.com/spec/v1\noid sha256:${index.toString(16).padStart(64, "0")}\nsize ${index}\n`);
+        }
+        git("add", ".");
+
+        const stateStub: any = {
+            isSyncLocked: () => false,
+            acquireSyncLock: async () => true,
+            updateLockHeartbeat: async () => {},
+            releaseSyncLock: async () => {},
+        };
+        const service = new GitService(stateStub);
+        (service as any).isOnline = async () => true;
+        (service as any).reconcilePointersFilesystem = async () => {};
+        const originalFetch = dugiteGit.fetchOrigin;
+        const originalFastForward = dugiteGit.fastForward;
+        const originalPush = dugiteGit.push;
+        const originalReadBlob = dugiteGit.readBlobAtRef;
+        (dugiteGit as any).fetchOrigin = async () => {};
+        (dugiteGit as any).fastForward = async () => {
+            throw new Error("divergent histories");
+        };
+        (dugiteGit as any).push = async () => {};
+        (dugiteGit as any).readBlobAtRef = async (repo: string, ref: string, filepath: string) => {
+            if (filepath === "remote-only.txt") {
+                throw new Error("spawn git EAGAIN");
+            }
+            return originalReadBlob(repo, ref, filepath);
+        };
+
+        try {
+            await assert.rejects(
+                service.syncChanges(
+                    dir,
+                    { username: "oauth2", password: "token" },
+                    { name: "Sync test", email: "test@example.invalid" }
+                ),
+                (error: unknown) =>
+                    error instanceof Error && error.message.startsWith(BLOB_READ_FAILED_PREFIX)
+            );
+
+            assert.strictEqual(git("rev-parse", "HEAD"), localHead, "a failed analysis must not commit");
+            // The index must be back to HEAD: no recovered remote pointers left staged.
+            assert.strictEqual(git("write-tree"), git("rev-parse", "HEAD^{tree}"));
+            const indexEntries = await dugiteGit.blobEntriesAtIndex(dir);
+            assert.ok(pointerPaths.every((filepath) => !indexEntries.has(filepath)));
+            // Disk content is untouched so the retry can recover the files again.
+            assert.ok(pointerPaths.every((filepath) => fs.existsSync(path.join(dir, filepath))));
+        } finally {
+            (dugiteGit as any).fetchOrigin = originalFetch;
+            (dugiteGit as any).fastForward = originalFastForward;
+            (dugiteGit as any).push = originalPush;
+            (dugiteGit as any).readBlobAtRef = originalReadBlob;
         }
     });
 });
