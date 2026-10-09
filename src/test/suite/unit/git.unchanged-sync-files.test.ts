@@ -9,7 +9,6 @@ import * as dugiteGit from "../../../git/dugiteGit";
 import * as nativeGit from "../../../git/dugiteGitNative";
 import { GitService } from "../../../git/GitService";
 import { findRemoteEquivalentAdditions, findUnchangedSyncFiles } from "../../../git/unchangedSyncFiles";
-import { removeRepository } from "../../helpers/removeRepository";
 
 /**
  * Locate a Git installation laid out the way dugite expects (`cmd/git.exe` on
@@ -33,6 +32,23 @@ function locateNativeGit(): { localGitDir: string; execPath: string } {
     }
     const execPath = execFileSync(resolveGitBinary(localGitDir), ["--exec-path"], { encoding: "utf8" }).trim();
     return { localGitDir, execPath };
+}
+
+/**
+ * Native git writes loose objects read-only, and Windows refuses to delete a
+ * read-only file until the attribute is cleared. Make the tree writable first.
+ */
+function removeRepository(dir: string): void {
+    const makeWritable = (entry: string): void => {
+        const stat = fs.lstatSync(entry);
+        if (stat.isSymbolicLink()) { return; }
+        fs.chmodSync(entry, stat.isDirectory() ? 0o777 : 0o666);
+        if (stat.isDirectory()) {
+            for (const child of fs.readdirSync(entry)) { makeWritable(path.join(entry, child)); }
+        }
+    };
+    makeWritable(dir);
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
 }
 
 suite("GitService: unchanged sync file verification", function () {

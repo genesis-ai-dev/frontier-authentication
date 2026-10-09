@@ -1,5 +1,3 @@
-import { EXTENSION_PIN_POLICY } from "../utils/extensionPinFeatureFlag";
-import { clearCurrentProjectPins } from "../utils/extensionPins";
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
@@ -120,7 +118,9 @@ export class SCMManager {
             )
         );
 
-        // Keep the existing binary command compatible; sync now removes all pins.
+        // Push pin update command (admin-only). The Conductor's admin intent
+        // (adminPinnedExtensions) ensures getPinMismatches() returns empty when
+        // the running version matches the admin's intended pin, so sync proceeds.
         this.context.subscriptions.push(
             vscode.commands.registerCommand(
                 "frontier.pushPinUpdate",
@@ -367,15 +367,6 @@ export class SCMManager {
 
     private async openWorkspace(workspacePath: string): Promise<void> {
         const uri = vscode.Uri.file(workspacePath);
-        if (EXTENSION_PIN_POLICY.ignoreProjectPins) {
-            // Fail closed when an older editor cannot save pins before opening.
-            const commands = await vscode.commands.getCommands(true);
-            if (!commands.includes("codex.openProjectFolder")) {
-                throw new Error("Update Codex Editor and reload before opening this project. The editor must clear pins and select Default first.");
-            }
-            await vscode.commands.executeCommand("codex.openProjectFolder", uri.toString());
-            return;
-        }
         await vscode.commands.executeCommand("vscode.openFolder", uri);
     }
 
@@ -442,7 +433,6 @@ export class SCMManager {
         remotePins: Record<string, { version: string; url: string }> | undefined,
         isManualSync: boolean
     ): Promise<{ canSync: boolean; pinnedIds: Set<string> }> {
-        if (EXTENSION_PIN_POLICY.ignoreProjectPins) { return { canSync: true, pinnedIds: new Set<string>() }; }
         // Delegate to the Conductor (handles Admin Intent > Remote > Local priority).
         // setRemotePins fires before aborting so the Conductor can start downloading.
         try {
@@ -558,7 +548,6 @@ export class SCMManager {
 
         let syncSucceeded = false;
         try {
-            await clearCurrentProjectPins();
             const token = await this.gitLabService.getToken();
             if (!token) {
                 throw new Error("Not logged in. Please sign in first.");
@@ -613,10 +602,15 @@ export class SCMManager {
                                 };
                             };
 
-                            const { canSync: canSyncPins, pinnedIds } = EXTENSION_PIN_POLICY.ignoreProjectPins
-                                ? { canSync: true, pinnedIds: new Set<string>() }
-                                : await this.handleRemotePinValidation(remoteMetadata.meta?.pinnedExtensions, isManualSync);
-                            if (!canSyncPins) { return { hasConflicts: false }; }
+                            // Write remote pins to workspaceState, then ask the Conductor
+                            // for effective pins (which now include the just-fetched remote pins).
+                            const remotePins = remoteMetadata.meta?.pinnedExtensions;
+                            const { canSync: canSyncPins, pinnedIds } =
+                                await this.handleRemotePinValidation(remotePins, isManualSync);
+                            if (!canSyncPins) {
+                                return { hasConflicts: false };
+                            }
+
                             const required = remoteMetadata.meta?.requiredExtensions;
                             if (required) {
                                 const { codexEditorVersion, frontierAuthVersion } =
@@ -767,28 +761,26 @@ export class SCMManager {
             }
             // Fire sync completed event only if sync succeeded
             if (syncSucceeded) {
-                await clearCurrentProjectPins();
                 this.syncEventEmitter.fire({
                     status: "completed",
                     message: "Synchronization complete",
                 });
-                if (!EXTENSION_PIN_POLICY.ignoreProjectPins) {
-                    // After a successful sync (fetch -> merge -> push), the local and remote
-                    // states are converged. We refresh remotePinnedExtensions storage to match
-                    // what we just pushed, ensuring the Conductor sees the latest pins on next reload.
-                    try {
-                        const convergedPins = await readLocalPinnedExtensions();
-                        await vscode.commands.executeCommand("codex.conductor.setRemotePins", convergedPins);
-                    } catch (e) {
-                        console.error("[SCMManager] Failed to refresh remote pins after sync:", e);
-                    }
 
-                    // Clear the admin intent (override) since the change is now authoritative on the remote.
-                    try {
-                        await vscode.commands.executeCommand("codex.conductor.clearAdminPinIntent");
-                        await vscode.commands.executeCommand("codex.conductor.setSyncCompletedAt", Date.now());
-                    } catch {}
+                // After a successful sync (fetch -> merge -> push), the local and remote
+                // states are converged. We refresh remotePinnedExtensions storage to match
+                // what we just pushed, ensuring the Conductor sees the latest pins on next reload.
+                try {
+                    const convergedPins = await readLocalPinnedExtensions();
+                    await vscode.commands.executeCommand("codex.conductor.setRemotePins", convergedPins);
+                } catch (e) {
+                    console.error("[SCMManager] Failed to refresh remote pins after sync:", e);
                 }
+
+                // Clear the admin intent (override) since the change is now authoritative on the remote.
+                try {
+                    await vscode.commands.executeCommand("codex.conductor.clearAdminPinIntent");
+                    await vscode.commands.executeCommand("codex.conductor.setSyncCompletedAt", Date.now());
+                } catch {}
             }
         }
     }
@@ -834,8 +826,7 @@ export class SCMManager {
             // Get current user info for commit author details
             const user = await this.gitLabService.getCurrentUser();
 
-            // Clear pins before staging so the uploaded commit includes their removal.
-            await clearCurrentProjectPins();
+            // Add all changes
             await this.gitService.addAll(workspacePath);
 
             // Commit
@@ -858,9 +849,7 @@ export class SCMManager {
                 password: token,
             };
 
-            await this.gitService.push(workspacePath, auth, {
-                author: { name: user.name || user.username, email: user.email || `${user.username}@users.noreply.gitlab.com` },
-            });
+            await this.gitService.push(workspacePath, auth);
 
             vscode.window.showInformationMessage("Changes uploaded successfully");
         } catch (error) {
@@ -1115,6 +1104,5 @@ export class SCMManager {
             workspacePath = this.getWorkspacePath();
         }
         await this.gitService.completeMerge(workspacePath, auth, author, resolvedFiles, snapshot);
-        await clearCurrentProjectPins();
     }
 }
