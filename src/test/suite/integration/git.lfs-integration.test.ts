@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { createHash } from "crypto";
 import * as dugiteGit from "../../../git/dugiteGit";
 import { registerMockAuthProvider } from "../../helpers/mockAuthProvider";
 import { GitService } from "../../../git/GitService";
@@ -127,8 +128,12 @@ suite("Integration: LFS Error Scenarios", () => {
         await fs.promises.mkdir(path.dirname(pointer), { recursive: true });
         await fs.promises.mkdir(path.dirname(filesFile), { recursive: true });
         
+        const recoveredBytes = Buffer.from("recovered");
+        const recoveredOid = createHash("sha256").update(recoveredBytes).digest("hex");
+        let uploadCount = 0;
+        let pushCount = 0;
         await fs.promises.writeFile(pointer, new Uint8Array());
-        await fs.promises.writeFile(filesFile, Buffer.from("recovered"));
+        await fs.promises.writeFile(filesFile, recoveredBytes);
 
         await dugiteGit.add(workspaceDir, ".gitattributes");
         // Create a file to make commit non-empty
@@ -147,7 +152,8 @@ suite("Integration: LFS Error Scenarios", () => {
                     JSON.stringify({
                         objects: [
                             {
-                                oid: "recovered-oid",
+                                oid: recoveredOid,
+                                size: recoveredBytes.length,
                                 actions: {
                                     upload: {
                                         href: "https://lfs.example.com/upload",
@@ -165,14 +171,26 @@ suite("Integration: LFS Error Scenarios", () => {
             }
 
             if (url.includes("/upload") && method === "PUT") {
+                uploadCount++;
+                const uploadedBytes = Buffer.from(await new Response(init.body).arrayBuffer());
+                assert.deepStrictEqual(uploadedBytes, recoveredBytes);
                 return new Response("", { status: 200 });
             }
 
-            return new Response("", { status: 200 });
+            throw new Error(`Unexpected fetch ${method} ${url}`);
         };
 
         const originalFetchOrigin = dugiteGit.fetchOrigin;
+        const originalPush = dugiteGit.push;
+        const originalIsOnline = gitService.isOnline;
+        gitService.isOnline = async () => true;
         (dugiteGit as any).fetchOrigin = async () => {};
+
+        // Mock both Git network boundaries; the LFS fetch mock does not intercept Git HTTP.
+        (dugiteGit as typeof dugiteGit).push = async (dir) => {
+            assert.strictEqual(dir, workspaceDir);
+            pushCount++;
+        };
 
         try {
             // Sync should recover empty pointer
@@ -182,9 +200,17 @@ suite("Integration: LFS Error Scenarios", () => {
                 { name: "Test", email: "test@example.com" }
             );
             
-            assert.ok(true, "Should handle LFS recovery during sync");
+            const expectedPointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${recoveredOid}\nsize ${recoveredBytes.length}\n`;
+            assert.strictEqual(uploadCount, 1, "Recovered bytes should be uploaded once");
+            assert.strictEqual(pushCount, 1, "Recovered commit should reach the Git push boundary");
+            assert.strictEqual(await fs.promises.readFile(pointer, "utf8"), expectedPointer);
+            const committed = await dugiteGit.readBlobAtRef(workspaceDir, "HEAD", ".project/attachments/pointers/file.bin");
+            assert.strictEqual(Buffer.from(committed).toString("utf8"), expectedPointer);
+            assert.deepStrictEqual(await fs.promises.readFile(filesFile), recoveredBytes);
         } finally {
             (dugiteGit as any).fetchOrigin = originalFetchOrigin;
+            (dugiteGit as typeof dugiteGit).push = originalPush;
+            gitService.isOnline = originalIsOnline;
         }
     });
 });

@@ -212,6 +212,24 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Initialize auth provider with state manager
     authenticationProvider = new FrontierAuthProvider(context, API_ENDPOINT, stateManager);
+    const { GitLabService: StartupGitLabService } = await import("./gitlab/GitLabService");
+    const startupGitLabService = new StartupGitLabService(authenticationProvider);
+    // Complete native startup discovery independently of Editor activation and sync gates.
+    // Do not reconcile from inside discovery: the binary is waiting for this result.
+    void (async () => {
+        const { getPinPolicy, discoverRemotePins } = await import("./utils/pinPolicy");
+        const policy = await getPinPolicy();
+        const folder = vscode.workspace.workspaceFolders?.[0];
+        if (!policy || policy.mode !== "enforce" || !folder) { return; }
+        let result;
+        try {
+            result = await discoverRemotePins(folder.uri.fsPath, () => startupGitLabService.getToken(), false);
+        } catch (error) {
+            result = { kind: "not-ready", reason: String(error) };
+        }
+        await vscode.commands.executeCommand("codex.conductor.completePinDiscovery", result);
+    })().catch(error => console.error("[Frontier] Startup pin discovery failed", error));
+
 
     try {
         await authenticationProvider.initialize();
