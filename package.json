@@ -1,5 +1,6 @@
 {
     "name": "frontier-authentication",
+    "codexProjectPinPolicyVersion": 2,
     "displayName": "Frontier Authentication",
     "description": "Authentication extension for Frontier",
     "publisher": "frontier-rnd",
@@ -138,6 +139,7 @@
         "dependencies": false
     },
     "scripts": {
+        "test:pin-policy": "node --test tests/pinPolicy.test.cjs",
         "vscode:prepublish": "npm run test && pnpm run package",
         "clean": "node -e \"const fs=require('fs');['out','dist'].forEach(d=>{try{fs.rmSync(d,{recursive:true,force:true})}catch{}})\"",
         "compile": "webpack",
@@ -148,7 +150,7 @@
         "watch-tests": "tsc -p . --outDir out --watch",
         "pretest": "npm run clean && npm run compile-tests && npm run compile && npm run lint",
         "lint": "eslint src --ext ts",
-        "test": "node ./out/test/runTest.js",
+        "test": "npm run test:pin-policy && node ./out/test/runTest.js",
         "format": "prettier --write \"src/**/*.{ts,js,json,md}\"",
         "format:check": "prettier --check \"src/**/*.{ts,js,json,md}\"",
         "prepare": "husky"

@@ -1,3 +1,6 @@
+import { activePins } from "./pinDecisions";
+import { getPinPolicy } from "./pinPolicy";
+import { clearCurrentProjectPins } from "./extensionPins";
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
@@ -228,7 +231,7 @@ async function readVersionsFromDisk(): Promise<{
     }
 }
 
-export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionCheckResult> {
+export async function checkAndUpdateMetadataVersions(pinnedIds: ReadonlySet<string> = new Set()): Promise<MetadataVersionCheckResult> {
     try {
         debug("[MetadataVersionChecker] ═══ METADATA VERSION CHECK ═══");
 
@@ -280,7 +283,7 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
         // Missing versions in metadata are fine: codex-editor writes them on activation.
         const outdatedExtensions: ExtensionVersionInfo[] = [];
 
-        if (metadataCodexVersion) {
+        if (metadataCodexVersion && !pinnedIds.has("project-accelerate.codex-editor-extension")) {
             const codexCheck = checkRequiredVersion(
                 codexEditorVersion,
                 metadataCodexVersion,
@@ -313,7 +316,7 @@ export async function checkAndUpdateMetadataVersions(): Promise<MetadataVersionC
             // MetadataManager.ensureExtensionVersionsRecorded on project open.
         }
 
-        if (metadataFrontierVersion) {
+        if (metadataFrontierVersion && !pinnedIds.has("frontier-rnd.frontier-authentication")) {
             const frontierCheck = checkRequiredVersion(
                 frontierAuthVersion,
                 metadataFrontierVersion,
@@ -483,6 +486,24 @@ export async function checkMetadataVersionsForSync(
     context: vscode.ExtensionContext,
     isManualSync: boolean = false
 ): Promise<boolean> {
+    let pinnedIds = new Set<string>();
+    const policy = await getPinPolicy();
+    if (policy) {
+        if (policy.mode === "ignore") { await clearCurrentProjectPins(); }
+        else {
+            // Discovery must precede the old mismatch gate, otherwise remote unpins are unreachable.
+            const { getSCMManager } = await import("../commands/scmCommands");
+            const discovery = await getSCMManager()?.discoverProjectPins();
+            if (discovery && discovery.kind !== "verified") { console.info("[PinPolicy] Keeping accepted state:", discovery); }
+            if (discovery?.kind === "invalid" || discovery?.kind === "not-ready") { return false; }
+        }
+        const current = await vscode.commands.executeCommand<import("./pinPolicy").PinStatus>("codex.conductor.reconcilePinPolicy");
+        if (current?.phase !== "ready") {
+            if (isManualSync) { void vscode.window.showWarningMessage(`Sync paused: ${current?.error ?? "project extension recovery is pending"}`); }
+            return false;
+        }
+        if (current.mode === "enforce") { pinnedIds = new Set(Object.keys(activePins(current.pins))); }
+    } else {
     // 1. Pin gate — delegate entirely to the Codex Conductor.
     //    If the Conductor is available (current Codex build), it owns the pin check.
     //    - Mismatches → notify and block.
@@ -523,8 +544,10 @@ export async function checkMetadataVersionsForSync(
         debug("[PinVersionChecker] Conductor unavailable, falling back to requiredExtensions");
     }
 
-    // 2. requiredExtensions check (no active pins).
-    const result = await checkAndUpdateMetadataVersions();
+    }
+
+    // 2. Check requiredExtensions for each extension that is not actively pinned.
+    const result = await checkAndUpdateMetadataVersions(pinnedIds);
 
     if (result.canSync) {
         return true;
@@ -587,7 +610,7 @@ export async function readLocalPinnedExtensions(): Promise<PinnedExtensions | un
         const content = await vscode.workspace.fs.readFile(metadataUri);
         const metadata = JSON.parse(new TextDecoder().decode(content));
         const pins = metadata?.meta?.pinnedExtensions;
-        return isPinnedExtensions(pins) ? pins : undefined;
+        return pins === undefined ? undefined : activePins(pins);
     } catch {
         return undefined;
     }
